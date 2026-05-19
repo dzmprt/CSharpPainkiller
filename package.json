@@ -1,0 +1,467 @@
+{
+  "name": "csharppainkiller",
+  "displayName": "CSharp Painkiller",
+  "publisher": "dzmprt",
+  "description": "Smart file creation, namespace management, code generation, diagnostics, and more for C#",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.120.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "C#",
+    "CSharp",
+    ".NET",
+    "DOTNET",
+    "dev kit",
+    "CSharp Painkiller"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dzmprt/CSharpPainkiller"
+  },
+  "homepage": "https://github.com/dzmprt/CSharpPainkiller/blob/main/README.md",
+  "icon": "images/CSharpPainkillerLogo.png",
+  "activationEvents": [
+    "onLanguage:csharp"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "csharppainkiller.generateHandlerForFile",
+        "title": "C# Generate Handler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.goToHandlerForFile",
+        "title": "C# Go To Handler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.createClass",
+        "title": "C# Class (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.createRecord",
+        "title": "C# Record (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.createStruct",
+        "title": "C# Struct (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.createEnum",
+        "title": "C# Enum (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.createInterface",
+        "title": "C# Interface (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.createRecordStruct",
+        "title": "C# Record Struct (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.adjustNamespace",
+        "title": "C# Adjust Namespaces (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.renameFileByType",
+        "title": "C# Rename File By Type (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.sortUsings",
+        "title": "C# Sort Usings (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.extractInterface",
+        "title": "C# Extract Interface (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.generateMapTo",
+        "title": "C# Generate MapTo Method (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.generateMapFrom",
+        "title": "C# Generate MapFrom Method (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.aspnet.emptyController",
+        "title": "C# Empty Controller (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.aspnet.efCrudController",
+        "title": "C# EF CRUD Controller (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.aspnet.emptyMinimalApi",
+        "title": "C# Empty Minimal API (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.aspnet.efCrudMinimalApi",
+        "title": "C# EF CRUD Minimal API (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.efcore.createConfigurationFromFolder",
+        "title": "C# EF Core Entity Configuration (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.efcore.createConfigurationFromFile",
+        "title": "C# Generate EF Core Configuration (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createRequestAndHandler",
+        "title": "C# MediatR Request and Handler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createRequest",
+        "title": "C# MediatR Request (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createHandler",
+        "title": "C# MediatR RequestHandler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createNotificationAndHandler",
+        "title": "C# MediatR Notification and Handler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createNotification",
+        "title": "C# MediatR Notification (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createNotificationHandler",
+        "title": "C# MediatR NotificationHandler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createRequestAndHandler",
+        "title": "C# MitMediator Request and Handler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createRequest",
+        "title": "C# MitMediator Request (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createHandler",
+        "title": "C# MitMediator RequestHandler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createNotificationAndHandler",
+        "title": "C# MitMediator Notification and Handler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createNotification",
+        "title": "C# MitMediator Notification (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createNotificationHandler",
+        "title": "C# MitMediator NotificationHandler (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createEmptyPipelineBehavior",
+        "title": "C# MediatR Empty PipelineBehavior (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mediatr.createFluentValidationBehavior",
+        "title": "C# MediatR FluentValidation PipelineBehavior (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createEmptyPipelineBehavior",
+        "title": "C# MitMediator Empty PipelineBehavior (CSharp Painkiller)"
+      },
+      {
+        "command": "csharppainkiller.templates.mitmediator.createFluentValidationBehavior",
+        "title": "C# MitMediator FluentValidation PipelineBehavior (CSharp Painkiller)"
+      }
+    ],
+    "submenus": [
+      {
+        "id": "csharppainkiller.create",
+        "label": "C# Create (CSharp Painkiller)"
+      },
+      {
+        "id": "csharppainkiller.refactor",
+        "label": "C# Refactor (CSharp Painkiller)"
+      },
+      {
+        "id": "csharppainkiller.templates",
+        "label": "C# Generator (CSharp Painkiller)"
+      },
+      {
+        "id": "csharppainkiller.templates.aspnet",
+        "label": "ASP.NET"
+      },
+      {
+        "id": "csharppainkiller.templates.mediatr",
+        "label": "MediatR"
+      },
+      {
+        "id": "csharppainkiller.templates.mitmediator",
+        "label": "MitMediator"
+      },
+      {
+        "id": "csharppainkiller.templates.mediatr.pipeline",
+        "label": "Generate PipelineBehavior"
+      },
+      {
+        "id": "csharppainkiller.templates.mitmediator.pipeline",
+        "label": "Generate PipelineBehavior"
+      },
+      {
+        "id": "csharppainkiller.efcore",
+        "label": "EF Core"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "when": "explorerResourceIsFolder",
+          "submenu": "csharppainkiller.create",
+          "group": "2_csharp@1"
+        },
+        {
+          "submenu": "csharppainkiller.refactor",
+          "group": "2_csharp@1"
+        },
+        {
+          "when": "explorerResourceIsFolder",
+          "submenu": "csharppainkiller.templates",
+          "group": "2_csharp@2"
+        },
+        {
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs && csharppainkiller.isMediatorFile",
+          "command": "csharppainkiller.generateHandlerForFile",
+          "group": "2_csharp@3"
+        },
+        {
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs && csharppainkiller.isMediatorFile",
+          "command": "csharppainkiller.goToHandlerForFile",
+          "group": "2_csharp@4"
+        },
+        {
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs",
+          "command": "csharppainkiller.efcore.createConfigurationFromFile",
+          "group": "2_csharp@5"
+        }
+      ],
+      "csharppainkiller.create": [
+        {
+          "command": "csharppainkiller.createClass",
+          "group": "1_types@1"
+        },
+        {
+          "command": "csharppainkiller.createRecord",
+          "group": "1_types@2"
+        },
+        {
+          "command": "csharppainkiller.createStruct",
+          "group": "1_types@3"
+        },
+        {
+          "command": "csharppainkiller.createEnum",
+          "group": "1_types@4"
+        },
+        {
+          "command": "csharppainkiller.createInterface",
+          "group": "1_types@5"
+        },
+        {
+          "command": "csharppainkiller.createRecordStruct",
+          "group": "1_types@6"
+        }
+      ],
+      "csharppainkiller.refactor": [
+        {
+          "command": "csharppainkiller.adjustNamespace",
+          "group": "1_refactor@1"
+        },
+        {
+          "command": "csharppainkiller.renameFileByType",
+          "group": "1_refactor@2"
+        },
+        {
+          "command": "csharppainkiller.sortUsings",
+          "group": "1_refactor@3"
+        },
+        {
+          "command": "csharppainkiller.extractInterface",
+          "group": "1_refactor@4"
+        }
+      ],
+      "csharppainkiller.templates": [
+        {
+          "submenu": "csharppainkiller.templates.aspnet",
+          "group": "1_templates@1"
+        },
+        {
+          "submenu": "csharppainkiller.templates.mediatr",
+          "group": "1_templates@2"
+        },
+        {
+          "submenu": "csharppainkiller.templates.mitmediator",
+          "group": "1_templates@3"
+        },
+        {
+          "submenu": "csharppainkiller.efcore",
+          "group": "1_templates@4"
+        }
+      ],
+      "csharppainkiller.templates.aspnet": [
+        {
+          "command": "csharppainkiller.templates.aspnet.emptyController",
+          "group": "1_aspnet@1"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.efCrudController",
+          "group": "1_aspnet@2"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.emptyMinimalApi",
+          "group": "1_aspnet@3"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.efCrudMinimalApi",
+          "group": "1_aspnet@4"
+        }
+      ],
+      "csharppainkiller.templates.mediatr": [
+        {
+          "command": "csharppainkiller.templates.mediatr.createRequestAndHandler",
+          "group": "1_mediatr@1"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createRequest",
+          "group": "1_mediatr@2"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createHandler",
+          "group": "1_mediatr@3"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createNotificationAndHandler",
+          "group": "2_mediatr@1"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createNotification",
+          "group": "2_mediatr@2"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createNotificationHandler",
+          "group": "2_mediatr@3"
+        },
+        {
+          "submenu": "csharppainkiller.templates.mediatr.pipeline",
+          "group": "3_mediatr@1"
+        }
+      ],
+      "csharppainkiller.templates.mediatr.pipeline": [
+        {
+          "command": "csharppainkiller.templates.mediatr.createEmptyPipelineBehavior",
+          "group": "1_pipeline@1"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createFluentValidationBehavior",
+          "group": "1_pipeline@2"
+        }
+      ],
+      "csharppainkiller.templates.mitmediator": [
+        {
+          "command": "csharppainkiller.templates.mitmediator.createRequestAndHandler",
+          "group": "1_mitmediator@1"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createRequest",
+          "group": "1_mitmediator@2"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createHandler",
+          "group": "1_mitmediator@3"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createNotificationAndHandler",
+          "group": "2_mitmediator@1"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createNotification",
+          "group": "2_mitmediator@2"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createNotificationHandler",
+          "group": "2_mitmediator@3"
+        },
+        {
+          "submenu": "csharppainkiller.templates.mitmediator.pipeline",
+          "group": "3_mitmediator@1"
+        }
+      ],
+      "csharppainkiller.templates.mitmediator.pipeline": [
+        {
+          "command": "csharppainkiller.templates.mitmediator.createEmptyPipelineBehavior",
+          "group": "1_pipeline@1"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createFluentValidationBehavior",
+          "group": "1_pipeline@2"
+        }
+      ],
+      "csharppainkiller.efcore": [
+        {
+          "command": "csharppainkiller.efcore.createConfigurationFromFolder",
+          "group": "1_efcore@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CSharp Painkiller",
+      "properties": {
+        "csharppainkiller.diagnostics.wrongNamespace": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostic: namespace does not match the file path."
+        },
+        "csharppainkiller.diagnostics.wrongFilename": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostic: file name does not match the primary type name."
+        },
+        "csharppainkiller.diagnostics.unsortedUsings": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostic: using directives are not sorted."
+        },
+        "csharppainkiller.diagnostics.mixedLanguageIdentifiers": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable diagnostic: identifiers (type names, method names, variables, namespaces, etc.) contain non-Latin or mixed-script characters."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run package",
+    "compile": "npm run check-types && npm run lint && node esbuild.js",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "npm run check-types && npm run lint && node esbuild.js --production",
+    "compile-tests": "tsc -p . --outDir out",
+    "watch-tests": "tsc -p . -w --outDir out",
+    "pretest": "npm run compile-tests && npm run compile && npm run lint",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.120.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "typescript-eslint": "^8.56.1",
+    "eslint": "^9.39.3",
+    "esbuild": "^0.27.3",
+    "npm-run-all": "^4.1.5",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.12",
+    "@vscode/test-electron": "^2.5.2"
+  }
+}
