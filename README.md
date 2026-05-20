@@ -1,12 +1,12 @@
-![CSharp Painkiller Logo](images/CSharpPainkillerLogo.png)
-
-# CSharp Painkiller
+CSharp Painkiller
 
 Smart file creation, namespace management, code generation, diagnostics, and more for C#.
 
 ![License](https://img.shields.io/github/license/dzmprt/CSharpPainkiller)
 
 [GitHub repository](https://github.com/dzmprt/CSharpPainkiller)
+
+[VisualStudio Marketplace](https://marketplace.visualstudio.com/items?itemName=DzmitryPratsko.csharppainkiller)
 
 </div>
 
