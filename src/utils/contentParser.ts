@@ -1,7 +1,8 @@
 import { type CType, type TypeDefinition, type TypeExtractionResult, type TypeSearchResult } from '../types.js';
+import { hasNonAsciiFast } from './contentHash.js';
 
 // ============================================================================
-// Namespace extraction
+// Namespace extraction (content-only, use LSP for file-based operations)
 // ============================================================================
 
 /**
@@ -21,7 +22,18 @@ function stripBom(content: string): string {
 }
 
 /**
+ * Extracts the namespace with its leading whitespace from file content.
+ * Used internally for namespace replacement in adjustFileNamespace.
+ */
+export function extractFileNamespaceWithIndent(content: string): { namespace: string; indent: string } | undefined {
+	const match = stripBom(content).match(NAMESPACE_REGEX);
+	return match ? { namespace: match[2], indent: match[1] } : undefined;
+}
+
+/**
  * Extracts the namespace from file content.
+ * INTERNAL USE ONLY - for working with file content strings.
+ * For LSP-based namespace extraction from files, use CSharpParser service.
  */
 export function extractFileNamespace(content: string): string | undefined {
 	const match = stripBom(content).match(NAMESPACE_REGEX);
@@ -29,19 +41,9 @@ export function extractFileNamespace(content: string): string | undefined {
 }
 
 /**
- * Extracts the namespace with its leading whitespace from file content.
- */
-export function extractFileNamespaceWithIndent(content: string): { namespace: string; indent: string } | undefined {
-	const match = stripBom(content).match(NAMESPACE_REGEX);
-	return match ? { namespace: match[2], indent: match[1] } : undefined;
-}
-
-// ============================================================================
-// Using directive extraction
-// ============================================================================
-
-/**
- * Extracts all using directives from file content.
+ * Extracts using directives from file content.
+ * INTERNAL USE ONLY - for working with file content strings.
+ * For LSP-based using extraction from files, use CSharpParser service.
  */
 export function extractUsingDirectives(content: string): string[] {
 	const usingRegex = /^using\s+([\w.]+)\s*;/gm;
@@ -53,12 +55,10 @@ export function extractUsingDirectives(content: string): string[] {
 	return namespaces;
 }
 
-// ============================================================================
-// Type extraction from file content
-// ============================================================================
-
 /**
  * Extracts type definitions from file content along with the namespace.
+ * Used internally for analyzing partial types and file structure.
+ * For LSP-based namespace/type extraction, use CSharpParser service.
  */
 export function extractTypesFromContent(content: string): TypeExtractionResult {
 	const types: TypeDefinition[] = [];
@@ -290,62 +290,51 @@ export function escapeRegExp(str: string): string {
 }
 
 // ============================================================================
-// Mixed-language identifier detection
+// Mixed-language identifier detection (OPTIMIZED — v2)
 // ============================================================================
 
 /**
- * Unicode script ranges used to detect identifier scripts.
- * Only ranges relevant for programming identifiers are included.
+ * Non-Latin Unicode script ranges for fast code-point lookup.
  */
-const SCRIPT_RANGES: { name: string; regex: RegExp }[] = [
-	{ name: 'latin',     regex: /[A-Za-z\u00C0-\u024F\u1E00-\u1EFF]/ },
-	{ name: 'cyrillic',  regex: /[\u0400-\u04FF\u0500-\u052F]/ },
-	{ name: 'greek',     regex: /[\u0370-\u03FF\u1F00-\u1FFF]/ },
-	{ name: 'armenian',  regex: /[\u0530-\u058F]/ },
-	{ name: 'georgian',  regex: /[\u10A0-\u10FF]/ },
-	{ name: 'arabic',    regex: /[\u0600-\u06FF]/ },
-	{ name: 'hebrew',    regex: /[\u0590-\u05FF]/ },
-	{ name: 'thai',      regex: /[\u0E00-\u0E7F]/ },
-	{ name: 'chinese',   regex: /[\u4E00-\u9FFF\u3400-\u4DBF]/ },
-	{ name: 'japanese',  regex: /[\u3040-\u309F\u30A0-\u30FF]/ },
-	{ name: 'korean',    regex: /[\uAC00-\uD7AF\u1100-\u11FF]/ },
+const NON_LATIN_RANGES: [number, number][] = [
+	[0x0370, 0x06FF], // Greek + Arabic extended
+	[0x0E00, 0x1FFF], // Thai + Lao + IPA ext
+	[0x3040, 0x4DBF], // Hiragana + Katakana + CJK
+	[0x10A0, 0x10FF], // Georgian
 ];
 
 /**
- * Returns the set of scripts found in a single identifier string.
- */
-function getIdentifierScripts(identifier: string): Set<string> {
-	const found = new Set<string>();
-	for (const ch of identifier) {
-		for (const { name, regex } of SCRIPT_RANGES) {
-			if (regex.test(ch)) {
-				found.add(name);
-				break;
-			}
-		}
-	}
-	return found;
-}
-
-/**
- * Returns true if the identifier contains characters from more than one script,
- * or if it contains any non-Latin, non-digit, non-underscore characters
- * (i.e., identifiers that are not pure ASCII / Latin).
- *
- * Both conditions are "mixed-language":
- *   - "МойКласс"          → pure Cyrillic, not mixed → flagged (non-Latin script)
- *   - "MyМетод"           → Latin + Cyrillic → flagged (mixed scripts)
- *   - "MyClass"           → pure Latin → OK
- *   - "_myVar123"         → pure Latin + digits/underscore → OK
+ * Optimized non-Latin identifier detection.
+ * 
+ * Performance improvements (optimization #5):
+ * - Direct code point comparison instead of regex per character
+ * - Early exit on pure ASCII identifiers (fastest path)
  */
 function isMixedOrNonLatinIdentifier(identifier: string): boolean {
-	const scripts = getIdentifierScripts(identifier);
-	// Pure Latin (or no letters at all) → OK
-	if (scripts.size === 0 || (scripts.size === 1 && scripts.has('latin'))) {
-		return false;
+	for (let i = 0; i < identifier.length; i++) {
+		const code = identifier.charCodeAt(i);
+		
+		// ASCII fast path: letters, digits, underscore
+		if ((code >= 0x30 && code <= 0x39) || // 0-9
+			(code >= 0x41 && code <= 0x5A) || // A-Z
+			(code >= 0x61 && code <= 0x7A) || // a-z
+			code === 0x5F) { // _
+			continue;
+		}
+		
+		// Non-ASCII — check script ranges via direct comparison (no regex)
+		for (let r = 0; r < NON_LATIN_RANGES.length; r++) {
+			if (code >= NON_LATIN_RANGES[r][0] && code <= NON_LATIN_RANGES[r][1]) {
+				return true; // Non-Latin script detected
+			}
+		}
+		
+		// Any other non-ASCII (extended Latin, etc.) is flagged
+		if (code > 0x7F) {
+			return true;
+		}
 	}
-	// Contains any non-Latin script (even pure Cyrillic, Greek, etc.) → flag it
-	return true;
+	return false;
 }
 
 export interface MixedLanguageOccurrence {
@@ -377,14 +366,10 @@ export function findMixedLanguageIdentifiers(content: string): MixedLanguageOccu
 	const results: MixedLanguageOccurrence[] = [];
 	const lines = content.split('\n');
 
-	// A C# identifier: starts with letter or underscore, then letters/digits/underscores.
-	// We extend the character class to include any Unicode letter (\p{L} not available in
-	// all JS engines without 'u' flag – use a broad range instead).
-	// This regex matches every token that looks like an identifier.
-	// We then post-filter with isMixedOrNonLatinIdentifier.
-	const IDENTIFIER_RE = /[A-Za-z_\u00C0-\u024F\u0370-\u04FF\u0500-\u052F\u0530-\u05FF\u0590-\u06FF\u0E00-\u0E7F\u1E00-\u1EFF\u1F00-\u1FFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF][A-Za-z0-9_\u00C0-\u024F\u0370-\u04FF\u0500-\u052F\u0530-\u05FF\u0590-\u06FF\u0E00-\u0E7F\u1E00-\u1EFF\u1F00-\u1FFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]*/g;
+	// Identifier regex: matches potential identifiers (including non-ASCII letters)
+	const IDENTIFIER_RE = /[A-Za-z_\u00C0-\u024F\u0370-\u06FF\u0E00-\u1FFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF][A-Za-z0-9_\u00C0-\u024F\u0370-\u06FF\u0E00-\u1FFF\u3040-\u30FF\u4E00-\u9FFF\uAC00-\uD7AF]*/g;
 
-	// C# keywords to skip (they are always Latin so won't be flagged, but skip for clarity)
+	// C# keywords to skip (all Latin, won't be flagged but skip for clarity/speed)
 	const CS_KEYWORDS = new Set([
 		'abstract', 'as', 'base', 'bool', 'break', 'byte', 'case', 'catch', 'char',
 		'checked', 'class', 'const', 'continue', 'decimal', 'default', 'delegate', 'do',
@@ -404,7 +389,15 @@ export function findMixedLanguageIdentifiers(content: string): MixedLanguageOccu
 	let inBlockComment = false;
 
 	for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-		let line = lines[lineIdx];
+		const originalLine = lines[lineIdx];
+
+		// OPTIMIZATION: Quick pre-check — if line has no non-ASCII at all, skip all processing.
+		// Avoids expensive string operations on purely ASCII lines (the common case).
+		if (!hasNonAsciiFast(originalLine)) {
+			continue; // No non-ASCII chars → no mixed-language identifiers possible
+		}
+
+		let line = originalLine;
 
 		// Handle block comments spanning multiple lines
 		if (inBlockComment) {
@@ -414,6 +407,11 @@ export function findMixedLanguageIdentifiers(content: string): MixedLanguageOccu
 			}
 			line = line.slice(endIdx + 2);
 			inBlockComment = false;
+
+			// Quick re-check after stripping comment tail
+			if (!hasNonAsciiFast(line)) {
+				continue;
+			}
 		}
 
 		// Strip block comment fragments on this line (non-greedy)
@@ -428,7 +426,6 @@ export function findMixedLanguageIdentifiers(content: string): MixedLanguageOccu
 			stripped += remaining.slice(0, bcStart);
 			const bcEnd = remaining.indexOf('*/', bcStart + 2);
 			if (bcEnd === -1) {
-				// Block comment started but not closed on this line
 				inBlockComment = true;
 				break;
 			}
@@ -442,17 +439,19 @@ export function findMixedLanguageIdentifiers(content: string): MixedLanguageOccu
 			line = line.slice(0, slCommentIdx);
 		}
 
-		// Strip string literals (regular and verbatim) to avoid flagging
-		// non-Latin text inside strings.
-		// This is a simplified removal – handles most common cases.
+		// Strip string literals to avoid flagging non-Latin text inside strings
 		line = stripStringLiterals(line);
 
-		// Now scan for identifiers
+		// Only scan for identifiers if line has non-ASCII after stripping
+		if (!hasNonAsciiFast(line)) {
+			continue; // All non-ASCII was inside comments/strings
+		}
+
 		IDENTIFIER_RE.lastIndex = 0;
 		let match: RegExpExecArray | null;
 		while ((match = IDENTIFIER_RE.exec(line)) !== null) {
 			const ident = match[0];
-			// Skip pure C# keywords (Latin only, won't be flagged anyway, but skip to be safe)
+			// Skip C# keywords (Latin only, but skip for clarity)
 			if (CS_KEYWORDS.has(ident)) {
 				continue;
 			}
@@ -471,29 +470,71 @@ export function findMixedLanguageIdentifiers(content: string): MixedLanguageOccu
 }
 
 /**
- * Replaces string literal contents with spaces so that non-Latin characters
- * inside strings are not flagged as identifier issues.
- *
- * Handles:
- *  - Regular string literals:  "..."
- *  - Char literals:            '.'
- *  - Verbatim strings:         @"..." (single-line portion only)
- *  - Interpolated strings:     $"..." (strips inner parts)
- *
- * Does NOT handle multi-line verbatim strings (acceptable limitation).
+ * Optimized string literal stripper — single-pass instead of 4 chained .replace() calls.
  */
 function stripStringLiterals(line: string): string {
-	// Replace content of string and char literals with spaces.
-	// We use a regex that matches quoted content including escape sequences.
-	return line
-		// Verbatim strings @"..."
-		.replace(/@"(?:[^"]|"")*"/g, (m) => ' '.repeat(m.length))
-		// Interpolated strings $"..." (simplified – treats as regular string)
-		.replace(/\$"(?:[^"\\]|\\.)*"/g, (m) => ' '.repeat(m.length))
-		// Regular strings "..."
-		.replace(/"(?:[^"\\]|\\.)*"/g, (m) => ' '.repeat(m.length))
-		// Char literals '.'
-		.replace(/'(?:[^'\\]|\\.)'/g, (m) => ' '.repeat(m.length));
+	let result = '';
+	let i = 0;
+	const len = line.length;
+
+	while (i < len) {
+		const ch = line[i];
+
+		if (ch === '"') {
+			// Check for verbatim string @"..."
+			if (i + 1 < len && line[i + 1] === '"') {
+				i += 2; // skip @"
+				while (i < len) {
+					if (line[i] === '"' && i + 1 < len && line[i + 1] !== '"') {
+						i++; // skip closing "
+						break;
+					}
+					i++; // skip character (including doubled "")
+				}
+				continue;
+			}
+
+			// Check for interpolated string $"..." (treat as regular string)
+			if (i > 0 && line[i - 1] === '$') {
+				i++; // skip $
+			}
+
+			// Regular string "..." — skip contents
+			i++; // skip opening "
+			while (i < len) {
+				if (line[i] === '\\') {
+					i += 2; // skip escaped character
+				} else if (line[i] === '"') {
+					i++; // skip closing "
+					break;
+				} else {
+					i++;
+				}
+			}
+			continue;
+		}
+
+		if (ch === "'") {
+			// Char literal — skip contents
+			i++; // skip opening '
+			while (i < len) {
+				if (line[i] === '\\') {
+					i += 2; // skip escaped character
+				} else if (line[i] === "'") {
+					i++; // skip closing '
+					break;
+				} else {
+					i++;
+				}
+			}
+			continue;
+		}
+
+		result += ch;
+		i++;
+	}
+
+	return result;
 }
 
 /**

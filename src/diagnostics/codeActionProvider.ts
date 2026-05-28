@@ -47,7 +47,7 @@ export class CSharpDiagnosticsCodeActionProvider implements vscode.CodeActionPro
 		diagnostic: vscode.Diagnostic
 	): vscode.CodeAction | undefined {
 		const action = new vscode.CodeAction(
-			'Fix namespace (CSharp Painkiller)',
+			'Fix namespace',
 			vscode.CodeActionKind.QuickFix
 		);
 		action.diagnostics = [diagnostic];
@@ -68,7 +68,7 @@ export class CSharpDiagnosticsCodeActionProvider implements vscode.CodeActionPro
 		diagnostic: vscode.Diagnostic
 	): vscode.CodeAction | undefined {
 		const action = new vscode.CodeAction(
-			'Sort using directives (CSharp Painkiller)',
+			'Sort using directives',
 			vscode.CodeActionKind.QuickFix
 		);
 		action.diagnostics = [diagnostic];

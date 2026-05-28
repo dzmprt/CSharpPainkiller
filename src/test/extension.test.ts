@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import { sanitizeNamespaceSegment, escapeRegExp, hasPartialTypes } from '../utils/contentParser.js';
 import { getTemplate } from '../templates.js';
+import { adjustFileNamespace } from '../namespace/adjust.js';
 
 suite('CSharp Painkiller Tests', () => {
 	// ============================================================================
@@ -83,6 +84,30 @@ suite('CSharp Painkiller Tests', () => {
 
 		test('returns false for empty content', () => {
 			assert.ok(!hasPartialTypes(''));
+		});
+	});
+
+	// ============================================================================
+	// Namespace adjustment tests
+	// ============================================================================
+
+	suite('Namespace Adjustment', () => {
+		test('replaces block namespace without usings at file start', () => {
+			const content = 'namespace Books.Domain.Test\n{\n\tpublic class Book\n\t{\n\t}\n}';
+			const result = adjustFileNamespace(content, 'test/Books/Book.cs', 'Books.Domain');
+
+			assert.ok(result.wasAdjusted);
+			assert.strictEqual(result.oldNamespace, 'Books.Domain.Test');
+			assert.strictEqual(result.adjustedContent, 'namespace Books.Domain;\n\npublic class Book\n{\n}\n');
+		});
+
+		test('replaces block namespace without usings when file has BOM', () => {
+			const content = '\uFEFFnamespace Books.Domain.Test\n{\n\tpublic class Book\n\t{\n\t}\n}';
+			const result = adjustFileNamespace(content, 'test/Books/Book.cs', 'Books.Domain');
+
+			assert.ok(result.wasAdjusted);
+			assert.strictEqual(result.oldNamespace, 'Books.Domain.Test');
+			assert.strictEqual(result.adjustedContent, '\uFEFFnamespace Books.Domain;\n\npublic class Book\n{\n}\n');
 		});
 	});
 });

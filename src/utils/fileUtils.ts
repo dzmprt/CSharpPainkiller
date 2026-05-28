@@ -29,7 +29,8 @@ export function isPathExcluded(filePath: string): boolean {
  */
 export async function collectCsFiles(folderUri: vscode.Uri): Promise<vscode.Uri[]> {
 	const pattern = '**/*.cs';
-	const files = await vscode.workspace.findFiles(pattern);
+	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const files = await vscode.workspace.findFiles(pattern, exclusionPattern);
 
 	// Filter to only include files within the target folder and exclude bin/obj
 	const normalizedFolderPath = '/' + folderUri.path.replace(/^\/+/, '');
@@ -52,7 +53,8 @@ export async function collectCsFiles(folderUri: vscode.Uri): Promise<vscode.Uri[
  */
 export async function collectAllCsFilesInWorkspace(): Promise<vscode.Uri[]> {
 	const pattern = '**/*.cs';
-	const files = await vscode.workspace.findFiles(pattern);
+	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const files = await vscode.workspace.findFiles(pattern, exclusionPattern);
 
 	// Exclude files in bin/obj directories
 	return files.filter(uri => {
@@ -95,7 +97,8 @@ export function findProjectRootForPath(
  * This is called once per folder operation to avoid repeated searches.
  */
 export async function preloadCsprojs(_folderUri: vscode.Uri): Promise<ProjectContext> {
-	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj');
+	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', exclusionPattern);
 
 	const csprojs: CsprojInfo[] = csprojFiles.map(uri => ({
 		dirPath: uri.path.replace(/\/[^/]*$/, ''),
@@ -114,7 +117,8 @@ export async function findProjectDirectory(folderUri: vscode.Uri): Promise<strin
 		return undefined;
 	}
 
-	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj');
+	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', exclusionPattern);
 	if (csprojFiles.length === 0) {
 		return undefined;
 	}

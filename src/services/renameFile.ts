@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import { getPublicTypeName, hasPartialTypes } from '../utils/contentParser.js';
 import { collectCsFiles, getFileNameFromUri } from '../utils/fileUtils.js';
+import { ErrorHandler } from '../utils/errorHandler.js';
+import { OperationError } from '../utils/operationError.js';
 
 /**
  * Renames a single file based on its C# type name.
@@ -25,16 +27,30 @@ export async function renameFileByType(
 		const typeInfo = getPublicTypeName(content);
 
 		if (typeInfo === null) {
+			const err = new OperationError('NO_TYPE_FOUND', {
+				operation: 'rename-file',
+				target: currentFileName,
+				reason: 'No public class, record, struct, or interface found',
+				suggestion: 'Add a public type definition to the file first',
+			});
+			ErrorHandler.showOperationError(err);
 			return {
 				success: false,
-				message: `No type found in file ${currentFileName}. Cannot determine filename.`,
+				message: err.context.reason ?? 'No type found',
 			};
 		}
 
 		if (typeInfo === 'ambiguous') {
+			const err = new OperationError('MULTIPLE_TYPES_FOUND', {
+				operation: 'rename-file',
+				target: currentFileName,
+				reason: 'Multiple public types found (conflicting names)',
+				suggestion: 'Keep only one public type per file, or split into separate files',
+			});
+			ErrorHandler.showOperationError(err);
 			return {
 				success: false,
-				message: `Multiple types found in file ${currentFileName}. Cannot determine which name to use for the file.`,
+				message: err.context.reason ?? 'Multiple types found',
 			};
 		}
 
@@ -56,9 +72,16 @@ export async function renameFileByType(
 		// Check if target file already exists
 		try {
 			await vscode.workspace.fs.stat(newFileUri);
+			const err = new OperationError('FILE_ALREADY_EXISTS', {
+				operation: 'rename-file',
+				target: newFileName,
+				reason: `Target file '${newFileName}' already exists`,
+				suggestion: 'Rename or delete the existing file first',
+			});
+			ErrorHandler.showOperationError(err);
 			return {
 				success: false,
-				message: `File ${newFileName} already exists in the target location.`,
+				message: err.context.reason ?? 'File already exists',
 			};
 		} catch {
 			// Target file doesn't exist, proceed with rename
@@ -81,9 +104,17 @@ export async function renameFileByType(
 			message: `Renamed file from "${currentFileName}" to "${newFileName}".`,
 		};
 	} catch (error) {
+		const reason = error instanceof Error ? error.message : 'File system error';
+		const err = new OperationError('RENAME_FAILED', {
+			operation: 'rename-file',
+			target: fileUri.path.split('/').pop(),
+			reason,
+			suggestion: 'Check file permissions and that the file is not open in the editor',
+		});
+		ErrorHandler.showOperationError(err);
 		return {
 			success: false,
-			message: `Error renaming file: ${error}`,
+			message: err.context.reason ?? 'Error renaming file',
 		};
 	}
 }

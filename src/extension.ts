@@ -7,12 +7,6 @@ import { sortUsingsInFile, sortUsingsInFolder } from './services/sortUsings.js';
 import { extractInterfaceFromFile } from './services/extractInterface.js';
 import { uriIsDirectory, uriIsFile } from './utils/fileUtils.js';
 import { detectMediatorFile } from './utils/contentParser.js';
-import {
-	runDiagnosticsForDocument,
-	runDiagnosticsForUri,
-	runDiagnosticsForWorkspace,
-} from './diagnostics/diagnosticsProvider.js';
-import { CSharpDiagnosticsCodeActionProvider } from './diagnostics/codeActionProvider.js';
 import { MapToCodeActionProvider } from './codeActions/mapToCodeActionProvider.js';
 import { GoToHandlerCodeActionProvider } from './codeActions/goToHandlerCodeActionProvider.js';
 import { generateMapToForDocument, generateMapFromForDocument } from './services/generateMapTo.js';
@@ -44,6 +38,10 @@ import {
 	createEfCoreConfigurationFromFolder,
 	createEfCoreConfigurationFromFile,
 } from './services/efCoreCommands.js';
+import { validateUri as validateSharedUri } from './utils/sharedUtilities.js';
+
+import { CsprojCache } from './utils/csprojCache.js';
+import { fetchDotnetTemplates, registerDynamicTemplateCommands } from './services/dotnetTemplates.js';
 
 /**
  * List of all "Create" commands for C# types.
@@ -57,44 +55,25 @@ const CREATE_COMMANDS: { id: string; type: CType }[] = [
 	{ id: 'csharppainkiller.createRecordStruct', type: 'record struct' },
 ];
 
-/**
- * Validates the selected URI and returns appropriate error messages.
- */
-function validateUri(uri: vscode.Uri | undefined, requireCsFile: boolean = false): string | undefined {
-	if (!uri) {
-		return 'No file or folder selected.';
-	}
-
-	if (uri.scheme !== 'file') {
-		return 'Only local files and folders are supported.';
-	}
-
-	if (requireCsFile && !uri.path.endsWith('.cs')) {
-		return 'This command only works on .cs files.';
-	}
-
-	return undefined;
-}
+// Alias validateUri for backward compatibility with existing code
+const validateUri = validateSharedUri;
 
 /**
  * Activates the CSharp Painkiller extension.
  * Registers all commands, diagnostics, and event subscriptions.
+ * Uses built-in VSCode language providers for C# analysis (C# DevKit optional).
  */
-export function activate(context: vscode.ExtensionContext) {
-	// -------------------------------------------------------------------------
-	// Diagnostics setup
-	// -------------------------------------------------------------------------
-	const diagnosticCollection = vscode.languages.createDiagnosticCollection('csharppainkiller');
-	context.subscriptions.push(diagnosticCollection);
+export async function activate(context: vscode.ExtensionContext) {
+	console.log('CSharp Painkiller is starting...');
 
-	// Register Code Action provider for quick fixes
-	const codeActionProvider = vscode.languages.registerCodeActionsProvider(
-		{ language: 'csharp', scheme: 'file' },
-		new CSharpDiagnosticsCodeActionProvider(),
-		{ providedCodeActionKinds: CSharpDiagnosticsCodeActionProvider.providedCodeActionKinds }
-	);
-	context.subscriptions.push(codeActionProvider);
+		// -------------------------------------------------------------------------
+	// Initialize CsprojCache — discover .csproj files once, then cache
+	// -------------------------------------------------------------------------
+	const csprojCache = CsprojCache.getInstance();
+	await csprojCache.initialize(context);
+	console.log('CsprojCache initialized');
 
+	// -------------------------------------------------------------------------
 	// Register Code Action provider for MapTo generation
 	const mapToCodeActionProvider = vscode.languages.registerCodeActionsProvider(
 		{ language: 'csharp', scheme: 'file' },
@@ -139,78 +118,7 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 	context.subscriptions.push(generateMapFromDisposable);
 
-	// Run diagnostics on all open editors at startup and scan workspace
-	runDiagnosticsForWorkspace(diagnosticCollection).catch(() => { /* ignore startup errors */ });
-
-	// Re-run diagnostics when a document is opened or its content changes (on save)
-	context.subscriptions.push(
-		vscode.workspace.onDidOpenTextDocument(doc => {
-			runDiagnosticsForDocument(doc, diagnosticCollection).catch(() => { });
-		})
-	);
-
-	context.subscriptions.push(
-		vscode.workspace.onDidSaveTextDocument(doc => {
-			runDiagnosticsForDocument(doc, diagnosticCollection).catch(() => { });
-		})
-	);
-
-	// FileSystemWatcher catches changes made outside VS Code (terminal, git, external tools).
-	// onDidDeleteFiles / onDidRenameFiles only fire for operations done inside VS Code Explorer.
-	const watcher = vscode.workspace.createFileSystemWatcher('**/*.cs');
-	context.subscriptions.push(watcher);
-
-	// File created on disk → analyse it
-	watcher.onDidCreate(uri => {
-		runDiagnosticsForUri(uri, diagnosticCollection).catch(() => { });
-	});
-
-	// File changed on disk → re-analyse
-	watcher.onDidChange(uri => {
-		runDiagnosticsForUri(uri, diagnosticCollection).catch(() => { });
-	});
-
-	// File deleted on disk → remove its diagnostics
-	watcher.onDidDelete(uri => {
-		diagnosticCollection.delete(uri);
-	});
-
-	// Also handle renames/deletes done via VS Code Explorer (fired before watcher sees them)
-	context.subscriptions.push(
-		vscode.workspace.onDidDeleteFiles(event => {
-			for (const uri of event.files) {
-				diagnosticCollection.delete(uri);
-			}
-		})
-	);
-
-	context.subscriptions.push(
-		vscode.workspace.onDidRenameFiles(event => {
-			for (const { oldUri, newUri } of event.files) {
-				diagnosticCollection.delete(oldUri);
-				runDiagnosticsForUri(newUri, diagnosticCollection).catch(() => { });
-			}
-		})
-	);
-
-	context.subscriptions.push(
-		vscode.workspace.onDidCreateFiles(event => {
-			for (const uri of event.files) {
-				runDiagnosticsForUri(uri, diagnosticCollection).catch(() => { });
-			}
-		})
-	);
-
-	// Re-run workspace diagnostics when the user changes analyzer settings
-	context.subscriptions.push(
-		vscode.workspace.onDidChangeConfiguration(event => {
-			if (event.affectsConfiguration('csharppainkiller.diagnostics')) {
-				runDiagnosticsForWorkspace(diagnosticCollection).catch(() => { });
-			}
-		})
-	);
-
-	// -------------------------------------------------------------------------
+		// -------------------------------------------------------------------------
 	// Mediator file context key
 	// Sets `csharppainkiller.isMediatorFile` based on the active editor content,
 	// so that "Generate Handler" and "Go To Handler" menu items are only shown
@@ -232,11 +140,15 @@ export function activate(context: vscode.ExtensionContext) {
 	}
 
 	// Run on startup for the already-active editor
-	updateMediatorContext(vscode.window.activeTextEditor?.document.uri).catch(() => { });
+	updateMediatorContext(vscode.window.activeTextEditor?.document.uri).catch((error) => {
+		console.warn('Failed to update mediator context on startup:', error);
+	});
 
 	context.subscriptions.push(
 		vscode.window.onDidChangeActiveTextEditor(editor => {
-			updateMediatorContext(editor?.document.uri).catch(() => { });
+			updateMediatorContext(editor?.document.uri).catch((error) => {
+				console.warn('Failed to update mediator context on editor change:', error);
+			});
 		})
 	);
 
@@ -244,7 +156,9 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(
 		vscode.workspace.onDidSaveTextDocument(doc => {
 			if (doc.uri === vscode.window.activeTextEditor?.document.uri) {
-				updateMediatorContext(doc.uri).catch(() => { });
+				updateMediatorContext(doc.uri).catch((error) => {
+					console.warn('Failed to update mediator context on save:', error);
+				});
 			}
 		})
 	);
@@ -265,26 +179,21 @@ export function activate(context: vscode.ExtensionContext) {
 	const adjustNamespaceDisposable = vscode.commands.registerCommand(
 		'csharppainkiller.adjustNamespace',
 		async (uri?: vscode.Uri) => {
-			const error = validateUri(uri);
-			if (error) {
-				vscode.window.showErrorMessage(error);
+			const uriValue = uri;
+			if (!uriValue) {
+				vscode.window.showErrorMessage('No file or folder selected.');
 				return;
 			}
-
-			const uriValue = uri!;
 
 			if (await uriIsDirectory(uriValue)) {
 				await adjustNamespaceForFolder(uriValue);
 			} else if (await uriIsFile(uriValue)) {
-				const fileError = validateUri(uriValue, true);
+				const fileError = validateUri(uriValue, { requireCsFile: true });
 				if (fileError) {
 					vscode.window.showErrorMessage(fileError);
 					return;
 				}
 				await adjustNamespaceForSingleFile(uriValue);
-
-				// After fixing namespace, refresh diagnostics for this file
-				runDiagnosticsForUri(uriValue, diagnosticCollection).catch(() => { });
 			} else {
 				vscode.window.showErrorMessage('Unsupported file type.');
 			}
@@ -297,18 +206,16 @@ export function activate(context: vscode.ExtensionContext) {
 	const renameFileByTypeDisposable = vscode.commands.registerCommand(
 		'csharppainkiller.renameFileByType',
 		async (uri?: vscode.Uri) => {
-			const error = validateUri(uri);
-			if (error) {
-				vscode.window.showErrorMessage(error);
+			const uriValue = uri;
+			if (!uriValue) {
+				vscode.window.showErrorMessage('No file or folder selected.');
 				return;
 			}
-
-			const uriValue = uri!;
 
 			if (await uriIsDirectory(uriValue)) {
 				await renameFilesByTypeInFolder(uriValue);
 			} else if (await uriIsFile(uriValue)) {
-				const fileError = validateUri(uriValue, true);
+				const fileError = validateUri(uriValue, { requireCsFile: true });
 				if (fileError) {
 					vscode.window.showErrorMessage(fileError);
 					return;
@@ -328,18 +235,16 @@ export function activate(context: vscode.ExtensionContext) {
 	const sortUsingsDisposable = vscode.commands.registerCommand(
 		'csharppainkiller.sortUsings',
 		async (uri?: vscode.Uri) => {
-			const error = validateUri(uri);
-			if (error) {
-				vscode.window.showErrorMessage(error);
+			const uriValue = uri;
+			if (!uriValue) {
+				vscode.window.showErrorMessage('No file or folder selected.');
 				return;
 			}
-
-			const uriValue = uri!;
 
 			if (await uriIsDirectory(uriValue)) {
 				await sortUsingsInFolder(uriValue);
 			} else if (await uriIsFile(uriValue)) {
-				const fileError = validateUri(uriValue, true);
+				const fileError = validateUri(uriValue, { requireCsFile: true });
 				if (fileError) {
 					vscode.window.showErrorMessage(fileError);
 					return;
@@ -358,13 +263,18 @@ export function activate(context: vscode.ExtensionContext) {
 	const extractInterfaceDisposable = vscode.commands.registerCommand(
 		'csharppainkiller.extractInterface',
 		async (uri?: vscode.Uri) => {
-			const error = validateUri(uri, true);
-			if (error) {
-				vscode.window.showErrorMessage(error);
+			const uriValue = uri;
+			if (!uriValue) {
+				vscode.window.showErrorMessage('No file or folder selected.');
 				return;
 			}
 
-			await extractInterfaceFromFile(uri!);
+			if (!uriValue.path.endsWith('.cs')) {
+				vscode.window.showErrorMessage('This command only works on .cs files.');
+				return;
+			}
+
+			await extractInterfaceFromFile(uriValue);
 		}
 	);
 
@@ -373,7 +283,7 @@ export function activate(context: vscode.ExtensionContext) {
 	context.subscriptions.push(sortUsingsDisposable);
 	context.subscriptions.push(extractInterfaceDisposable);
 
-	// -------------------------------------------------------------------------
+		// -------------------------------------------------------------------------
 	// "C# Generate Handler" / "C# Go To Handler" context menu commands
 	// -------------------------------------------------------------------------
 	context.subscriptions.push(
@@ -433,15 +343,25 @@ export function activate(context: vscode.ExtensionContext) {
 		)
 	);
 
-	// -------------------------------------------------------------------------
-	// "C# Templates > MediatR" commands
-	// -------------------------------------------------------------------------
-	context.subscriptions.push(
-		vscode.commands.registerCommand(
-			'csharppainkiller.templates.mediatr.createRequestAndHandler',
-			(uri?: vscode.Uri) => createMediatRRequestAndHandler(uri)
-		)
-	);
+  // -------------------------------------------------------------------------
+  // ".NET Project" commands — dynamically loaded from `dotnet new list`
+  // -------------------------------------------------------------------------
+
+  // Fetch templates and register dynamic commands at startup
+  const dotnetTemplates = await fetchDotnetTemplates(context);
+
+  // Register all dynamic template commands (including the unified createProject command)
+  registerDynamicTemplateCommands(dotnetTemplates, context);
+
+  // -------------------------------------------------------------------------
+  // "C# Templates > MediatR" commands
+  // -------------------------------------------------------------------------
+  context.subscriptions.push(
+    vscode.commands.registerCommand(
+      'csharppainkiller.templates.mediatr.createRequestAndHandler',
+      (uri?: vscode.Uri) => createMediatRRequestAndHandler(uri)
+    )
+  );
 	context.subscriptions.push(
 		vscode.commands.registerCommand(
 			'csharppainkiller.templates.mediatr.createRequest',
@@ -536,11 +456,16 @@ export function activate(context: vscode.ExtensionContext) {
 			(uri?: vscode.Uri) => createMitMediatorFluentValidationBehavior(uri)
 		)
 	);
+
+	// -------------------------------------------------------------------------
+	// Cleanup: dispose CsprojCache singleton on extension deactivation
+	// -------------------------------------------------------------------------
+	context.subscriptions.push({
+		dispose: () => csprojCache.dispose()
+	});
 }
 
-/**
- * Deactivates the extension.
- */
 export function deactivate() {
-	// Cleanup if needed
+	// Dispose CsprojCache on extension deactivation
+	CsprojCache.getInstance().dispose();
 }

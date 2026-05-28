@@ -1,6 +1,6 @@
-CSharp Painkiller
+C# Painkiller
 
-Smart file creation, namespace management, code generation, diagnostics, and more for C#.
+Smart file creation, code generation, project creation, namespace management and more for C#.
 
 ![License](https://img.shields.io/github/license/dzmprt/CSharpPainkiller)
 
@@ -12,6 +12,10 @@ Smart file creation, namespace management, code generation, diagnostics, and mor
 
 ---
 
+## Requirements
+
+- **VS Code 1.92.0+**
+
 ## Table of Contents
 
 - [Features](#features)
@@ -21,10 +25,10 @@ Smart file creation, namespace management, code generation, diagnostics, and mor
   - [Generate Mapping Methods](#generate-mapping-methods)
   - [Sort Usings](#sort-usings)
   - [Extract Interface](#extract-interface)
+  - [.NET Project Creation](#net-project-creation)
   - [ASP.NET Templates](#aspnet-templates)
   - [MediatR and MitMediator templates](#mediatr-and-mitmediator-templates)
   - [EF Core](#ef-core)
-  - [Diagnostics](#diagnostics)
   - [Go To Handler](#go-to-handler)
 - [Issues](#issues)
 - [Release Notes](#release-notes)
@@ -63,6 +67,12 @@ Alphabetically sort `using` directives in a `.cs` file or across an entire folde
 
 Generate an interface from a class definition in one click. Right-click a `.cs` file → **C# Refactor → C# Extract Interface**.
 
+### .NET Project Creation
+
+Scaffold new .NET projects using dynamic templates from `dotnet new list`. Right-click a **folder** in the Explorer → **.NET NEW**. The extension dynamically fetches available .NET templates and registers them as commands at startup, allowing you to create any project type supported by the .NET SDK.
+
+![ASP.NET Templates demo](images/NETProjectCreation.gif)
+
 ### ASP.NET Templates
 
 Scaffold ASP.NET controllers and Minimal API endpoints. Right-click a folder → **C# Generator → ASP.NET**.
@@ -100,17 +110,6 @@ Scaffold Entity Framework Core entity configurations. Right-click a folder → *
 
 ![EF Core demo](images/efcore.gif)
 
-### Diagnostics
-
-The extension provides real-time inline diagnostics for common C# code-quality issues. All diagnostics can be individually enabled or disabled in Settings.
-
-| Diagnostic | Description | Setting |
-|-----------|-------------|---------|
-| **Wrong namespace** | Namespace doesn't match the file path | `csharppainkiller.diagnostics.wrongNamespace` |
-| **Wrong filename** | File name doesn't match the primary type name | `csharppainkiller.diagnostics.wrongFilename` |
-| **Unsorted usings** | `using` directives are not in alphabetical order | `csharppainkiller.diagnostics.unsortedUsings` |
-| **Mixed-language identifiers** | Type/method/variable names contain non-Latin or mixed-script characters | `csharppainkiller.diagnostics.mixedLanguageIdentifiers` |
-
 ### Go To Handler
 
 Navigate between a MediatR/MitMediator request file and its handler.
@@ -123,14 +122,22 @@ Navigate between a MediatR/MitMediator request file and its handler.
 
 ## Release Notes
 
+### 0.0.2
+
+- Added **.NET Project Creation** (`.NET NEW`) — dynamic template scaffolding from `dotnet new list`
+- Real-time diagnostics have been removed due to performance issues. This may be added in the future
+- Changed sort usings logic
+
 ### 0.0.1
 
 Initial release with:
 - C# type creation (class, record, struct, enum, interface, record struct)
 - Namespace adjustment for files and folders with automatic `using` directive updates
 - File renaming based on the contained C# type name
-- Sort usings, extract interface, generate mapping methods
-- ASP.NET, MediatR, MitMediator, and EF Core code generation templates
+- Sort usings, extract interface, generate MapTo/MapFrom mapping methods
+- ASP.NET templates (Empty Controller, EF CRUD Controller, Empty Minimal API, EF CRUD Minimal API)
+- MediatR and MitMediator templates (Request, Handler, Notification, PipelineBehavior)
+- EF Core Entity Configuration generation
 - Real-time diagnostics (wrong namespace, wrong filename, unsorted usings, mixed-language identifiers)
 - Generate Request and handler for MediatR and MitMediator request files
-- Go To Handler for MediatR and MitMediator
+- Go To Handler navigation for MediatR and MitMediator

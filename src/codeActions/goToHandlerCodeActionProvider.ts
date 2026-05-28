@@ -1,14 +1,15 @@
 import * as vscode from 'vscode';
-import { getTypeNameAtPosition } from '../services/generateMapTo.js';
-import { detectMediatorFile } from '../utils/contentParser.js';
+import { ParserCache } from './parserCache.js';
 
 /**
  * Code action provider that offers "Go to Handler" when the cursor is on a
  * class that implements IRequest<T>, IRequest, or INotification
  * (from MediatR or MitMediator).
+ * Uses ParserCache to avoid redundant document scanning.
  */
 export class GoToHandlerCodeActionProvider implements vscode.CodeActionProvider {
 	public static readonly providedCodeActionKinds = [vscode.CodeActionKind.RefactorRewrite];
+	private static parserCache = ParserCache.getInstance();
 
 	provideCodeActions(
 		document: vscode.TextDocument,
@@ -20,21 +21,19 @@ export class GoToHandlerCodeActionProvider implements vscode.CodeActionProvider 
 			return [];
 		}
 
-		const content = document.getText();
-
-		// Only offer the action when this file contains a mediator type
-		if (!detectMediatorFile(content)) {
+		// Use cached mediator detection instead of scanning full content every time
+		if (!GoToHandlerCodeActionProvider.parserCache.isMediatorFile(document)) {
 			return [];
 		}
 
-		// Only show the action when the cursor is on the class name
+		// Use cached type name extraction at the cursor position
 		const position = range instanceof vscode.Selection ? range.active : range.start;
-		if (!getTypeNameAtPosition(document, position)) {
+		if (!GoToHandlerCodeActionProvider.parserCache.getTypeNameAt(document, position.line, position.character)) {
 			return [];
 		}
 
 		const action = new vscode.CodeAction(
-			'Go to Handler (CSharp Painkiller)',
+			'Go to Handler',
 			vscode.CodeActionKind.RefactorRewrite
 		);
 		action.command = {

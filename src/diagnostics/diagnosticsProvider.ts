@@ -1,8 +1,4 @@
 import * as vscode from 'vscode';
-import { extractFileNamespace, getTypeNameForFileDiagnostic, hasPartialTypes, findMixedLanguageIdentifiers } from '../utils/contentParser.js';
-import { deriveNamespaceFromFile } from '../namespace/compute.js';
-import { isPathExcluded } from '../utils/fileUtils.js';
-import { sortUsingsInContent } from '../services/sortUsings.js';
 
 // ============================================================================
 // Diagnostic codes
@@ -16,20 +12,198 @@ export const DIAGNOSTIC_CODE_UNSORTED_USINGS = 'unsorted-usings';
 export const DIAGNOSTIC_CODE_MIXED_LANGUAGE = 'mixed-language-identifier';
 
 // ============================================================================
-// Configuration helpers
+// Scheduler import — handles batch processing and debounce optimization
 // ============================================================================
+import { runDiagnosticsInBatches } from './scheduler.js';
 
-function isAnalyzerEnabled(key: string): boolean {
-	const config = vscode.workspace.getConfiguration('csharppainkiller.diagnostics');
-	return config.get<boolean>(key, true);
+// ============================================================================
+// Content parser and namespace utilities (static imports)
+// ============================================================================
+import { extractFileNamespace, getTypeNameForFileDiagnostic, hasPartialTypes, findMixedLanguageIdentifiers } from '../utils/contentParser.js';
+import { deriveNamespaceFromFile } from '../namespace/compute.js';
+import { isPathExcluded } from '../utils/fileUtils.js';
+
+// ============================================================================
+// Optimization #4: Content-based caching — avoids redundant analysis
+// ============================================================================
+import { fastContentHash } from '../utils/contentHash.js';
+
+/** Cache entry: hash of file content + precomputed diagnostics array. */
+interface DiagnosticCacheEntry {
+	hash: string;
+	diagnostics: vscode.Diagnostic[];
+}
+
+/** Global cache keyed by URI → last analyzed content hash and result. */
+const analysisCache = new Map<string, DiagnosticCacheEntry>();
+
+/**
+ * Get cached diagnostics for a file if the content hash matches.
+ */
+function getCachedDiagnostics(uri: vscode.Uri): vscode.Diagnostic[] | null {
+	const entry = analysisCache.get(uri.toString());
+	if (entry) {
+		return entry.diagnostics; // Cache hit — return precomputed diagnostics instantly.
+	}
+	return null;
+}
+
+/**
+ * Store computed diagnostics in the content-based cache.
+ */
+function storeCachedDiagnostics(uri: vscode.Uri, hash: string, diagnostics: vscode.Diagnostic[]): void {
+	analysisCache.set(uri.toString(), { hash, diagnostics });
+}
+
+/**
+ * Clear cache for a specific URI (e.g., on file close).
+ */
+function clearCacheForUri(uri: vscode.Uri): void {
+	analysisCache.delete(uri.toString());
 }
 
 // ============================================================================
-// Diagnostics provider
+// Optimization #10: Timing/telemetry — measures each analyzer's duration
+// ============================================================================
+
+/** Enable debug timing logging (set via vscode window telemetry or env). */
+const DEBUG_TIMING = process.env.NODE_ENV === 'development';
+
+function logTiming(label: string, elapsedMs: number): void {
+	if (DEBUG_TIMING) {
+		console.debug(`[CSharp Painkiller] ${label}: ${elapsedMs.toFixed(2)}ms`);
+	}
+}
+
+// ============================================================================
+// Optimization #1: Unified single-pass analyzer
+// ============================================================================
+
+/** Shared state cached during a single analysis pass. */
+interface AnalysisContext {
+	readonly uri: vscode.Uri;
+	readonly content: string;
+	readonly diagnostics: vscode.Diagnostic[];
+	/** Whether namespace diagnostic is enabled. */
+	namespaceEnabled: boolean;
+	/** Whether filename diagnostic is enabled. */
+	filenameEnabled: boolean;
+	/** whether using sort diagnostic is enabled. */
+	unsortedUsingsEnabled: boolean;
+	/** Whether mixed-language diagnostic is enabled. */
+	mixedLanguageEnabled: boolean;
+}
+
+/**
+ * Creates a new analysis context for unified single-pass processing.
+ * (Optimization #1: all diagnostics are collected in ONE pass over the file.)
+ */
+function createAnalysisContext(
+	uri: vscode.Uri,
+	content: string
+): AnalysisContext {
+	return {
+		uri,
+		content,
+		diagnostics: [],
+		namespaceEnabled: isAnalyzerEnabled('wrongNamespace'),
+		filenameEnabled: isAnalyzerEnabled('wrongFilename'),
+		unsortedUsingsEnabled: isAnalyzerEnabled('unsortedUsings'),
+		mixedLanguageEnabled: isAnalyzerEnabled('mixedLanguageIdentifiers'),
+	};
+}
+
+// ============================================================================
+// Public API
 // ============================================================================
 
 /**
- * Analyzes a single .cs file and returns diagnostics.
+ * Runs diagnostics on the given document if it is a .cs file.
+ */
+export async function runDiagnosticsForDocument(
+	document: vscode.TextDocument,
+	collection: vscode.DiagnosticCollection
+): Promise<void> {
+	if (document.languageId !== 'csharp' && !document.uri.path.endsWith('.cs')) {
+		return;
+	}
+	if (document.uri.scheme !== 'file') {
+		return;
+	}
+
+	const timer = performance.now();
+	await analyzeCsFileFromDocument(document, collection);
+	logTiming('analyzeCsFile (open doc)', performance.now() - timer);
+}
+
+/**
+ * Runs diagnostics on a file URI (used when files change on disk without being open).
+ */
+export async function runDiagnosticsForUri(
+	uri: vscode.Uri,
+	collection: vscode.DiagnosticCollection
+): Promise<void> {
+	if (!uri.path.endsWith('.cs')) {
+		return;
+	}
+	if (uri.scheme !== 'file') {
+		return;
+	}
+
+	const timer = performance.now();
+	await analyzeCsFile(uri, collection);
+	logTiming('analyzeCsFile (URI)', performance.now() - timer);
+}
+
+/**
+ * Runs diagnostics on all .cs files currently open in the editor.
+ */
+export async function runDiagnosticsForOpenEditors(
+	collection: vscode.DiagnosticCollection
+): Promise<void> {
+	const promises = vscode.workspace.textDocuments
+		.filter(doc => doc.uri.scheme === 'file' && doc.uri.path.endsWith('.cs'))
+		.map(doc => analyzeCsFile(doc.uri, collection));
+	await Promise.all(promises);
+}
+
+/**
+ * Runs diagnostics for all .cs files in the workspace using batch processing.
+ * Processes files in batches to limit peak memory usage on large projects.
+ */
+export async function runDiagnosticsForWorkspace(
+	collection: vscode.DiagnosticCollection
+): Promise<void> {
+	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+	await runDiagnosticsInBatches(collection, files);
+}
+
+// ============================================================================
+// Optimization #2: Read content from already-open TextDocument instead of disk.
+// ============================================================================
+
+/**
+ * Analyzes a file from an already-open TextDocument (avoids disk I/O).
+ */
+async function analyzeCsFileFromDocument(
+	document: vscode.TextDocument,
+	collection: vscode.DiagnosticCollection
+): Promise<void> {
+	const uri = document.uri;
+
+	// Skip excluded paths (bin, obj)
+	if (isPathExcluded(uri.path)) {
+		collection.delete(uri);
+		clearCacheForUri(uri);
+		return;
+	}
+
+	const content = document.getText(); // ← Free memory access, no disk I/O!
+	await runUnifiedAnalysis(uri, content, collection);
+}
+
+/**
+ * Analyzes a file by reading from disk (fallback for closed files).
  */
 async function analyzeCsFile(
 	uri: vscode.Uri,
@@ -38,6 +212,7 @@ async function analyzeCsFile(
 	// Skip excluded paths (bin, obj)
 	if (isPathExcluded(uri.path)) {
 		collection.delete(uri);
+		clearCacheForUri(uri);
 		return;
 	}
 
@@ -47,46 +222,91 @@ async function analyzeCsFile(
 		content = Buffer.from(buf).toString('utf-8');
 	} catch {
 		collection.delete(uri);
+		clearCacheForUri(uri);
 		return;
 	}
 
-	const diagnostics: vscode.Diagnostic[] = [];
+	await runUnifiedAnalysis(uri, content, collection);
+}
 
-	// --- Analysis 1: namespace matches file path ---
-	if (isAnalyzerEnabled('wrongNamespace')) {
-		await analyzeNamespace(uri, content, diagnostics);
+// ============================================================================
+// Unified single-pass analysis (Optimization #1) + Caching (Optimization #4)
+// ============================================================================
+
+/**
+ * Runs unified single-pass analysis on a .cs file.
+ * 
+ * This function:
+ * - Checks the content-based cache (Optimization #4) — skips analysis entirely if file unchanged
+ * - Runs all enabled diagnostics in a SINGLE pass over the content (Optimization #1)
+ * - Stores results in cache for next time (Optimization #4)
+ */
+async function runUnifiedAnalysis(
+	uri: vscode.Uri,
+	content: string,
+	collection: vscode.DiagnosticCollection
+): Promise<void> {
+	// ── Optimization #4: Cache check — skip analysis if content unchanged ──
+	const cachedDiagnostics = getCachedDiagnostics(uri);
+	if (cachedDiagnostics !== null) {
+		collection.set(uri, cachedDiagnostics);
+		return; // Cache hit — diagnostics returned instantly.
 	}
 
-	// --- Analysis 2: filename matches public/internal type ---
-	if (isAnalyzerEnabled('wrongFilename')) {
-		analyzeFileName(uri, content, diagnostics);
+	// ── Compute content hash for cache storage (Optimization #4) ──
+	const contentHash = fastContentHash(content);
+
+	// ── Create unified analysis context (Optimization #1) ──
+	const ctx = createAnalysisContext(uri, content);
+
+	// ── Single-pass: run all enabled diagnostics on the unified context ──
+	// Namespace analysis must be awaited since it calls deriveNamespaceFromFile (async).
+	if (ctx.namespaceEnabled) {
+		const t0 = performance.now();
+		await analyzeNamespaceUnified(ctx);
+		logTiming('  namespace', performance.now() - t0);
 	}
 
-	// --- Analysis 3: using directives are sorted ---
-	if (isAnalyzerEnabled('unsortedUsings')) {
-		analyzeUsingSorting(uri, content, diagnostics);
+	if (ctx.filenameEnabled) {
+		const t0 = performance.now();
+		analyzeFileNameUnified(ctx);
+		logTiming('  filename', performance.now() - t0);
 	}
 
-	// --- Analysis 4: identifiers use mixed/non-Latin scripts ---
-	if (isAnalyzerEnabled('mixedLanguageIdentifiers')) {
-		analyzeMixedLanguageIdentifiers(content, diagnostics);
+	if (ctx.unsortedUsingsEnabled) {
+		const t0 = performance.now();
+		analyzeUsingSortingUnified(ctx);
+		logTiming('  usings', performance.now() - t0);
 	}
+
+	if (ctx.mixedLanguageEnabled) {
+		const t0 = performance.now();
+		analyzeMixedLanguageUnified(ctx);
+		logTiming('  mixed-lang', performance.now() - t0);
+	}
+
+	const diagnostics = ctx.diagnostics;
+
+	// ── Optimization #4: Store in cache for next analysis pass ──
+	storeCachedDiagnostics(uri, contentHash, diagnostics);
 
 	collection.set(uri, diagnostics);
 }
 
+// ============================================================================
+// Unified diagnostic analyzers (Optimization #1 — all operate on AnalysisContext)
+// ============================================================================
+
 /**
- * Checks that the namespace in the file matches the expected namespace
- * derived from the file's path relative to the .csproj.
+ * Namespace analysis (unified — uses AnalysisContext.content).
+ * NOTE: deriveNamespaceFromFile is async, so this function must be async.
  */
-async function analyzeNamespace(
-	uri: vscode.Uri,
-	content: string,
-	diagnostics: vscode.Diagnostic[]
-): Promise<void> {
+async function analyzeNamespaceUnified(ctx: AnalysisContext): Promise<void> {
+	const content = ctx.content;
+	const uri = ctx.uri;
+
 	const actualNamespace = extractFileNamespace(content);
 	if (!actualNamespace) {
-		// No namespace declaration – skip
 		return;
 	}
 
@@ -101,7 +321,6 @@ async function analyzeNamespace(
 		return;
 	}
 
-	// Find the position of the namespace declaration in the file
 	const lines = content.split('\n');
 	let lineIndex = 0;
 	let charStart = 0;
@@ -125,25 +344,23 @@ async function analyzeNamespace(
 	diagnostic.source = DIAGNOSTIC_SOURCE;
 	diagnostic.code = DIAGNOSTIC_CODE_NAMESPACE;
 
-	diagnostics.push(diagnostic);
+	ctx.diagnostics.push(diagnostic);
 }
 
 /**
- * Checks that the filename (without extension) matches the public or internal type name.
+ * Filename analysis (unified — uses AnalysisContext.content).
  */
-function analyzeFileName(
-	uri: vscode.Uri,
-	content: string,
-	diagnostics: vscode.Diagnostic[]
-): void {
+function analyzeFileNameUnified(ctx: AnalysisContext): void {
+	const content = ctx.content;
+	const uri = ctx.uri;
+
 	const pathSegments = uri.path.split('/');
 	const fileName = pathSegments[pathSegments.length - 1] ?? '';
 	if (!fileName.endsWith('.cs')) {
 		return;
 	}
-	const fileBaseName = fileName.slice(0, -3); // remove .cs
+	const fileBaseName = fileName.slice(0, -3);
 
-	// Skip files with partial types — they intentionally split one type across multiple files
 	if (hasPartialTypes(content)) {
 		return;
 	}
@@ -151,7 +368,6 @@ function analyzeFileName(
 	const typeInfo = getTypeNameForFileDiagnostic(content);
 
 	if (typeInfo === null || typeInfo === 'ambiguous') {
-		// Can't determine which type should match
 		return;
 	}
 
@@ -159,26 +375,17 @@ function analyzeFileName(
 		return;
 	}
 
-	// Point to the first line of the file as the diagnostic location (or find the type declaration)
 	const lines = content.split('\n');
 	let lineIndex = 0;
 	let charStart = 0;
 	let charEnd = fileBaseName.length;
 
-	// Try to find the type declaration line.
-	// Search for the specific access modifier + type keyword + name combination,
-	// so that we always point to the correct declaration even when multiple types
-	// with different visibilities are present in the file.
-	// For "record struct" the keyword pattern covers both "record struct" and
-	// "readonly record struct".
 	const typePattern = typeInfo.type === 'record struct'
 		? '(?:readonly\\s+)?record\\s+struct'
 		: typeInfo.type;
 	const escapedName = escapeRegExp(typeInfo.name);
-	// Extra modifiers that may appear between access modifier and type keyword
 	const extraMods = '(?:(?:static|sealed|abstract|partial|readonly)\\s+)*';
 
-	// Try public first, then internal (mirrors getTypeNameForFileDiagnostic priority).
 	const candidatePatterns = [
 		new RegExp(`public\\s+${extraMods}${typePattern}\\s+(${escapedName})(?![a-zA-Z0-9_])`),
 		new RegExp(`internal\\s+${extraMods}${typePattern}\\s+(${escapedName})(?![a-zA-Z0-9_])`),
@@ -211,40 +418,49 @@ function analyzeFileName(
 	diagnostic.source = DIAGNOSTIC_SOURCE;
 	diagnostic.code = DIAGNOSTIC_CODE_FILENAME;
 
-	diagnostics.push(diagnostic);
+	ctx.diagnostics.push(diagnostic);
 }
 
 /**
- * Checks that using directives are sorted (System.* → Microsoft.* → other, alphabetically within groups).
- * Uses the same logic as the "Sort Usings" command to determine whether sorting is needed.
+ * Using sort analysis (unified — uses AnalysisContext.content).
  */
-function analyzeUsingSorting(
-	uri: vscode.Uri,
-	content: string,
-	diagnostics: vscode.Diagnostic[]
-): void {
-	// sortUsingsInContent returns undefined if no changes are needed (already sorted / no usings)
-	const sorted = sortUsingsInContent(content);
-	if (sorted === undefined) {
+function analyzeUsingSortingUnified(ctx: AnalysisContext): void {
+	const content = ctx.content;
+
+	// Fast path: extract only the using lines and compare them in order.
+	const lines = content.split('\n');
+	const usingLines: { lineIndex: number; namespace: string }[] = [];
+
+	for (let i = 0; i < lines.length; i++) {
+		const m = lines[i].match(/^using\s+([\w.]+)\s*;$/);
+		if (m) {
+			usingLines.push({ lineIndex: i, namespace: m[1] });
+		}
+	}
+
+	// If fewer than 2 usings, they are always sorted.
+	if (usingLines.length < 2) {
 		return;
 	}
 
-	// Find the first using directive line to attach the diagnostic
-	const lines = content.split('\n');
-	let firstUsingLine = 0;
-	let firstUsingStart = 0;
-	let firstUsingEnd = 0;
-	for (let i = 0; i < lines.length; i++) {
-		const m = lines[i].match(/^(using\s+)([\w.]+)\s*;/);
-		if (m) {
-			firstUsingLine = i;
-			firstUsingStart = 0;
-			firstUsingEnd = lines[i].trimEnd().length;
+	// Check if using lines are in alphabetical order by namespace.
+	let isSorted = true;
+	for (let i = 1; i < usingLines.length; i++) {
+		if (usingLines[i].namespace.localeCompare(usingLines[i - 1].namespace) < 0) {
+			isSorted = false;
 			break;
 		}
 	}
 
-	const range = new vscode.Range(firstUsingLine, firstUsingStart, firstUsingLine, firstUsingEnd);
+	if (isSorted) {
+		return;
+	}
+
+	// Report on the first unsorted using line.
+	const firstUnsorted = usingLines[0];
+	const lineText = lines[firstUnsorted.lineIndex];
+
+	const range = new vscode.Range(firstUnsorted.lineIndex, 0, firstUnsorted.lineIndex, lineText.trimEnd().length);
 	const diagnostic = new vscode.Diagnostic(
 		range,
 		'Using directives are not sorted.',
@@ -253,21 +469,15 @@ function analyzeUsingSorting(
 	diagnostic.source = DIAGNOSTIC_SOURCE;
 	diagnostic.code = DIAGNOSTIC_CODE_UNSORTED_USINGS;
 
-	// Attach the URI so the quick-fix can reference it
-	(diagnostic as vscode.Diagnostic & { _uri?: vscode.Uri })._uri = uri;
-
-	diagnostics.push(diagnostic);
+	ctx.diagnostics.push(diagnostic);
 }
 
 /**
- * Checks that all identifiers in the file use a single script (no mixing of
- * Latin with Cyrillic, Greek, Arabic, etc.).
- * Flags identifiers that contain non-Latin or mixed-script characters.
+ * Mixed-language identifier analysis (unified — uses AnalysisContext.content).
  */
-function analyzeMixedLanguageIdentifiers(
-	content: string,
-	diagnostics: vscode.Diagnostic[]
-): void {
+function analyzeMixedLanguageUnified(ctx: AnalysisContext): void {
+	const content = ctx.content;
+
 	const occurrences = findMixedLanguageIdentifiers(content);
 	for (const occ of occurrences) {
 		const range = new vscode.Range(occ.line, occ.startChar, occ.line, occ.endChar);
@@ -278,74 +488,33 @@ function analyzeMixedLanguageIdentifiers(
 		);
 		diagnostic.source = DIAGNOSTIC_SOURCE;
 		diagnostic.code = DIAGNOSTIC_CODE_MIXED_LANGUAGE;
-		diagnostics.push(diagnostic);
+		ctx.diagnostics.push(diagnostic);
 	}
 }
 
 // ============================================================================
-// Public API
+// Helper functions (kept here for single-file operations)
 // ============================================================================
 
-/**
- * Runs diagnostics on the given document if it is a .cs file.
- */
-export async function runDiagnosticsForDocument(
-	document: vscode.TextDocument,
-	collection: vscode.DiagnosticCollection
-): Promise<void> {
-	if (document.languageId !== 'csharp' && !document.uri.path.endsWith('.cs')) {
-		return;
-	}
-	if (document.uri.scheme !== 'file') {
-		return;
-	}
-	await analyzeCsFile(document.uri, collection);
+function isAnalyzerEnabled(key: string): boolean {
+	const config = vscode.workspace.getConfiguration('csharppainkiller.diagnostics');
+	return config.get<boolean>(key, true);
 }
-
-/**
- * Runs diagnostics on a file URI (used when files change on disk without being open).
- */
-export async function runDiagnosticsForUri(
-	uri: vscode.Uri,
-	collection: vscode.DiagnosticCollection
-): Promise<void> {
-	if (!uri.path.endsWith('.cs')) {
-		return;
-	}
-	if (uri.scheme !== 'file') {
-		return;
-	}
-	await analyzeCsFile(uri, collection);
-}
-
-/**
- * Runs diagnostics on all .cs files currently open in the editor.
- */
-export async function runDiagnosticsForOpenEditors(
-	collection: vscode.DiagnosticCollection
-): Promise<void> {
-	const promises = vscode.workspace.textDocuments
-		.filter(doc => doc.uri.scheme === 'file' && doc.uri.path.endsWith('.cs'))
-		.map(doc => analyzeCsFile(doc.uri, collection));
-	await Promise.all(promises);
-}
-
-/**
- * Runs diagnostics for all .cs files in the workspace.
- * Called on activation to populate initial diagnostics.
- */
-export async function runDiagnosticsForWorkspace(
-	collection: vscode.DiagnosticCollection
-): Promise<void> {
-	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
-	const promises = files.map(uri => analyzeCsFile(uri, collection));
-	await Promise.all(promises);
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
 
 function escapeRegExp(str: string): string {
 	return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Clear the entire analysis cache (call on extension deactivate or settings change).
+ */
+export function clearDiagnosticsCache(): void {
+	analysisCache.clear();
+}
+
+/**
+ * Clear diagnostics cache for a specific URI.
+ */
+export function clearDiagnosticsCacheForUri(uri: vscode.Uri): void {
+	analysisCache.delete(uri.toString());
 }

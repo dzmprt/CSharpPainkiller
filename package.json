@@ -1,11 +1,11 @@
 {
   "name": "csharppainkiller",
-  "displayName": "CSharp Painkiller",
-  "publisher": "dzmprt",
-  "description": "Smart file creation, namespace management, code generation, diagnostics, and more for C#",
-  "version": "0.0.1",
+  "displayName": "C# Painkiller",
+  "publisher": "DzmitryPratsko",
+  "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
+  "version": "0.0.2",
   "engines": {
-    "vscode": "^1.120.0"
+    "vscode": "^1.92.0"
   },
   "categories": [
     "Programming Languages"
@@ -16,7 +16,10 @@
     ".NET",
     "DOTNET",
     "dev kit",
-    "CSharp Painkiller"
+    "CSharp Painkiller",
+    "ASP.NET",
+    "MediatR",
+    "MitMediator"
   ],
   "repository": {
     "type": "git",
@@ -32,161 +35,165 @@
     "commands": [
       {
         "command": "csharppainkiller.generateHandlerForFile",
-        "title": "C# Generate Handler (CSharp Painkiller)"
+        "title": "Generate Handler"
       },
       {
         "command": "csharppainkiller.goToHandlerForFile",
-        "title": "C# Go To Handler (CSharp Painkiller)"
+        "title": "Go To Handler"
       },
       {
         "command": "csharppainkiller.createClass",
-        "title": "C# Class (CSharp Painkiller)"
+        "title": "Class"
       },
       {
         "command": "csharppainkiller.createRecord",
-        "title": "C# Record (CSharp Painkiller)"
+        "title": "Record"
       },
       {
         "command": "csharppainkiller.createStruct",
-        "title": "C# Struct (CSharp Painkiller)"
+        "title": "Struct"
       },
       {
         "command": "csharppainkiller.createEnum",
-        "title": "C# Enum (CSharp Painkiller)"
+        "title": "Enum"
       },
       {
         "command": "csharppainkiller.createInterface",
-        "title": "C# Interface (CSharp Painkiller)"
+        "title": "Interface"
       },
       {
         "command": "csharppainkiller.createRecordStruct",
-        "title": "C# Record Struct (CSharp Painkiller)"
+        "title": "Record Struct"
       },
       {
         "command": "csharppainkiller.adjustNamespace",
-        "title": "C# Adjust Namespaces (CSharp Painkiller)"
+        "title": "Adjust Namespaces"
       },
       {
         "command": "csharppainkiller.renameFileByType",
-        "title": "C# Rename File By Type (CSharp Painkiller)"
+        "title": "Rename File By Type"
       },
       {
         "command": "csharppainkiller.sortUsings",
-        "title": "C# Sort Usings (CSharp Painkiller)"
+        "title": "Sort Usings"
       },
       {
         "command": "csharppainkiller.extractInterface",
-        "title": "C# Extract Interface (CSharp Painkiller)"
+        "title": "Extract Interface"
       },
       {
         "command": "csharppainkiller.generateMapTo",
-        "title": "C# Generate MapTo Method (CSharp Painkiller)"
+        "title": "Generate MapTo Method"
       },
       {
         "command": "csharppainkiller.generateMapFrom",
-        "title": "C# Generate MapFrom Method (CSharp Painkiller)"
+        "title": "Generate MapFrom Method"
       },
       {
         "command": "csharppainkiller.templates.aspnet.emptyController",
-        "title": "C# Empty Controller (CSharp Painkiller)"
+        "title": "Empty Controller"
       },
       {
         "command": "csharppainkiller.templates.aspnet.efCrudController",
-        "title": "C# EF CRUD Controller (CSharp Painkiller)"
+        "title": "EF CRUD Controller"
       },
       {
         "command": "csharppainkiller.templates.aspnet.emptyMinimalApi",
-        "title": "C# Empty Minimal API (CSharp Painkiller)"
+        "title": "Empty Minimal API"
       },
       {
         "command": "csharppainkiller.templates.aspnet.efCrudMinimalApi",
-        "title": "C# EF CRUD Minimal API (CSharp Painkiller)"
+        "title": "EF CRUD Minimal API"
       },
       {
         "command": "csharppainkiller.efcore.createConfigurationFromFolder",
-        "title": "C# EF Core Entity Configuration (CSharp Painkiller)"
+        "title": "EF Core Entity Configuration"
       },
       {
         "command": "csharppainkiller.efcore.createConfigurationFromFile",
-        "title": "C# Generate EF Core Configuration (CSharp Painkiller)"
+        "title": "Generate EF Core Configuration"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createRequestAndHandler",
-        "title": "C# MediatR Request and Handler (CSharp Painkiller)"
+        "title": "Request and Handler"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createRequest",
-        "title": "C# MediatR Request (CSharp Painkiller)"
+        "title": "Request"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createHandler",
-        "title": "C# MediatR RequestHandler (CSharp Painkiller)"
+        "title": "RequestHandler"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createNotificationAndHandler",
-        "title": "C# MediatR Notification and Handler (CSharp Painkiller)"
+        "title": "Notification and Handler"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createNotification",
-        "title": "C# MediatR Notification (CSharp Painkiller)"
+        "title": "Notification"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createNotificationHandler",
-        "title": "C# MediatR NotificationHandler (CSharp Painkiller)"
+        "title": "NotificationHandler"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createRequestAndHandler",
-        "title": "C# MitMediator Request and Handler (CSharp Painkiller)"
+        "title": "Request and Handler"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createRequest",
-        "title": "C# MitMediator Request (CSharp Painkiller)"
+        "title": "Request"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createHandler",
-        "title": "C# MitMediator RequestHandler (CSharp Painkiller)"
+        "title": "RequestHandler"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createNotificationAndHandler",
-        "title": "C# MitMediator Notification and Handler (CSharp Painkiller)"
+        "title": "Notification and Handler"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createNotification",
-        "title": "C# MitMediator Notification (CSharp Painkiller)"
+        "title": "Notification"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createNotificationHandler",
-        "title": "C# MitMediator NotificationHandler (CSharp Painkiller)"
+        "title": "NotificationHandler"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createEmptyPipelineBehavior",
-        "title": "C# MediatR Empty PipelineBehavior (CSharp Painkiller)"
+        "title": "Empty PipelineBehavior"
       },
       {
         "command": "csharppainkiller.templates.mediatr.createFluentValidationBehavior",
-        "title": "C# MediatR FluentValidation PipelineBehavior (CSharp Painkiller)"
+        "title": "FluentValidation PipelineBehavior"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createEmptyPipelineBehavior",
-        "title": "C# MitMediator Empty PipelineBehavior (CSharp Painkiller)"
+        "title": "Empty PipelineBehavior"
       },
       {
         "command": "csharppainkiller.templates.mitmediator.createFluentValidationBehavior",
-        "title": "C# MitMediator FluentValidation PipelineBehavior (CSharp Painkiller)"
+        "title": "FluentValidation PipelineBehavior"
+      },
+      {
+        "command": "csharppainkiller.dotnet.createProject",
+        "title": ".NET NEW"
       }
     ],
     "submenus": [
       {
         "id": "csharppainkiller.create",
-        "label": "C# Create (CSharp Painkiller)"
+        "label": "C# Create"
       },
       {
         "id": "csharppainkiller.refactor",
-        "label": "C# Refactor (CSharp Painkiller)"
+        "label": "C# Refactor"
       },
       {
         "id": "csharppainkiller.templates",
-        "label": "C# Generator (CSharp Painkiller)"
+        "label": "C# Generator"
       },
       {
         "id": "csharppainkiller.templates.aspnet",
@@ -243,6 +250,11 @@
           "when": "!explorerResourceIsFolder && resourceExtname == .cs",
           "command": "csharppainkiller.efcore.createConfigurationFromFile",
           "group": "2_csharp@5"
+        },
+        {
+          "command": "csharppainkiller.dotnet.createProject",
+          "when": "explorerResourceIsFolder",
+          "group": "2_csharp@6"
         }
       ],
       "csharppainkiller.create": [
@@ -412,31 +424,7 @@
         }
       ]
     },
-    "configuration": {
-      "title": "CSharp Painkiller",
-      "properties": {
-        "csharppainkiller.diagnostics.wrongNamespace": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable diagnostic: namespace does not match the file path."
-        },
-        "csharppainkiller.diagnostics.wrongFilename": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable diagnostic: file name does not match the primary type name."
-        },
-        "csharppainkiller.diagnostics.unsortedUsings": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable diagnostic: using directives are not sorted."
-        },
-        "csharppainkiller.diagnostics.mixedLanguageIdentifiers": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable diagnostic: identifiers (type names, method names, variables, namespaces, etc.) contain non-Latin or mixed-script characters."
-        }
-      }
-    }
+    "configuration": []
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
@@ -452,8 +440,11 @@
     "lint": "eslint src",
     "test": "vscode-test"
   },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
   "devDependencies": {
-    "@types/vscode": "^1.120.0",
+    "@types/vscode": "^1.92.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
     "typescript-eslint": "^8.56.1",

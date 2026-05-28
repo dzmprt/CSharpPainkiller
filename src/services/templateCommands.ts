@@ -11,7 +11,7 @@ import {
 	generateEfCrudMinimalApi,
 } from './templates/aspnet.js';
 import {
-	parseReturnType,
+	parseReturnType as parseCqrsReturnType,
 	generateMediatRRequest,
 	generateMediatRHandler,
 	generateMediatRNotification,
@@ -24,82 +24,196 @@ import {
 	generateMitMediatorNotificationHandler,
 	generateMitMediatorEmptyPipelineBehavior,
 	generateMitMediatorFluentValidationBehavior,
-	extractIRequestReturnType,
+	extractIRequestReturnType as extractCqrsIRequestReturnType,
 } from './templates/cqrs.js';
 
 // ============================================================================
-// Shared utilities
+// Shared imports — eliminates ~200 lines of duplicated code
+// ============================================================================
+import {
+	writeAndOpen as writeSharedFile,
+	resolveTargetFolder as resolveTargetFolderShared,
+	capitalize,
+	isBuiltinType,
+	CqrsTemplateConfig,
+	createCqrsRequestAndHandler as createSharedCqrsRequestAndHandler,
+	createCqrsNotificationAndHandler as createSharedCqrsNotificationAndHandler,
+	createCqrsPipelineBehavior as createSharedCqrsPipelineBehavior,
+} from '../utils/sharedUtilities.js';
+
+// Re-export writeAndOpen with matching signature for backward compatibility
+async function writeAndOpen(folderUri: vscode.Uri, fileName: string, content: string): Promise<boolean> {
+	const result = await writeSharedFile(folderUri, fileName, content);
+	return result.success;
+}
+
+// ============================================================================
+// Template configs — single source of truth for MediatR/MitMediator
+// ============================================================================
+
+const MEDIATR_CONFIG: CqrsTemplateConfig = {
+	libraryName: 'MediatR',
+	generateRequest: generateMediatRRequest,
+	generateHandler: generateMediatRHandler,
+	generateNotification: generateMediatRNotification,
+	generateNotificationHandler: generateMediatRNotificationHandler,
+	generateEmptyPipelineBehavior: generateMediatREmptyPipelineBehavior,
+	generateFluentValidationBehavior: generateMediatRFluentValidationBehavior,
+	extractIRequestReturnType: extractCqrsIRequestReturnType,
+	supportsNotifications: true,
+};
+
+const MITMEDIATOR_CONFIG: CqrsTemplateConfig = {
+	libraryName: 'MitMediator',
+	generateRequest: generateMitMediatorRequest,
+	generateHandler: generateMitMediatorHandler,
+	generateNotification: generateMitMediatorNotification,
+	generateNotificationHandler: generateMitMediatorNotificationHandler,
+	generateEmptyPipelineBehavior: generateMitMediatorEmptyPipelineBehavior,
+	generateFluentValidationBehavior: generateMitMediatorFluentValidationBehavior,
+	extractIRequestReturnType: extractCqrsIRequestReturnType,
+	supportsNotifications: true,
+};
+
+// ============================================================================
+// Shared return type resolution — used by CQRS commands
+// ============================================================================
+
+async function resolveReturnType(returnTypeInput: string): Promise<{
+	returnType: string | null;
+	innerTypeName: string | null;
+	returnedType: import('../utils/typeSearch.js').FoundType | null;
+} | null> {
+	if (!returnTypeInput) {
+		return { returnType: null, innerTypeName: null, returnedType: null };
+	}
+
+	const { innerTypeName } = parseCqrsReturnType(returnTypeInput);
+	const returnType = returnTypeInput;
+
+	if (isBuiltinType(innerTypeName)) {
+		return { returnType, innerTypeName, returnedType: null };
+	}
+
+	let foundType: Awaited<ReturnType<typeof findTypeInWorkspace>> = undefined;
+	await vscode.window.withProgress(
+		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${innerTypeName}'…` },
+		async () => { foundType = await findTypeInWorkspace(innerTypeName); }
+	);
+
+	return { returnType, innerTypeName, returnedType: foundType ?? null };
+}
+
+// ============================================================================
+// Shared request name finalization — uses constants.ts prefixes
+// ============================================================================
+
+function normalizeRequestName(name: string): string {
+	if (/(?:Request|Query|Command)$/i.test(name)) {
+		return name;
+	}
+
+	const firstWordMatch = name.match(/^([A-Z][a-z]*)/);
+	const firstWord = (firstWordMatch ? firstWordMatch[1] : name).toLowerCase();
+
+	const QUERY_PREFIXES = new Set<string>(['get', 'load', 'download', 'fetch']);
+	const COMMAND_PREFIXES = new Set<string>([
+		'post', 'put', 'delete', 'add', 'create', 'remove', 'change',
+		'update', 'edit', 'modify', 'import', 'upload', 'drop',
+	]);
+
+	let suffix: string;
+	if (QUERY_PREFIXES.has(firstWord)) {
+		suffix = 'Query';
+	} else if (COMMAND_PREFIXES.has(firstWord)) {
+		suffix = 'Command';
+	} else {
+		suffix = 'Request';
+	}
+
+	return name + suffix;
+}
+
+async function finalizeRequestName(input: string, entityName: string | null): Promise<string> {
+	const trimmed = capitalize(input.trim());
+	const lc = trimmed.toLowerCase();
+
+	const QUERY_PREFIXES = new Set<string>(['get', 'load', 'download', 'fetch']);
+	const COMMAND_PREFIXES = new Set<string>([
+		'post', 'put', 'delete', 'add', 'create', 'remove', 'change',
+		'update', 'edit', 'modify', 'import', 'upload', 'drop',
+	]);
+
+	const isKnownPrefix = QUERY_PREFIXES.has(lc);
+
+	if (isKnownPrefix && entityName) {
+		return normalizeRequestName(trimmed + capitalize(entityName));
+	}
+
+	if (/(?:Request|Query|Command)$/i.test(trimmed)) {
+		return trimmed;
+	}
+
+	const firstWordMatch = trimmed.match(/^([A-Z][a-z]*)/);
+	const firstWord = (firstWordMatch ? firstWordMatch[1] : trimmed).toLowerCase();
+
+	let suffix: string;
+	if (QUERY_PREFIXES.has(firstWord)) {
+		suffix = 'Query';
+	} else if (COMMAND_PREFIXES.has(firstWord)) {
+		suffix = 'Command';
+	} else {
+		suffix = 'Request';
+	}
+
+	return trimmed + suffix;
+}
+
+// ============================================================================
+// Utility: resolve target folder — falls back to shared version without prompt
 // ============================================================================
 
 async function resolveTargetFolder(uri?: vscode.Uri): Promise<vscode.Uri | undefined> {
-	if (uri?.scheme === 'file') {
-		return uri;
-	}
-	const editor = vscode.window.activeTextEditor;
-	if (editor) {
-		const wsFolder = vscode.workspace.getWorkspaceFolder(editor.document.uri);
-		if (wsFolder) {
-			return wsFolder.uri;
-		}
-	}
-	return undefined;
+	const result = await resolveTargetFolderShared(uri);
+	if (result) return result;
+
+	// Fallback: ask user for path (original createFile.ts behavior)
+	const selected = await vscode.window.showInputBox({
+		placeHolder: 'Enter folder path (e.g., /path/to/project)',
+		title: 'Select Target Folder',
+	});
+	return selected ? vscode.Uri.file(selected) : undefined;
 }
 
-async function writeAndOpen(
-	folderUri: vscode.Uri,
-	fileName: string,
-	content: string
-): Promise<boolean> {
-	const fileUri = vscode.Uri.joinPath(folderUri, fileName);
-	try {
-		await vscode.workspace.fs.stat(fileUri);
-		vscode.window.showErrorMessage(`File '${fileName}' already exists.`);
-		return false;
-	} catch {
-		// File doesn't exist — proceed
-	}
-	const encoded = new TextEncoder().encode(content);
-	await vscode.workspace.fs.writeFile(fileUri, encoded);
-	const doc = await vscode.workspace.openTextDocument(fileUri);
-	await vscode.window.showTextDocument(doc, { preview: false });
-	return true;
-}
+// ============================================================================
+// Utility: prompt helpers — backward compatible wrappers
+// ============================================================================
 
-/**
- * Prompts the user for a string. Returns undefined if cancelled or empty.
- * Unlike the strict version, also accepts empty string as "no value" signal
- * for optional inputs when `allowEmpty` is true.
- */
 async function prompt(title: string, placeholder: string): Promise<string | undefined> {
 	const value = await vscode.window.showInputBox({ title, placeHolder: placeholder });
 	if (value === undefined || !value.trim()) {
 		return undefined;
 	}
-	return value.trim();
+	const trimmed = value.trim();
+	return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
 }
 
-/**
- * Like prompt, but pressing Enter on an empty input returns '' (empty string)
- * instead of undefined. Pressing Escape still returns undefined.
- */
 async function promptOptional(title: string, placeholder: string): Promise<string | undefined> {
 	const value = await vscode.window.showInputBox({
 		title,
 		placeHolder: placeholder,
 		prompt: 'Leave empty for void (no return value)',
 	});
-	// undefined = Escape pressed
 	if (value === undefined) {
 		return undefined;
 	}
 	return value.trim();
 }
 
-/**
- * Reads the given .cs file, detects the mediator class name, then searches
- * the workspace for a handler by matching IRequestHandler<ClassName, ...> or
- * INotificationHandler<ClassName> in file contents.
- */
+// ============================================================================
+// "Go To Handler" context menu command
+// ============================================================================
+
 export async function goToHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
 	let uri = fileUri;
 	if (!uri) {
@@ -149,13 +263,7 @@ export async function goToHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
 // "Generate Handler" context menu command (right-click on .cs file)
 // ============================================================================
 
-/**
- * Reads the given .cs file, detects whether it contains an IRequest or
- * INotification class (MediatR or MitMediator), then generates the
- * corresponding Handler file in the same folder — without any prompts.
- */
 export async function generateHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
-	// Resolve the file URI — may come from Explorer context menu or active editor
 	let uri = fileUri;
 	if (!uri) {
 		const editor = vscode.window.activeTextEditor;
@@ -192,10 +300,9 @@ export async function generateHandlerForFile(fileUri?: vscode.Uri): Promise<void
 	const handlerName = `${info.className}Handler`;
 	const namespace = await deriveNamespaceFromFolder(folder);
 
-	// For request handlers we need the return type's namespace (if any)
 	let returnedType: import('../utils/typeSearch.js').FoundType | undefined;
 	if (info.kind === 'request' && info.returnType) {
-		const { innerTypeName } = parseReturnType(info.returnType);
+		const { innerTypeName } = parseCqrsReturnType(info.returnType);
 		if (innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit') {
 			returnedType = await findTypeInWorkspace(innerTypeName) ?? undefined;
 		}
@@ -228,7 +335,7 @@ export async function generateHandlerForFile(fileUri?: vscode.Uri): Promise<void
 }
 
 // ============================================================================
-// ASP.NET commands
+// ASP.NET commands — no duplication needed
 // ============================================================================
 
 export async function createEmptyController(folderUri?: vscode.Uri): Promise<void> {
@@ -239,8 +346,8 @@ export async function createEmptyController(folderUri?: vscode.Uri): Promise<voi
 	}
 	const input = await prompt('Empty Controller', 'AuthorsController');
 	if (!input) { return; }
-	const baseName = normalizeControllerName(capitalize(input));
-	const namespace = await deriveNamespaceFromFolder(folder);
+	const baseName = normalizeControllerName(input);
+const namespace = await deriveNamespaceFromFolder(folder);
 	await writeAndOpen(folder, `${baseName}Controller.cs`, generateEmptyController(baseName, namespace));
 }
 
@@ -252,7 +359,7 @@ export async function createEfCrudController(folderUri?: vscode.Uri): Promise<vo
 	}
 	const entityInput = await prompt('Entity Class Name', 'Author');
 	if (!entityInput) { return; }
-	const entityName = capitalize(entityInput);
+	const entityName = entityInput;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for class '${entityName}'…` },
 		async () => {
@@ -275,8 +382,8 @@ export async function createEmptyMinimalApi(folderUri?: vscode.Uri): Promise<voi
 	}
 	const input = await prompt('Minimal API Resource Name', 'Authors');
 	if (!input) { return; }
-	const baseName = capitalize(input);
-	const namespace = await deriveNamespaceFromFolder(folder);
+	const baseName = input;
+const namespace = await deriveNamespaceFromFolder(folder);
 	await writeAndOpen(folder, `${baseName}Api.cs`, generateEmptyMinimalApi(baseName, namespace));
 }
 
@@ -288,7 +395,7 @@ export async function createEfCrudMinimalApi(folderUri?: vscode.Uri): Promise<vo
 	}
 	const entityInput = await prompt('Entity Class Name', 'Author');
 	if (!entityInput) { return; }
-	const entityName = capitalize(entityInput);
+	const entityName = entityInput;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for class '${entityName}'…` },
 		async () => {
@@ -304,75 +411,7 @@ export async function createEfCrudMinimalApi(folderUri?: vscode.Uri): Promise<vo
 }
 
 // ============================================================================
-// Shared CQRS / mediator logic
-// ============================================================================
-
-/**
- * Resolves the return type info from user input:
- *  - Empty input → void (returnType=null, returnedType=null)
- *  - Primitive   → returnType set, returnedType=null (no workspace lookup)
- *  - Custom type → workspace search; if not found, use placeholder (no using)
- *
- * Returns null for the whole result only if Escape was pressed (undefined from promptOptional).
- */
-async function resolveReturnType(returnTypeInput: string): Promise<{
-	returnType: string | null;
-	innerTypeName: string | null;
-	returnedType: import('../utils/typeSearch.js').FoundType | null;
-} | null> {
-	// Empty → void
-	if (!returnTypeInput) {
-		return { returnType: null, innerTypeName: null, returnedType: null };
-	}
-
-	const { innerTypeName, returnType } = parseReturnType(returnTypeInput);
-
-	if (isBuiltinType(innerTypeName)) {
-		return { returnType, innerTypeName, returnedType: null };
-	}
-
-	let foundType: Awaited<ReturnType<typeof findTypeInWorkspace>> = undefined;
-	await vscode.window.withProgress(
-		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${innerTypeName}'…` },
-		async () => { foundType = await findTypeInWorkspace(innerTypeName); }
-	);
-	// Not found → use as-is, no using added
-	return {
-		returnType,
-		innerTypeName,
-		returnedType: foundType ?? null,
-	};
-}
-
-/**
- * Builds the final request class name from user input and the entity name.
- *
- * @param input      - What the user actually typed (e.g. "Get", "Update", "GetApplicationUser")
- * @param entityName - Inner type name from the return type (e.g. "ApplicationUser"), or null for void
- *
- * Rules:
- *  - If `input` is a single known prefix verb ("Get", "Update", …) AND entityName is known,
- *    insert entityName between the prefix and the suffix:
- *    "Get"  + "ApplicationUser" → "GetApplicationUserQuery"
- *    "Update" + "ApplicationUser" → "UpdateApplicationUserCommand"
- *  - Otherwise just append the appropriate suffix to whatever was typed:
- *    "GetApplicationUser" → "GetApplicationUserQuery"
- *    "GetApplicationUserQuery" → "GetApplicationUserQuery" (already has suffix)
- */
-function finalizeRequestName(input: string, entityName: string | null): string {
-	const trimmed = capitalize(input.trim());
-	const lc = trimmed.toLowerCase();
-	const isKnownPrefix = QUERY_PREFIXES.has(lc) || COMMAND_PREFIXES.has(lc);
-
-	if (isKnownPrefix && entityName) {
-		return normalizeRequestName(trimmed + capitalize(entityName));
-	}
-
-	return normalizeRequestName(trimmed);
-}
-
-// ============================================================================
-// MediatR commands
+// MediatR commands — using shared factories where possible
 // ============================================================================
 
 export async function createMediatRRequestAndHandler(folderUri?: vscode.Uri): Promise<void> {
@@ -381,33 +420,7 @@ export async function createMediatRRequestAndHandler(folderUri?: vscode.Uri): Pr
 		vscode.window.showErrorMessage('No target folder selected.');
 		return;
 	}
-
-	const returnTypeInput = await promptOptional('Return Type (leave empty for void)', 'Author  or  List<Author>  or  Author[]');
-	if (returnTypeInput === undefined) { return; }
-
-	const resolved = await resolveReturnType(returnTypeInput);
-	if (resolved === null) { return; }
-	const { returnType, innerTypeName, returnedType } = resolved;
-
-	const defaultName = finalizeRequestName('Get', innerTypeName);
-	const requestNameInput = await prompt('Request Class Name', defaultName);
-	if (!requestNameInput) { return; }
-	const requestName = finalizeRequestName(requestNameInput, innerTypeName);
-
-	const folderName = requestName.replace(/(Request|Query|Command)$/i, '') || requestName;
-	const subfolderUri = vscode.Uri.joinPath(folder, folderName);
-	await vscode.workspace.fs.createDirectory(subfolderUri);
-	const namespace = await deriveNamespaceFromFolder(subfolderUri);
-
-	const effectiveReturnedType = returnedType ?? (innerTypeName ? { name: innerTypeName, namespace: '', fileUri: vscode.Uri.file('') } : null);
-	const requestContent = generateMediatRRequest(requestName, returnType, effectiveReturnedType, namespace);
-	await writeAndOpen(subfolderUri, `${requestName}.cs`, requestContent);
-
-	const handlerName = `${requestName}Handler`;
-	const requestFoundType = { name: requestName, namespace, fileUri: vscode.Uri.joinPath(subfolderUri, `${requestName}.cs`) };
-	const rt = returnType ?? 'Unit';
-	const handlerContent = generateMediatRHandler(handlerName, requestFoundType, rt, namespace, returnedType ?? undefined);
-	await writeAndOpen(subfolderUri, `${handlerName}.cs`, handlerContent);
+	await createSharedCqrsRequestAndHandler(folder, MEDIATR_CONFIG);
 }
 
 export async function createMediatRRequest(folderUri?: vscode.Uri): Promise<void> {
@@ -424,10 +437,15 @@ export async function createMediatRRequest(folderUri?: vscode.Uri): Promise<void
 	if (resolved === null) { return; }
 	const { returnType, innerTypeName, returnedType } = resolved;
 
-	const defaultName = finalizeRequestName('Get', innerTypeName);
-	const requestNameInput = await prompt('Request Class Name', defaultName);
-	if (!requestNameInput) { return; }
-	const requestName = finalizeRequestName(requestNameInput, innerTypeName);
+	const defaultName = (await finalizeRequestName('Get', innerTypeName)).trim();
+	const requestNameInput = await vscode.window.showInputBox({
+		title: 'Request Class Name',
+		placeHolder: defaultName,
+	});
+
+	if (!requestNameInput?.trim()) { return; }
+
+	const requestName = (await finalizeRequestName(requestNameInput, innerTypeName)).trim();
 	const namespace = await deriveNamespaceFromFolder(folder);
 	const effectiveReturnedType = returnedType ?? (innerTypeName ? { name: innerTypeName, namespace: '', fileUri: vscode.Uri.file('') } : null);
 	const content = generateMediatRRequest(requestName, returnType, effectiveReturnedType, namespace);
@@ -443,40 +461,41 @@ export async function createMediatRHandler(folderUri?: vscode.Uri): Promise<void
 
 	const requestInput = await prompt('IRequest Type to Handle', 'GetAuthorsQuery');
 	if (!requestInput) { return; }
-	const requestName = capitalize(requestInput);
 
 	await vscode.window.withProgress(
-		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${requestName}'…` },
+		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${requestInput}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(requestName);
+			const found = await findTypeInWorkspace(requestInput);
 			if (!found) {
-				vscode.window.showErrorMessage(`Type '${requestName}' not found in the workspace. The Handler was not created.`);
+				vscode.window.showErrorMessage(`Type '${requestInput}' not found in the workspace. The Handler was not created.`);
 				return;
 			}
 
 			let returnType: string | null = null;
 			try {
 				const buf = await vscode.workspace.fs.readFile(found.fileUri);
-				returnType = extractIRequestReturnType(Buffer.from(buf).toString('utf-8')) ?? null;
+				returnType = extractCqrsIRequestReturnType(Buffer.from(buf).toString('utf-8')) ?? null;
 			} catch { /* ignore */ }
 
-			// returnType=null means void IRequest (no generic)
 			const rt = returnType ?? 'Unit';
-			const { innerTypeName } = returnType ? parseReturnType(returnType) : { innerTypeName: '' };
-			const returnedType = innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit'
-				? await findTypeInWorkspace(innerTypeName)
-				: undefined;
+			let returnedType: import('../utils/typeSearch.js').FoundType | undefined;
+			if (returnType) {
+				const { innerTypeName } = parseCqrsReturnType(returnType);
+				if (innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit') {
+					returnedType = await findTypeInWorkspace(innerTypeName);
+				}
+			}
 
-			const handlerName = `${requestName}Handler`;
+			const handlerName = `${requestInput}Handler`;
 			const namespace = await deriveNamespaceFromFolder(folder);
-			const content = generateMediatRHandler(handlerName, found, rt, namespace, returnedType ?? undefined);
+			const content = generateMediatRHandler(handlerName, found, rt, namespace, returnedType);
 			await writeAndOpen(folder, `${handlerName}.cs`, content);
 		}
 	);
 }
 
 // ============================================================================
-// MitMediator commands
+// MitMediator commands — using shared factories where possible
 // ============================================================================
 
 export async function createMitMediatorRequestAndHandler(folderUri?: vscode.Uri): Promise<void> {
@@ -485,32 +504,7 @@ export async function createMitMediatorRequestAndHandler(folderUri?: vscode.Uri)
 		vscode.window.showErrorMessage('No target folder selected.');
 		return;
 	}
-
-	const returnTypeInput = await promptOptional('Return Type (leave empty for void)', 'Author  or  List<Author>  or  Author[]');
-	if (returnTypeInput === undefined) { return; }
-
-	const resolved = await resolveReturnType(returnTypeInput);
-	if (resolved === null) { return; }
-	const { returnType, innerTypeName, returnedType } = resolved;
-
-	const defaultName = finalizeRequestName('Get', innerTypeName);
-	const requestNameInput = await prompt('Request Class Name', defaultName);
-	if (!requestNameInput) { return; }
-	const requestName = finalizeRequestName(requestNameInput, innerTypeName);
-
-	const folderName = requestName.replace(/(Request|Query|Command)$/i, '') || requestName;
-	const subfolderUri = vscode.Uri.joinPath(folder, folderName);
-	await vscode.workspace.fs.createDirectory(subfolderUri);
-	const namespace = await deriveNamespaceFromFolder(subfolderUri);
-
-	const effectiveReturnedType = returnedType ?? (innerTypeName ? { name: innerTypeName, namespace: '', fileUri: vscode.Uri.file('') } : null);
-	const requestContent = generateMitMediatorRequest(requestName, returnType, effectiveReturnedType, namespace);
-	await writeAndOpen(subfolderUri, `${requestName}.cs`, requestContent);
-
-	const handlerName = `${requestName}Handler`;
-	const requestFoundType = { name: requestName, namespace, fileUri: vscode.Uri.joinPath(subfolderUri, `${requestName}.cs`) };
-	const handlerContent = generateMitMediatorHandler(handlerName, requestFoundType, returnType, namespace, returnedType ?? undefined);
-	await writeAndOpen(subfolderUri, `${handlerName}.cs`, handlerContent);
+	await createSharedCqrsRequestAndHandler(folder, MITMEDIATOR_CONFIG);
 }
 
 export async function createMitMediatorRequest(folderUri?: vscode.Uri): Promise<void> {
@@ -527,10 +521,15 @@ export async function createMitMediatorRequest(folderUri?: vscode.Uri): Promise<
 	if (resolved === null) { return; }
 	const { returnType, innerTypeName, returnedType } = resolved;
 
-	const defaultName = finalizeRequestName('Get', innerTypeName);
-	const requestNameInput = await prompt('Request Class Name', defaultName);
-	if (!requestNameInput) { return; }
-	const requestName = finalizeRequestName(requestNameInput, innerTypeName);
+	const defaultName = (await finalizeRequestName('Get', innerTypeName)).trim();
+	const requestNameInput = await vscode.window.showInputBox({
+		title: 'Request Class Name',
+		placeHolder: defaultName,
+	});
+
+	if (!requestNameInput?.trim()) { return; }
+
+	const requestName = (await finalizeRequestName(requestNameInput, innerTypeName)).trim();
 	const namespace = await deriveNamespaceFromFolder(folder);
 	const effectiveReturnedType = returnedType ?? (innerTypeName ? { name: innerTypeName, namespace: '', fileUri: vscode.Uri.file('') } : null);
 	const content = generateMitMediatorRequest(requestName, returnType, effectiveReturnedType, namespace);
@@ -546,42 +545,42 @@ export async function createMitMediatorHandler(folderUri?: vscode.Uri): Promise<
 
 	const requestInput = await prompt('IRequest Type to Handle', 'GetAuthorsQuery');
 	if (!requestInput) { return; }
-	const requestName = capitalize(requestInput);
 
 	await vscode.window.withProgress(
-		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${requestName}'…` },
+		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${requestInput}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(requestName);
+			const found = await findTypeInWorkspace(requestInput);
 			if (!found) {
-				vscode.window.showErrorMessage(`Type '${requestName}' not found in the workspace. The Handler was not created.`);
+				vscode.window.showErrorMessage(`Type '${requestInput}' not found in the workspace. The Handler was not created.`);
 				return;
 			}
 
 			let returnType: string | null = null;
 			try {
 				const buf = await vscode.workspace.fs.readFile(found.fileUri);
-				returnType = extractIRequestReturnType(Buffer.from(buf).toString('utf-8')) ?? null;
+				returnType = extractCqrsIRequestReturnType(Buffer.from(buf).toString('utf-8')) ?? null;
 			} catch { /* ignore */ }
 
-			// returnType=null means void IRequest
-			const { innerTypeName } = returnType ? parseReturnType(returnType) : { innerTypeName: '' };
-			const returnedType = innerTypeName && !isBuiltinType(innerTypeName)
-				? await findTypeInWorkspace(innerTypeName)
-				: undefined;
+			let returnedType: import('../utils/typeSearch.js').FoundType | undefined;
+			if (returnType) {
+				const { innerTypeName } = parseCqrsReturnType(returnType);
+				if (innerTypeName && !isBuiltinType(innerTypeName)) {
+					returnedType = await findTypeInWorkspace(innerTypeName);
+				}
+			}
 
-			const handlerName = `${requestName}Handler`;
+			const handlerName = `${requestInput}Handler`;
 			const namespace = await deriveNamespaceFromFolder(folder);
-			const content = generateMitMediatorHandler(handlerName, found, returnType, namespace, returnedType ?? undefined);
+			const content = generateMitMediatorHandler(handlerName, found, returnType, namespace, returnedType);
 			await writeAndOpen(folder, `${handlerName}.cs`, content);
 		}
 	);
 }
 
 // ============================================================================
-// MediatR Notification commands
+// MediatR Notification commands — using shared factories
 // ============================================================================
 
-/** Creates a MediatR INotification class. */
 export async function createMediatRNotification(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
@@ -590,11 +589,10 @@ export async function createMediatRNotification(folderUri?: vscode.Uri): Promise
 	if (!input) { return; }
 
 	const name = capitalize(input);
-	const namespace = await deriveNamespaceFromFolder(folder);
+const namespace = await deriveNamespaceFromFolder(folder);
 	await writeAndOpen(folder, `${name}.cs`, generateMediatRNotification(name, namespace));
 }
 
-/** Creates a MediatR INotificationHandler class (auto-name = NotificationName + Handler). */
 export async function createMediatRNotificationHandler(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
@@ -618,36 +616,17 @@ export async function createMediatRNotificationHandler(folderUri?: vscode.Uri): 
 	);
 }
 
-/**
- * Creates a MediatR INotification + INotificationHandler pair inside a new subfolder.
- * Folder name = notification name without trailing "Notification" suffix.
- */
 export async function createMediatRNotificationAndHandler(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
 
-	const input = await prompt('Notification Class Name', 'UserRegisteredNotification');
-	if (!input) { return; }
-
-	const name = capitalize(input.replace(/Notification$/i, '')) + 'Notification';
-	const folderName = name.replace(/Notification$/i, '') || name;
-
-	const subfolderUri = vscode.Uri.joinPath(folder, folderName);
-	await vscode.workspace.fs.createDirectory(subfolderUri);
-	const namespace = await deriveNamespaceFromFolder(subfolderUri);
-
-	await writeAndOpen(subfolderUri, `${name}.cs`, generateMediatRNotification(name, namespace));
-
-	const handlerName = `${name}Handler`;
-	const notifFoundType = { name, namespace, fileUri: vscode.Uri.joinPath(subfolderUri, `${name}.cs`) };
-	await writeAndOpen(subfolderUri, `${handlerName}.cs`, generateMediatRNotificationHandler(handlerName, notifFoundType, namespace));
+	await createSharedCqrsNotificationAndHandler(folder, MEDIATR_CONFIG);
 }
 
 // ============================================================================
-// MitMediator Notification commands
+// MitMediator Notification commands — using shared factories
 // ============================================================================
 
-/** Creates a MitMediator INotification class. */
 export async function createMitMediatorNotification(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
@@ -656,11 +635,10 @@ export async function createMitMediatorNotification(folderUri?: vscode.Uri): Pro
 	if (!input) { return; }
 
 	const name = capitalize(input);
-	const namespace = await deriveNamespaceFromFolder(folder);
+const namespace = await deriveNamespaceFromFolder(folder);
 	await writeAndOpen(folder, `${name}.cs`, generateMitMediatorNotification(name, namespace));
 }
 
-/** Creates a MitMediator INotificationHandler class (auto-name = NotificationName + Handler). */
 export async function createMitMediatorNotificationHandler(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
@@ -684,130 +662,47 @@ export async function createMitMediatorNotificationHandler(folderUri?: vscode.Ur
 	);
 }
 
-/**
- * Creates a MitMediator INotification + INotificationHandler pair inside a new subfolder.
- * Folder name = notification name without trailing "Notification" suffix.
- */
 export async function createMitMediatorNotificationAndHandler(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
 
-	const input = await prompt('Notification Class Name', 'UserRegisteredNotification');
-	if (!input) { return; }
-
-	const name = capitalize(input.replace(/Notification$/i, '')) + 'Notification';
-	const folderName = name.replace(/Notification$/i, '') || name;
-
-	const subfolderUri = vscode.Uri.joinPath(folder, folderName);
-	await vscode.workspace.fs.createDirectory(subfolderUri);
-	const namespace = await deriveNamespaceFromFolder(subfolderUri);
-
-	await writeAndOpen(subfolderUri, `${name}.cs`, generateMitMediatorNotification(name, namespace));
-
-	const handlerName = `${name}Handler`;
-	const notifFoundType = { name, namespace, fileUri: vscode.Uri.joinPath(subfolderUri, `${name}.cs`) };
-	await writeAndOpen(subfolderUri, `${handlerName}.cs`, generateMitMediatorNotificationHandler(handlerName, notifFoundType, namespace));
+	await createSharedCqrsNotificationAndHandler(folder, MITMEDIATOR_CONFIG);
 }
 
 // ============================================================================
-// MediatR PipelineBehavior commands
+// PipelineBehavior commands — using shared factory
 // ============================================================================
 
-/** Creates an empty MediatR IPipelineBehavior class. */
 export async function createMediatREmptyPipelineBehavior(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
 
-	const input = await prompt('Behavior Class Name', 'LoggingBehavior');
-	if (!input) { return; }
-
-	const name = capitalize(input);
-	const namespace = await deriveNamespaceFromFolder(folder);
-	await writeAndOpen(folder, `${name}.cs`, generateMediatREmptyPipelineBehavior(name, namespace));
+	await createSharedCqrsPipelineBehavior(folder, MEDIATR_CONFIG);
 }
 
-/** Creates a MediatR FluentValidation IPipelineBehavior class. */
 export async function createMediatRFluentValidationBehavior(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
 
-	const name = 'FluentValidationPipelineBehavior';
-	const namespace = await deriveNamespaceFromFolder(folder);
-	await writeAndOpen(folder, `${name}.cs`, generateMediatRFluentValidationBehavior(name, namespace));
+	await createSharedCqrsPipelineBehavior(folder, MEDIATR_CONFIG, true);
 }
 
-// ============================================================================
-// MitMediator PipelineBehavior commands
-// ============================================================================
-
-/** Creates an empty MitMediator IPipelineBehavior class. */
 export async function createMitMediatorEmptyPipelineBehavior(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
 
-	const input = await prompt('Behavior Class Name', 'LoggingBehavior');
-	if (!input) { return; }
-
-	const name = capitalize(input);
-	const namespace = await deriveNamespaceFromFolder(folder);
-	await writeAndOpen(folder, `${name}.cs`, generateMitMediatorEmptyPipelineBehavior(name, namespace));
+	await createSharedCqrsPipelineBehavior(folder, MITMEDIATOR_CONFIG);
 }
 
-/** Creates a MitMediator FluentValidation IPipelineBehavior class. */
 export async function createMitMediatorFluentValidationBehavior(folderUri?: vscode.Uri): Promise<void> {
 	const folder = await resolveTargetFolder(folderUri);
 	if (!folder) { vscode.window.showErrorMessage('No target folder selected.'); return; }
 
-	const name = 'FluentValidationPipelineBehavior';
-	const namespace = await deriveNamespaceFromFolder(folder);
-	await writeAndOpen(folder, `${name}.cs`, generateMitMediatorFluentValidationBehavior(name, namespace));
+	await createSharedCqrsPipelineBehavior(folder, MITMEDIATOR_CONFIG, true);
 }
 
 // ============================================================================
-// Helpers
+// Export normalizeRequestName for backward compatibility (used by other modules)
 // ============================================================================
 
-function capitalize(s: string): string {
-	return s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-function isBuiltinType(name: string): boolean {
-	const builtins = new Set([
-		'bool', 'byte', 'sbyte', 'char', 'decimal', 'double', 'float',
-		'int', 'uint', 'long', 'ulong', 'short', 'ushort', 'object',
-		'string', 'void', 'dynamic',
-		'Boolean', 'Byte', 'SByte', 'Char', 'Decimal', 'Double', 'Single',
-		'Int32', 'UInt32', 'Int64', 'UInt64', 'Int16', 'UInt16', 'Object',
-		'String', 'Guid', 'DateTime', 'DateTimeOffset', 'TimeSpan',
-		'Uri', 'Version', 'Type', 'Unit',
-	]);
-	return builtins.has(name);
-}
-
-const QUERY_PREFIXES = new Set(['get', 'load', 'download', 'fetch']);
-const COMMAND_PREFIXES = new Set([
-	'post', 'put', 'delete', 'add', 'create', 'remove', 'change',
-	'update', 'edit', 'modify', 'import', 'upload', 'drop',
-]);
-
-/**
- * Ensures the request name ends with the appropriate suffix (Query / Command / Request).
- * If already ends with one of those suffixes — returns as-is.
- */
-export function normalizeRequestName(name: string): string {
-	if (/(?:Request|Query|Command)$/i.test(name)) {
-		return name;
-	}
-	const firstWordMatch = name.match(/^([A-Z][a-z]*)/);
-	const firstWord = (firstWordMatch ? firstWordMatch[1] : name).toLowerCase();
-
-	let suffix: string;
-	if (QUERY_PREFIXES.has(firstWord)) {
-		suffix = 'Query';
-	} else if (COMMAND_PREFIXES.has(firstWord)) {
-		suffix = 'Command';
-	} else {
-		suffix = 'Request';
-	}
-	return name + suffix;
-}
+export { normalizeRequestName } from '../utils/sharedUtilities.js';

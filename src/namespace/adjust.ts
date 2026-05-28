@@ -9,16 +9,31 @@ import { removeUsingDirective } from './usingDirectives.js';
 // ============================================================================
 
 /**
+ * Checks if the given filename is Program.cs (case-insensitive).
+ */
+function isProgramCs(uriPath: string): boolean {
+	const fileName = uriPath.split('/').pop()?.toLowerCase();
+	return fileName === 'program.cs';
+}
+
+/**
  * Adjusts the namespace declaration in a file's content.
  * Supports both file-scoped and block-scoped namespace syntax.
+ * Always uses file-scoped namespaces (namespace Name;) as the output format.
+ * Removes all old namespace declarations (both block and file-scoped).
+ * 
+ * For Program.cs files: if there was no existing namespace, do NOT add a new one
+ * (to support .NET 6+ minimal API style files that intentionally have no namespace).
  *
  * @param content - The full file content
+ * @param uriPath - The URI path of the file (used to detect Program.cs)
  * @param newNamespace - The new namespace to set
  * @param skipPartialTypes - If true, files with partial type declarations are skipped
  * @returns The adjusted content and whether it was modified
  */
 export function adjustFileNamespace(
 	content: string,
+	uriPath: string,
 	newNamespace: string,
 	skipPartialTypes: boolean = false
 ): { adjustedContent: string; wasAdjusted: boolean; oldNamespace: string | undefined } {
@@ -29,48 +44,70 @@ export function adjustFileNamespace(
 		return { adjustedContent: content, wasAdjusted: false, oldNamespace };
 	}
 
-	// Detect block-scoped namespace: namespace Foo { ... }
-	const blockMatch = detectBlockNamespace(content);
+	// Check if this is a Program.cs file (done early since it's just filename-based)
+	const isProgram = isProgramCs(uriPath);
+
+	// Strip UTF-8 BOM if present — it confuses all regex anchors (^) and whitespace matches
+	const hasBom = content.startsWith('\uFEFF');
+	let workingContent = hasBom ? content.slice(1) : content;
+
+	// Normalize CRLF → LF so that all regexes work correctly regardless of line endings.
+	// We'll restore CRLF at the end if the original file used it.
+	const hasCrlf = workingContent.includes('\r\n');
+	if (hasCrlf) {
+		workingContent = workingContent.replace(/\r\n/g, '\n');
+	}
+
+	// First, check for any existing namespace (block-scoped or file-scoped)
+	const blockMatch = detectBlockNamespace(workingContent);
+	const fileScopedMatch = workingContent.match(/^(\s*)namespace\s+([\w.]+)\s*;\s*(?:\/\/.*)?$/m);
+
+	// Determine the old namespace from whichever exists
+	let oldNamespace: string | undefined;
 	if (blockMatch) {
-		const oldNamespace = blockMatch.name;
-		if (oldNamespace === newNamespace) {
-			return { adjustedContent: content, wasAdjusted: false, oldNamespace };
-		}
-		let adjustedContent = convertBlockToFileScoped(content, blockMatch, newNamespace);
-		const removeResult = removeUsingDirective(adjustedContent, newNamespace);
-		if (removeResult.wasRemoved) {
-			adjustedContent = removeResult.adjustedContent;
-		}
-		adjustedContent = normalizeSpacingAroundNamespace(adjustedContent);
-		return { adjustedContent, wasAdjusted: true, oldNamespace };
+		oldNamespace = blockMatch.name;
+	} else if (fileScopedMatch) {
+		oldNamespace = fileScopedMatch[2];
 	}
 
-	// Detect file-scoped namespace: namespace Foo;
-	const namespaceRegex = /^(\s*)namespace\s+([\w.]+)\s*;\s*(?:\/\/.*)?$/m;
-	const match = content.match(namespaceRegex);
-
-	if (match) {
-		const oldNamespace = match[2];
-
-		// If the existing namespace already matches, return unchanged
-		if (oldNamespace === newNamespace) {
-			return { adjustedContent: content, wasAdjusted: false, oldNamespace };
-		}
-
-		// Namespace differs, replace it
-		let adjustedContent = content.replace(namespaceRegex, `${match[1]}namespace ${newNamespace};\n`);
-
-		// Remove redundant using directive that matches the new namespace (the file IS now in that namespace)
-		const removeResult = removeUsingDirective(adjustedContent, newNamespace);
-		if (removeResult.wasRemoved) {
-			adjustedContent = removeResult.adjustedContent;
-		}
-		adjustedContent = normalizeSpacingAroundNamespace(adjustedContent);
-		return { adjustedContent, wasAdjusted: true, oldNamespace };
+	// If old namespace matches new namespace exactly, no change needed
+	if (oldNamespace === newNamespace) {
+		return { adjustedContent: content, wasAdjusted: false, oldNamespace };
 	}
 
-	// No namespace found - need to insert one at the top of the file
-	return insertNamespaceAtTop(content, newNamespace);
+	// For Program.cs files: if there was no existing namespace, don't add one
+	// This supports .NET 6+ minimal API style files that intentionally have no namespace
+	if (isProgram && !oldNamespace) {
+		return { adjustedContent: content, wasAdjusted: false, oldNamespace };
+	}
+
+	// Strategy: ALWAYS remove ALL existing namespaces completely (for non-Program.cs or Program.cs with namespace),
+	// then add the new one
+	// This is the most reliable way to ensure no duplicates (file-scoped + block-scoped coexisting)
+	
+	// Remove all namespaces (both file-scoped and block-scoped)
+	workingContent = removeAllNamespaceDeclarations(workingContent);
+	
+	// Now insert the new namespace at the top
+	const result = insertNamespaceAtTop(workingContent, newNamespace);
+
+	if (!result.wasAdjusted) {
+		return { ...result, oldNamespace };
+	}
+
+	let finalContent = normalizeSpacingAroundNamespace(result.adjustedContent);
+
+	// Restore CRLF line endings if the original file used them
+	if (hasCrlf) {
+		finalContent = finalContent.replace(/\n/g, '\r\n');
+	}
+
+	// Re-attach the BOM if the original file had one
+	if (hasBom) {
+		finalContent = '\uFEFF' + finalContent;
+	}
+
+	return { adjustedContent: finalContent, wasAdjusted: true, oldNamespace };
 }
 
 // ============================================================================
@@ -80,7 +117,11 @@ export function adjustFileNamespace(
 /**
  * Adjusts namespace for a single file using the legacy (non-batch) path.
  */
-export async function adjustNamespaceForFile(fileUri: vscode.Uri): Promise<FileAdjustResultWithContext> {
+export async function adjustNamespaceForFile(
+	fileUri: vscode.Uri,
+	_targetFolderUri?: vscode.Uri,
+	_projectContext?: { csprojs: import('../types.js').CsprojInfo[] }
+): Promise<FileAdjustResultWithContext> {
 	try {
 		const existingContent = await vscode.workspace.fs.readFile(fileUri);
 		const content = Buffer.from(existingContent).toString('utf-8');
@@ -89,7 +130,7 @@ export async function adjustNamespaceForFile(fileUri: vscode.Uri): Promise<FileA
 		const extractionResult = extractTypesFromContent(content);
 
 		const newNamespace = await deriveNamespaceFromFile(fileUri);
-		const { adjustedContent, wasAdjusted, oldNamespace } = adjustFileNamespace(content, newNamespace, true);
+		const { adjustedContent, wasAdjusted, oldNamespace } = adjustFileNamespace(content, fileUri.path, newNamespace, true);
 
 		if (!wasAdjusted) {
 			return { uri: fileUri, adjusted: false };
@@ -109,7 +150,6 @@ export async function adjustNamespaceForFile(fileUri: vscode.Uri): Promise<FileA
 }
 
 /**
- * Adjusts namespace for a single file using preloaded project context.
  * This is the optimized path for batch folder operations.
  */
 export async function adjustNamespaceForFileWithContext(
@@ -125,7 +165,7 @@ export async function adjustNamespaceForFileWithContext(
 		const extractionResult = extractTypesFromContent(content);
 
 		const newNamespace = await deriveNamespaceForFile(fileUri, targetFolderUri, projectContext);
-		const { adjustedContent, wasAdjusted, oldNamespace } = adjustFileNamespace(content, newNamespace, true);
+		const { adjustedContent, wasAdjusted, oldNamespace } = adjustFileNamespace(content, fileUri.path, newNamespace, true);
 
 		if (!wasAdjusted) {
 			return { uri: fileUri, adjusted: false };
@@ -191,6 +231,98 @@ function normalizeSpacingAroundNamespace(content: string): string {
 }
 
 /**
+ * Removes ALL namespace declarations (both block-scoped and file-scoped) from the content.
+ * Preserves all code that was inside the namespace blocks (dedented).
+ * Returns the content with namespaces removed.
+ */
+function removeAllNamespaceDeclarations(content: string): string {
+	// Remove file-scoped namespaces first. This also fixes files that were
+	// previously adjusted incorrectly and now contain both:
+	//   namespace New.Name;
+	//   namespace Old.Name { ... }
+	content = removeFileScopedNamespaceDeclarations(content);
+
+	// First, try to remove any block-scoped namespaces
+	const nsRegex = /^(?:\uFEFF)?([ \t]*)namespace\s+([\w.]+)[ \t]*(?:\{[ \t]*)?$/gm;
+	let nsMatch: RegExpExecArray | null;
+	const blocks: BlockNamespaceInfo[] = [];
+
+	nsRegex.lastIndex = 0;
+	while ((nsMatch = nsRegex.exec(content)) !== null) {
+		const braces = findNamespaceBraces(content, nsMatch);
+		if (braces) {
+			blocks.push({
+				name: nsMatch[2],
+				keywordStart: nsMatch.index,
+				indent: nsMatch[1],
+				braceOpen: braces.braceOpen,
+				braceClose: braces.braceClose,
+			});
+		}
+	}
+
+	// If we found block namespaces, extract and dedent their content
+	if (blocks.length > 0) {
+		const beforeFirst = content.slice(0, blocks[0].keywordStart).replace(/[\r\n\s]+$/, '');
+		const bodySegments: string[] = [];
+
+		for (let idx = 0; idx < blocks.length; idx++) {
+			const block = blocks[idx];
+
+			// Code between previous block's closing brace and this block's keyword
+			if (idx > 0) {
+				const prevClose = blocks[idx - 1].braceClose;
+				const gap = content.slice(prevClose + 1, block.keywordStart).trim();
+				if (gap) {
+					bodySegments.push(gap);
+				}
+			}
+
+			// The body of this namespace block (between braces, exclusive)
+			const bodyRaw = content.slice(block.braceOpen + 1, block.braceClose);
+			const bodyLines = bodyRaw.split('\n');
+			const dedented = dedentLines(bodyLines);
+
+			// Trim leading/trailing blank lines
+			let start = 0;
+			let end = dedented.length - 1;
+			while (start <= end && dedented[start].trim() === '') { start++; }
+			while (end >= start && dedented[end].trim() === '') { end--; }
+
+			if (start <= end) {
+				bodySegments.push(dedented.slice(start, end + 1).join('\n'));
+			}
+		}
+
+		// Code after the last closing brace (outside all namespace blocks)
+		const lastBlock = blocks[blocks.length - 1];
+		const afterLast = content.slice(lastBlock.braceClose + 1).trim();
+		if (afterLast) {
+			bodySegments.push(afterLast);
+		}
+
+		const body = bodySegments.join('\n\n');
+
+		if (beforeFirst) {
+			return `${beforeFirst}\n\n${body}\n`;
+		}
+		return body;
+	}
+
+	// No namespaces found - return as is. File-scoped namespaces were already
+	// removed above, so this is either namespace-free content or original content.
+	return content;
+}
+
+/**
+ * Removes all file-scoped namespace declarations from content.
+ */
+function removeFileScopedNamespaceDeclarations(content: string): string {
+	const fileScopedRegex = /^(?:\uFEFF)?[ \t]*namespace\s+[\w.]+\s*;[ \t]*(?:\/\/.*)?(?:\n|$)/gm;
+	return content.replace(fileScopedRegex, '');
+}
+
+/**
  * Inserts a namespace declaration at the top of the file content,
  * taking into account existing using statements.
  */
@@ -207,7 +339,7 @@ function insertNamespaceAtTop(
 	}
 
 	// Process using statements (with possible blank lines between them)
-	let lastUsingEnd = i; // Where the using block ends
+	let lastUsingEnd = 0; // Where the using block ends (0 means no usings found yet)
 	while (i < lines.length) {
 		const trimmedLine = lines[i].trim();
 		if (/^using\s+/.test(trimmedLine)) {
@@ -242,7 +374,9 @@ function insertNamespaceAtTop(
 	}
 
 	// No using statements - insert namespace at the very top without leading blank line
-	let adjustedContent = `namespace ${newNamespace};\n\n${content}`;
+	// Strip any leading blank lines from content so there's no extra whitespace
+	const trimmedContent = content.replace(/^[\r\n]+/, '');
+	let adjustedContent = trimmedContent ? `namespace ${newNamespace};\n\n${trimmedContent}` : `namespace ${newNamespace};\n`;
 
 	// Remove redundant using directive that matches the new namespace
 	const removeResult = removeUsingDirective(adjustedContent, newNamespace);
@@ -278,17 +412,22 @@ function findNamespaceBraces(
 	content: string,
 	nsMatch: RegExpExecArray
 ): { braceOpen: number; braceClose: number } | null {
-	// The "{" may be on the same line as "namespace" (already captured by the regex)
-	// or on the next line. Search from the start of the match line.
-	const afterMatchEnd = nsMatch.index + nsMatch[0].length;
-	const nextNewline = content.indexOf('\n', afterMatchEnd);
-	const searchEnd = nextNewline === -1 ? content.length : nextNewline + 1;
-	const snippet = content.slice(nsMatch.index, Math.min(searchEnd + 50, content.length));
-	const bracePos = snippet.indexOf('{');
-	if (bracePos === -1) {
-		return null;
+	// The "{" may be on the same line as "namespace" or on the next line.
+	// First check if the regex match itself already contains the opening brace
+	// (e.g. "namespace Foo {" — brace captured on same line).
+	const braceInMatch = nsMatch[0].indexOf('{');
+	let braceOpen: number;
+	if (braceInMatch !== -1) {
+		// Brace was on the same line as the namespace keyword
+		braceOpen = nsMatch.index + braceInMatch;
+	} else {
+		// Brace is on a subsequent line — search from the end of the matched line
+		const afterMatchEnd = nsMatch.index + nsMatch[0].length;
+		braceOpen = content.indexOf('{', afterMatchEnd);
+		if (braceOpen === -1) {
+			return null;
+		}
 	}
-	const braceOpen = nsMatch.index + bracePos;
 
 	// Find the matching closing brace by counting depth
 	let depth = 1;
@@ -310,7 +449,7 @@ function findNamespaceBraces(
  */
 function detectBlockNamespace(content: string): BlockNamespaceInfo | null {
 	// Match "namespace Foo.Bar" not followed by ";" — brace may be on same line or next line
-	const nsRegex = /^([ \t]*)namespace\s+([\w.]+)[ \t]*(?:\{[ \t]*)?$/m;
+	const nsRegex = /^(?:\uFEFF)?([ \t]*)namespace\s+([\w.]+)[ \t]*(?:\{[ \t]*)?$/m;
 	const nsMatch = nsRegex.exec(content);
 	if (!nsMatch) {
 		return null;
@@ -359,6 +498,9 @@ function dedentLines(lines: string[]): string[] {
  * - All namespace blocks have their braces removed and their bodies dedented.
  * - Code outside any namespace block (but below the usings) is kept as-is.
  * - A single `namespace NewName;` line replaces all namespace declarations.
+ * - Also removes any file-scoped namespace declarations (namespace Name;).
+ *
+ * Note: This function is kept for reference but is superseded by removeAllNamespaceDeclarations().
  *
  * Before:
  *   using System;
@@ -379,10 +521,12 @@ function dedentLines(lines: string[]): string[] {
  *
  *   internal class Bar { }
  */
-function convertBlockToFileScoped(
+// Unused function - kept for reference, superseded by removeAllNamespaceDeclarations()
+// @ts-ignore - Intentionally unused function kept for reference
+function _convertBlockToFileScoped(
 	content: string,
 	_firstBlock: BlockNamespaceInfo,
-	newNamespace: string
+	_newNamespace: string
 ): string {
 	// Find ALL block-scoped namespace declarations in the file
 	const nsRegex = /^([ \t]*)namespace\s+([\w.]+)[ \t]*(?:\{[ \t]*)?$/gm;
@@ -403,7 +547,12 @@ function convertBlockToFileScoped(
 	}
 
 	if (blocks.length === 0) {
-		// Fallback — should not happen
+		// No block namespaces found; just replace any file-scoped namespace if it exists
+		const fileScopedRegex = /^(\s*)namespace\s+([\w.]+)\s*;\s*(?:\/\/.*)?$/m;
+		if (fileScopedRegex.test(content)) {
+			return content.replace(fileScopedRegex, `namespace ${_newNamespace};`);
+		}
+		// Fallback — should not happen if called correctly
 		return content;
 	}
 
@@ -452,7 +601,7 @@ function convertBlockToFileScoped(
 	}
 
 	const body = bodySegments.join('\n\n');
-	const namespaceLine = `${blocks[0].indent}namespace ${newNamespace};`;
+	const namespaceLine = `${blocks[0].indent}namespace ${_newNamespace};`;
 
 	if (beforeFirst) {
 		return `${beforeFirst}\n\n${namespaceLine}\n\n${body}\n`;

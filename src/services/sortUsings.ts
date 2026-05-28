@@ -3,12 +3,11 @@ import { collectCsFiles } from '../utils/fileUtils.js';
 
 /**
  * Groups for sorting using directives.
- * Order: System.* → Microsoft.* → other third-party → project-local (short names)
+ * Order: System.* → everything else (alphabetically)
  */
 function getUsingGroup(ns: string): number {
 	if (ns.startsWith('System')) { return 0; }
-	if (ns.startsWith('Microsoft')) { return 1; }
-	return 2;
+	return 1;
 }
 
 /**
