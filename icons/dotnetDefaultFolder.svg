@@ -1,0 +1,15 @@
+<svg version="1.2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 396 294" width="396" height="294">
+	<style>
+		tspan { white-space:pre } 
+		.s0 { fill: #6c429c } 
+		.s1 { fill: #5c2d91 } 
+		.t2 { font-size: 81px;fill: #ffffff;font-weight: 400;font-family: "Arial"; } 
+	</style>
+	<path id="Layer 1 copy 2" fill-rule="evenodd" class="s0"
+		d="m13.4 0.51h106.55c7.18 0 13 5.82 13 13v41.44c0 7.18-5.82 13-13 13h-106.55c-7.18 0-13-5.82-13-13v-41.44c0-7.18 5.82-13 13-13z" />
+	<path id="Layer 1" fill-rule="evenodd" class="s1"
+		d="m13 29.23h370c7.18 0 13 5.82 13 13v238.76c0 7.18-5.82 13-13 13h-370c-7.18 0-13-5.82-13-13v-238.76c0-7.18 5.82-13 13-13z" />
+	<text id=".NET" style="transform: matrix(1.617,0,0,1.617,36.834,110.767)">
+		<tspan x="1.8" y="61.5" class="t2">.NET</tspan>
+	</text>
+</svg>

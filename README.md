@@ -28,8 +28,10 @@ Smart file creation, code generation, project creation, namespace management and
   - [.NET Project Creation](#net-project-creation)
   - [ASP.NET Templates](#aspnet-templates)
   - [MediatR and MitMediator templates](#mediatr-and-mitmediator-templates)
-  - [EF Core](#ef-core)
+  - [EF Core Configuration](#ef-core-configuration)
+  - [Entity Framework CMD](#ef-core-cmd)
   - [Go To Handler](#go-to-handler)
+  - [Color for projects](#color-for-projects)
 - [Issues](#issues)
 - [Release Notes](#release-notes)
 
@@ -104,11 +106,25 @@ Generate requests, handlers, notifications, and pipeline behaviors. Right-click 
 | **Empty PipelineBehavior** | Blank `IPipelineBehavior` |
 | **FluentValidation PipelineBehavior** | Validation behavior using FluentValidation |
 
-### EF Core
+### EF Core Configuration
 
 Scaffold Entity Framework Core entity configurations. Right-click a folder → **C# Generator → EF Core**, or right-click a `.cs` entity file directly.
 
-![EF Core demo](images/efcore.gif)
+![EF Core Configuration demo](images/efcore.gif)
+
+### Entity Framework CMD
+
+Run Entity Framework Core migration commands directly from the Explorer context menu on a `.csproj` file:
+
+| Command | Description |
+|---------|-------------|
+| **Add Migration** | Add a new EF Core migration |
+| **Remove Migration** | Remove the last migration |
+| **Update Database** | Update the database to the latest migration |
+| **List Migrations** | List all available migrations |
+| **Script Migration** | Generate a SQL script for migrations |
+
+![Entity Framework CMD demo](images/EntityFrameworkCMDdemo.png)
 
 ### Go To Handler
 
@@ -116,11 +132,20 @@ Navigate between a MediatR/MitMediator request file and its handler.
 
 ![Go To Handler demo](images/goToHandler.gif)
 
+### Color for projects
+
+The names of the folders containing project files are highlighted in purple.
+
 ## Issues
 
 - If you find a bug please report it on [GitHub issues](https://github.com/dzmprt/CSharpPainkiller/issues)
 
 ## Release Notes
+
+### 0.0.3
+
+- Added **Entity Framework CMD** commands — Add Migration, Remove Migration, Update Database, List Migrations, Script Migration via `dotnet ef` CLI. Added **Entity Framework CMD** submenu to `.csproj` file context menu
+- Custom color for C# project folders
 
 ### 0.0.2
 

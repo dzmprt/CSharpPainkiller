@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -180,6 +180,26 @@
       {
         "command": "csharppainkiller.dotnet.createProject",
         "title": ".NET NEW"
+      },
+      {
+        "command": "csharppainkiller.efcore.cmd.addMigration",
+        "title": "Add Migration"
+      },
+      {
+        "command": "csharppainkiller.efcore.cmd.updateDatabase",
+        "title": "Update Database"
+      },
+      {
+        "command": "csharppainkiller.efcore.cmd.listMigrations",
+        "title": "List Migrations"
+      },
+      {
+        "command": "csharppainkiller.efcore.cmd.scriptMigration",
+        "title": "Script Migration"
+      },
+      {
+        "command": "csharppainkiller.efcore.cmd.removeMigration",
+        "title": "Remove Migration"
       }
     ],
     "submenus": [
@@ -218,6 +238,10 @@
       {
         "id": "csharppainkiller.efcore",
         "label": "EF Core"
+      },
+      {
+        "id": "csharppainkiller.efcoreCmd",
+        "label": "Entity Framework CMD"
       }
     ],
     "menus": {
@@ -255,6 +279,11 @@
           "command": "csharppainkiller.dotnet.createProject",
           "when": "explorerResourceIsFolder",
           "group": "2_csharp@6"
+        },
+        {
+          "when": "resourceExtname == .csproj",
+          "submenu": "csharppainkiller.efcoreCmd",
+          "group": "2_csharp@7"
         }
       ],
       "csharppainkiller.create": [
@@ -421,6 +450,28 @@
         {
           "command": "csharppainkiller.efcore.createConfigurationFromFolder",
           "group": "1_efcore@1"
+        }
+      ],
+      "csharppainkiller.efcoreCmd": [
+        {
+          "command": "csharppainkiller.efcore.cmd.addMigration",
+          "group": "1_efcmd@1"
+        },
+        {
+          "command": "csharppainkiller.efcore.cmd.removeMigration",
+          "group": "1_efcmd@2"
+        },
+        {
+          "command": "csharppainkiller.efcore.cmd.listMigrations",
+          "group": "1_efcmd@3"
+        },
+        {
+          "command": "csharppainkiller.efcore.cmd.scriptMigration",
+          "group": "1_efcmd@4"
+        },
+        {
+          "command": "csharppainkiller.efcore.cmd.updateDatabase",
+          "group": "1_efcmd@5"
         }
       ]
     },

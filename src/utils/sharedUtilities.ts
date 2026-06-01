@@ -6,6 +6,7 @@
 import * as vscode from 'vscode';
 import { CS_EXTENSION, HANDLER_SUFFIX } from '../constants.js';
 
+
 // ============================================================================
 // Shared file operations (replaces duplicated writeAndOpen patterns)
 // ============================================================================
@@ -51,19 +52,6 @@ export async function writeAndOpen(
 	}
 }
 
-/**
- * Reads file content from a URI.
- */
-export async function readFileContent(uri: vscode.Uri): Promise<string | undefined> {
-	try {
-		const buf = await vscode.workspace.fs.readFile(uri);
-		return Buffer.from(buf).toString('utf-8');
-	} catch {
-		return undefined;
-	}
-}
-
-// ============================================================================
 // Shared target folder resolution (replaces duplicated resolveTargetFolder)
 // ============================================================================
 
@@ -313,49 +301,6 @@ export async function createCqrsNotificationAndHandler(
 }
 
 /**
- * Shared factory for CQRS notification-only creation.
- */
-export async function createCqrsNotification(
-	folder: vscode.Uri,
-	config: CqrsTemplateConfig,
-	promptPrefix: string = ''
-): Promise<void> {
-	const input = await prompt('Notification Class Name', promptPrefix || 'UserRegisteredNotification');
-	if (!input) { return; }
-
-	const name = capitalize(input);
-	const namespace = await deriveNamespaceFromFolder(folder);
-	await writeAndOpen(folder, `${name}.cs`, config.generateNotification(name, namespace));
-}
-
-/**
- * Shared factory for CQRS notification handler-only creation.
- */
-export async function createCqrsNotificationHandler(
-	folder: vscode.Uri,
-	config: CqrsTemplateConfig,
-	promptPrefix: string = ''
-): Promise<void> {
-	const input = await prompt('INotification Type to Handle', promptPrefix || 'UserRegisteredNotification');
-	if (!input) { return; }
-
-	const notificationName = capitalize(input);
-	await vscode.window.withProgress(
-		{ location: vscode.ProgressLocation.Notification, title: `Searching for '${notificationName}'…` },
-		async () => {
-			const found = await findTypeInWorkspace(notificationName);
-			if (!found) {
-				vscode.window.showErrorMessage(`Type '${notificationName}' not found. The handler was not created.`);
-				return;
-			}
-			const handlerName = `${notificationName}Handler`;
-			const namespace = await deriveNamespaceFromFolder(folder);
-			await writeAndOpen(folder, `${handlerName}.cs`, config.generateNotificationHandler(handlerName, found, namespace));
-		}
-	);
-}
-
-/**
  * Shared factory for CQRS empty pipeline behavior creation.
  */
 export async function createCqrsPipelineBehavior(
@@ -462,10 +407,6 @@ function parseReturnType(returnTypeStr: string): { innerTypeName: string; return
 	}
 
 	return { innerTypeName: returnTypeStr.trim(), returnType: returnTypeStr };
-}
-
-async function findTypeInWorkspace(name: string): Promise<import('./typeSearch.js').FoundType | undefined> {
-	return (await import('./typeSearch.js')).findTypeInWorkspace(name);
 }
 
 /**

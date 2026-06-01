@@ -61,15 +61,6 @@ export interface TypeExtractionResult {
 // Namespace adjustment types
 // ============================================================================
 
-/** Result of adjusting a single file's namespace. */
-export interface FileAdjustResult {
-	uri: vscode.Uri;
-	adjusted: boolean;
-	oldNamespace?: string;
-	newNamespace?: string;
-	error?: string;
-}
-
 /** Namespace change tracking for a file. */
 export interface NamespaceChange {
 	/** The file URI that was changed */
@@ -83,7 +74,12 @@ export interface NamespaceChange {
 }
 
 /** Extended result for file adjustment that includes type information. */
-export interface FileAdjustResultWithContext extends FileAdjustResult {
+export interface FileAdjustResultWithContext {
+	uri: vscode.Uri;
+	adjusted: boolean;
+	oldNamespace?: string;
+	newNamespace?: string;
+	error?: string;
 	/** Types that were in this file before adjustment */
 	types?: TypeDefinition[];
 }
@@ -200,54 +196,8 @@ export interface CqrsTemplateConfig {
 }
 
 // ============================================================================
-// NOTE: The following types are deprecated — use sharedUtilities.ts instead:
-//   - CqrsTemplateConfig → src/utils/sharedUtilities.ts
-//   - MediatorFileInfo, MediatorKind, MediatorLibrary → src/utils/sharedUtilities.ts
-//   - WriteFileResult → src/utils/sharedUtilities.ts
-// ============================================================================
-
-// ============================================================================
-// Command registration types (architecture improvement)
-// ============================================================================
-
-/**
- * Definition of a VS Code command for declarative registration.
- * Used by CommandRegistry to replace verbose registerCommand boilerplate.
- */
-export interface CommandDefinition {
-	/** The VS Code command ID */
-	id: string;
-
-	/** The handler function (variadic args for VS Code compatibility) */
-	handler: (...args: any[]) => Promise<void>;
-
-	/** Optional VS Code context expression when the command is available */
-	when?: string;
-}
-
-/** Metadata about a registered command for introspection. */
-export interface RegisteredCommand {
-	/** The VS Code command ID */
-	id: string;
-
-	/** The VS Code Disposable for this registration */
-	disposable: vscode.Disposable;
-
-	/** Handler function reference */
-	handler: (...args: any[]) => Promise<void>;
-}
-
-// ============================================================================
 // Diagnostics types
 // ============================================================================
-
-/** Severity mapping for CSharp Painkiller diagnostics. */
-export enum CSharpDiagnosticSeverity {
-	Warning = 1,
-	Error = 0,
-	Information = 3,
-	Hint = 4,
-}
 
 /** Range information for mixed-language identifier occurrences. */
 export interface MixedLanguageOccurrence {
@@ -259,32 +209,4 @@ export interface MixedLanguageOccurrence {
 	startChar: number;
 	/** 0-based end column (exclusive) */
 	endChar: number;
-}
-
-// ============================================================================
-// Template command types (shared between MediatR/MitMediator)
-// ============================================================================
-
-/** Resolved return type information for CQRS commands. */
-export interface ResolvedReturnType {
-	/** The full return type string (e.g., "List<Author>" or null for void) */
-	returnType: string | null;
-	/** The inner type name extracted from generics (e.g., "Author") */
-	innerTypeName: string | null;
-	/** Workspace-located type info for adding using directives */
-	returnedType: FoundType | null;
-}
-
-/** Information about a request type for handler generation. */
-export interface RequestTypeInfo {
-	/** The request class name */
-	requestName: string;
-	/** Namespace of the request */
-	namespace: string;
-	/** URI of the request file */
-	fileUri: vscode.Uri;
-	/** Return type string (e.g., "List<Author>") */
-	returnType: string;
-	/** Resolved returned type for using directives */
-	returnedType?: FoundType;
 }

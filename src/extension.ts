@@ -37,11 +37,17 @@ import {
 import {
 	createEfCoreConfigurationFromFolder,
 	createEfCoreConfigurationFromFile,
+	efCoreAddMigration,
+	efCoreUpdateDatabase,
+	efCoreListMigrations,
+	efCoreScriptMigration,
+	efCoreRemoveMigration,
 } from './services/efCoreCommands.js';
 import { validateUri as validateSharedUri } from './utils/sharedUtilities.js';
 
 import { CsprojCache } from './utils/csprojCache.js';
 import { fetchDotnetTemplates, registerDynamicTemplateCommands } from './services/dotnetTemplates.js';
+import { CsprojFolderDecorationProvider } from './decoration/csprojFolderDecorationProvider.js';
 
 /**
  * List of all "Create" commands for C# types.
@@ -72,6 +78,16 @@ export async function activate(context: vscode.ExtensionContext) {
 	const csprojCache = CsprojCache.getInstance();
 	await csprojCache.initialize(context);
 	console.log('CsprojCache initialized');
+
+	// -------------------------------------------------------------------------
+	// Register file decoration provider for csproj folders
+	// -------------------------------------------------------------------------
+	const decorationProvider = new CsprojFolderDecorationProvider();
+	await decorationProvider.initialize();
+	context.subscriptions.push(
+		vscode.window.registerFileDecorationProvider(decorationProvider)
+	);
+	console.log('File decoration provider registered');
 
 	// -------------------------------------------------------------------------
 	// Register Code Action provider for MapTo generation
@@ -118,7 +134,8 @@ export async function activate(context: vscode.ExtensionContext) {
 	);
 	context.subscriptions.push(generateMapFromDisposable);
 
-		// -------------------------------------------------------------------------
+
+	// -------------------------------------------------------------------------
 	// Mediator file context key
 	// Sets `csharppainkiller.isMediatorFile` based on the active editor content,
 	// so that "Generate Handler" and "Go To Handler" menu items are only shown
@@ -343,6 +360,40 @@ export async function activate(context: vscode.ExtensionContext) {
 		)
 	);
 
+	// -------------------------------------------------------------------------
+	// "C# Entity Framework CMD" commands — dotnet ef CLI
+	// -------------------------------------------------------------------------
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.efcore.cmd.addMigration',
+			(uri?: vscode.Uri) => efCoreAddMigration(uri)
+		)
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.efcore.cmd.updateDatabase',
+			(uri?: vscode.Uri) => efCoreUpdateDatabase(uri)
+		)
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.efcore.cmd.listMigrations',
+			(uri?: vscode.Uri) => efCoreListMigrations(uri)
+		)
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.efcore.cmd.scriptMigration',
+			(uri?: vscode.Uri) => efCoreScriptMigration(uri)
+		)
+	);
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.efcore.cmd.removeMigration',
+			(uri?: vscode.Uri) => efCoreRemoveMigration(uri)
+		)
+	);
+
   // -------------------------------------------------------------------------
   // ".NET Project" commands — dynamically loaded from `dotnet new list`
   // -------------------------------------------------------------------------
@@ -461,7 +512,10 @@ export async function activate(context: vscode.ExtensionContext) {
 	// Cleanup: dispose CsprojCache singleton on extension deactivation
 	// -------------------------------------------------------------------------
 	context.subscriptions.push({
-		dispose: () => csprojCache.dispose()
+		dispose: () => {
+			csprojCache.dispose();
+			decorationProvider.dispose();
+		}
 	});
 }
 

@@ -38,8 +38,11 @@ export async function createCSharpFile(type: CType, folderUri?: vscode.Uri): Pro
 		return;
 	}
 
-	const namespaceName = await deriveNamespaceFromFolder(targetFolder);
-	const content = getTemplate(type, sanitizedName, namespaceName);
+	// Ensure interface names always start with "I"
+	const finalName = type === 'interface' && !sanitizedName.startsWith('I') ? `I${sanitizedName}` : sanitizedName;
 
-	await writeAndOpen(targetFolder, `${sanitizedName}.cs`, content);
+	const namespaceName = await deriveNamespaceFromFolder(targetFolder);
+	const content = getTemplate(type, finalName, namespaceName);
+
+	await writeAndOpen(targetFolder, `${finalName}.cs`, content);
 }
