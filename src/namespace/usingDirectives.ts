@@ -19,14 +19,14 @@ export function addUsingForNewNamespace(
 	newNamespace: string,
 	fileNamespace: string | undefined
 ): UsingDirectiveChangeResult {
+	// If the file's namespace matches the new namespace, remove redundant self-namespace usings
+	if (fileNamespace === newNamespace) {
+		return removeRedundantUsing(content, newNamespace);
+	}
+
 	// Check if the using directive already exists
 	if (content.includes(`using ${newNamespace};`)) {
 		return { adjustedContent: content, wasAdded: false, wasRemoved: false };
-	}
-
-	// If the file's namespace matches the new namespace, remove the redundant using directives
-	if (fileNamespace === newNamespace) {
-		return removeRedundantUsing(content, newNamespace);
 	}
 
 	const lines = content.split('\n');
@@ -66,11 +66,21 @@ export function addUsingForNewNamespace(
  * Returns the set of type names found in the content.
  */
 export function findTypeReferencesInContent(content: string, typeNames: Set<string>): Set<string> {
+	if (typeNames.size === 0) {
+		return new Set();
+	}
+
+	// Type names inside using/namespace lines are not usage of the type itself
+	const searchableContent = content
+		.split('\n')
+		.filter(line => !/^\s*using\s+/.test(line) && !/^\s*namespace\s+/.test(line))
+		.join('\n');
+
 	const found = new Set<string>();
 	for (const typeName of typeNames) {
 		const escaped = escapeRegExp(typeName);
 		const regex = new RegExp(`(?<![a-zA-Z0-9_])${escaped}(?![a-zA-Z0-9_])`);
-		if (regex.test(content)) {
+		if (regex.test(searchableContent)) {
 			found.add(typeName);
 		}
 	}
@@ -84,9 +94,9 @@ export function findTypeReferencesInContent(content: string, typeNames: Set<stri
 /**
  * Updates using directives in files that reference types from changed namespaces.
  * For each file, checks:
- * 1. If any using directive matches an old namespace from a namespace change
- * 2. If the file content references any type names that moved to a new namespace
- * and adds corresponding using directives for the new namespaces.
+ * 1. If any using directive matches an orphaned old namespace (no remaining files use it)
+ * 2. If the file content references any type names that moved to a new namespace —
+ *    only then adds a using directive for the new namespace.
  */
 export async function updateUsingDirectivesForNamespaceChanges(
 	csFiles: vscode.Uri[],
@@ -120,7 +130,6 @@ export async function updateUsingDirectivesForNamespaceChanges(
 		}
 	}
 
-	// If no types were tracked, fall back to using-directive-only matching
 	const hasTypeTracking = allChangedTypeNames.size > 0;
 
 	// Pre-scan all files to determine which old namespaces now have zero remaining files
@@ -163,20 +172,15 @@ export async function updateUsingDirectivesForNamespaceChanges(
 			// Track which old using directives need to be removed
 			const oldNamespacesToRemove = new Set<string>();
 
-			// Check 1: using directive matching - if file has using OldNs, remove it and add using NewNs
-			// NOTE: Old using is only removed if the old namespace is now orphaned (no files left in solution)
+			// Check 1: remove stale using directives for orphaned old namespaces only
 			const usingNamespaces = extractUsingDirectives(content);
 			for (const usingNs of usingNamespaces) {
-				const newNamespace = namespaceChangeMap.get(usingNs);
-				if (newNamespace) {
-					namespacesToAdd.add(newNamespace);
-					if (orphanedOldNamespaces.has(usingNs)) {
-						oldNamespacesToRemove.add(usingNs);
-					}
+				if (namespaceChangeMap.has(usingNs) && orphanedOldNamespaces.has(usingNs)) {
+					oldNamespacesToRemove.add(usingNs);
 				}
 			}
 
-			// Check 2: type reference scanning - if file references types that moved, add using
+			// Check 2: add using only when the file references a type that moved to a new namespace
 			if (hasTypeTracking) {
 				const referencedTypes = findTypeReferencesInContent(content, allChangedTypeNames);
 				for (const typeName of referencedTypes) {

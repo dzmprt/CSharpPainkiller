@@ -1,13 +1,14 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { extractFileNamespace } from '../utils/contentParser.js';
+import { coerceTypeName } from '../utils/sharedUtilities.js';
 import { findTypeInWorkspace } from '../utils/typeSearch.js';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
-interface FieldInfo {
+export interface FieldInfo {
 	name: string;
 	typeName: string;
 }
@@ -258,7 +259,7 @@ function buildConversion(expr: string, srcType: string, tgtType: string): string
  * newlines are preserved). This ensures that char-offset → line/col conversions
  * via vscode.TextDocument.positionAt() remain valid.
  */
-function stripComments(content: string): string {
+export function stripComments(content: string): string {
 	let result = '';
 	let i = 0;
 	const len = content.length;
@@ -430,7 +431,7 @@ function buildAssignmentLines(
 	return lines;
 }
 
-function buildMapToMethod(
+export function buildMapToMethod(
 	sourceTypeName: string,
 	targetTypeName: string,
 	sourceFields: FieldInfo[],
@@ -439,9 +440,10 @@ function buildMapToMethod(
 ): string {
 	const i1 = '    ';
 	const i2 = '        ';
+	const methodName = `MapTo${targetTypeName}`;
 	const assignments = buildAssignmentLines(sourceFields, targetFields, 'source.', i2);
 	return [
-		`${i1}public ${targetTypeName} MapTo(${sourceTypeName} source)`,
+		`${i1}public static ${targetTypeName} ${methodName}(${sourceTypeName} source)`,
 		`${i1}{`,
 		`${i2}return new ${targetTypeName}`,
 		`${i2}{`,
@@ -451,7 +453,7 @@ function buildMapToMethod(
 	].join(eol);
 }
 
-function buildMapFromMethod(
+export function buildMapFromMethod(
 	sourceTypeName: string,
 	targetTypeName: string,
 	sourceFields: FieldInfo[],
@@ -460,12 +462,38 @@ function buildMapFromMethod(
 ): string {
 	const i1 = '    ';
 	const i2 = '        ';
+	const methodName = `MapFrom${targetTypeName}`;
 	// MapFrom builds sourceType from targetType — target fields are the inputs
 	const assignments = buildAssignmentLines(targetFields, sourceFields, 'source.', i2);
 	return [
-		`${i1}public static ${sourceTypeName} MapFrom(${targetTypeName} source)`,
+		`${i1}public static ${sourceTypeName} ${methodName}(${targetTypeName} source)`,
 		`${i1}{`,
 		`${i2}return new ${sourceTypeName}`,
+		`${i2}{`,
+		...assignments,
+		`${i2}};`,
+		`${i1}}`,
+	].join(eol);
+}
+
+/**
+ * Builds `MapFrom{SourceType}` inside a DTO that maps from the source entity.
+ */
+export function buildDtoMapFromMethod(
+	dtoTypeName: string,
+	sourceTypeName: string,
+	dtoFields: FieldInfo[],
+	sourceFields: FieldInfo[],
+	eol: string
+): string {
+	const i1 = '    ';
+	const i2 = '        ';
+	const methodName = `MapFrom${sourceTypeName}`;
+	const assignments = buildAssignmentLines(sourceFields, dtoFields, 'source.', i2);
+	return [
+		`${i1}public static ${dtoTypeName} ${methodName}(${sourceTypeName} source)`,
+		`${i1}{`,
+		`${i2}return new ${dtoTypeName}`,
 		`${i2}{`,
 		...assignments,
 		`${i2}};`,
@@ -488,12 +516,15 @@ interface MappingContext {
 	insertionPosition: vscode.Position;
 }
 
-async function resolveMappingContext(document: vscode.TextDocument): Promise<MappingContext | undefined> {
+async function resolveMappingContext(
+	document: vscode.TextDocument,
+	explicitSourceTypeName?: string
+): Promise<MappingContext | undefined> {
 	const content = document.getText();
 	const eol = content.includes('\r\n') ? '\r\n' : '\n';
 
 	// 1. Source type
-	const sourceTypeName = detectPrimaryTypeName(content);
+	const sourceTypeName = coerceTypeName(explicitSourceTypeName) ?? detectPrimaryTypeName(content);
 	if (!sourceTypeName) {
 		vscode.window.showErrorMessage('CSharp Painkiller: Cannot find a class, struct, or record in the current file.');
 		return undefined;
@@ -562,56 +593,62 @@ async function resolveMappingContext(document: vscode.TextDocument): Promise<Map
 // ---------------------------------------------------------------------------
 
 /**
- * Generates `public TargetType MapTo(SourceType source)` at the end of the
- * class body in the current document.
+ * Generates `public static TargetType MapToTargetType(SourceType source)` at the
+ * end of the class body in the current document.
  */
-export async function generateMapToForDocument(document: vscode.TextDocument): Promise<void> {
-	const ctx = await resolveMappingContext(document);
+export async function generateMapToForDocument(
+	document: vscode.TextDocument,
+	sourceTypeName?: string
+): Promise<void> {
+	const ctx = await resolveMappingContext(document, sourceTypeName);
 	if (!ctx) { return; }
 
-	const { sourceTypeName, targetTypeName, sourceFields, targetFields, targetNamespace, eol, insertionPosition } = ctx;
+	const { sourceTypeName: srcName, targetTypeName, sourceFields, targetFields, targetNamespace, eol, insertionPosition } = ctx;
 
 	// Duplicate check
-	const existingRe = new RegExp(`public\\s+${escapeRe(targetTypeName)}\\s+MapTo\\s*\\(`, 'm');
+	const existingRe = new RegExp(`\\bMapTo${escapeRe(targetTypeName)}\\s*\\(`, 'm');
 	if (existingRe.test(document.getText())) {
 		vscode.window.showWarningMessage(
-			`CSharp Painkiller: MapTo(${targetTypeName}) already exists in ${sourceTypeName}.`
+			`CSharp Painkiller: MapTo${targetTypeName} already exists in ${srcName}.`
 		);
 		return;
 	}
 
-	const methodText = buildMapToMethod(sourceTypeName, targetTypeName, sourceFields, targetFields, eol);
+	const methodText = buildMapToMethod(srcName, targetTypeName, sourceFields, targetFields, eol);
 	await applyMethodInsert(document, insertionPosition, methodText, targetNamespace, eol);
 
 	vscode.window.showInformationMessage(
-		`CSharp Painkiller: Generated MapTo(${targetTypeName}) in ${sourceTypeName}.`
+		`CSharp Painkiller: Generated MapTo${targetTypeName} in ${srcName}.`
 	);
 }
 
 /**
- * Generates `public static SourceType MapFrom(TargetType source)` at the end
- * of the class body in the current document.
+ * Generates `public static SourceType MapFromTargetType(TargetType source)` at the
+ * end of the class body in the current document.
  */
-export async function generateMapFromForDocument(document: vscode.TextDocument): Promise<void> {
-	const ctx = await resolveMappingContext(document);
+export async function generateMapFromForDocument(
+	document: vscode.TextDocument,
+	sourceTypeName?: string
+): Promise<void> {
+	const ctx = await resolveMappingContext(document, sourceTypeName);
 	if (!ctx) { return; }
 
-	const { sourceTypeName, targetTypeName, sourceFields, targetFields, targetNamespace, eol, insertionPosition } = ctx;
+	const { sourceTypeName: srcName, targetTypeName, sourceFields, targetFields, targetNamespace, eol, insertionPosition } = ctx;
 
 	// Duplicate check
-	const existingRe = new RegExp(`public\\s+static\\s+${escapeRe(sourceTypeName)}\\s+MapFrom\\s*\\(`, 'm');
+	const existingRe = new RegExp(`\\bMapFrom${escapeRe(targetTypeName)}\\s*\\(`, 'm');
 	if (existingRe.test(document.getText())) {
 		vscode.window.showWarningMessage(
-			`CSharp Painkiller: MapFrom(${targetTypeName}) already exists in ${sourceTypeName}.`
+			`CSharp Painkiller: MapFrom${targetTypeName} already exists in ${srcName}.`
 		);
 		return;
 	}
 
-	const methodText = buildMapFromMethod(sourceTypeName, targetTypeName, sourceFields, targetFields, eol);
+	const methodText = buildMapFromMethod(srcName, targetTypeName, sourceFields, targetFields, eol);
 	await applyMethodInsert(document, insertionPosition, methodText, targetNamespace, eol);
 
 	vscode.window.showInformationMessage(
-		`CSharp Painkiller: Generated MapFrom(${targetTypeName}) in ${sourceTypeName}.`
+		`CSharp Painkiller: Generated MapFrom${targetTypeName} in ${srcName}.`
 	);
 }
 
@@ -669,7 +706,7 @@ function escapeRe(s: string): string {
 	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function detectPrimaryTypeName(content: string): string | undefined {
+export function detectPrimaryTypeName(content: string): string | undefined {
 	const stripped = stripComments(content);
 	const publicMatch = stripped.match(
 		/\bpublic\s+(?:(?:static|sealed|abstract|partial|readonly)\s+)*(?:class|struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)/
@@ -678,7 +715,7 @@ function detectPrimaryTypeName(content: string): string | undefined {
 	return stripped.match(/\b(?:class|struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)/)?.[1];
 }
 
-function parseTypeFields(content: string, typeName: string): FieldInfo[] {
+export function parseTypeFields(content: string, typeName: string): FieldInfo[] {
 	const body = extractTypeBody(content, typeName);
 	if (body === undefined) { return []; }
 	return extractFields(body, content, typeName);
@@ -748,22 +785,27 @@ export function getTypeNameAtPosition(
 	const content  = document.getText();
 	const stripped = stripComments(content);
 
-	const re = /\b(?:class|struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
-	let match: RegExpExecArray | null;
+	const patterns = [
+		/\brecord\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)/g,
+		/\b(?:class|struct|record|enum|interface)\s+([A-Za-z_][A-Za-z0-9_]*)/g,
+	];
 
-	while ((match = re.exec(stripped)) !== null) {
-		const nameStart = match.index + match[0].indexOf(match[1]);
-		const nameEnd   = nameStart + match[1].length;
+	for (const re of patterns) {
+		let match: RegExpExecArray | null;
+		while ((match = re.exec(stripped)) !== null) {
+			const nameStart = match.index + match[0].indexOf(match[1]);
+			const nameEnd   = nameStart + match[1].length;
 
-		const startPos = document.positionAt(nameStart);
-		const endPos   = document.positionAt(nameEnd);
+			const startPos = document.positionAt(nameStart);
+			const endPos   = document.positionAt(nameEnd);
 
-		if (
-			position.line >= startPos.line && position.line <= endPos.line &&
-			(position.line !== startPos.line || position.character >= startPos.character) &&
-			(position.line !== endPos.line   || position.character <= endPos.character)
-		) {
-			return match[1];
+			if (
+				position.line >= startPos.line && position.line <= endPos.line &&
+				(position.line !== startPos.line || position.character >= startPos.character) &&
+				(position.line !== endPos.line   || position.character <= endPos.character)
+			) {
+				return match[1];
+			}
 		}
 	}
 

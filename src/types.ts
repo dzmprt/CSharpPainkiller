@@ -167,7 +167,7 @@ export interface CqrsTemplateConfig {
 	generateHandler: (
 		handlerName: string,
 		requestType: { name: string; namespace: string; fileUri: vscode.Uri },
-		returnType: string,
+		returnType: string | null,
 		namespace: string,
 		returnedType?: { name: string; namespace: string; fileUri: vscode.Uri }
 	) => string;

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { collectCsFiles } from '../utils/fileUtils.js';
+import { collectTopLevelUsingBlock } from '../utils/usingBlock.js';
 
 /**
  * Extracts the last segment of a namespace for simple symbol matching.
@@ -23,26 +24,12 @@ function lastSegment(ns: string): string {
  * directives that are actually needed.
  */
 export function removeUnusedUsingsFromContent(content: string): string | undefined {
-	const usingRegex = /^using\s+([\w.]+)\s*;[ \t]*(\/\/[^\n]*)?(\r?\n|$)/gm;
-
-	const usingEntries: { full: string; ns: string; start: number; end: number }[] = [];
-	let match: RegExpExecArray | null;
-	while ((match = usingRegex.exec(content)) !== null) {
-		usingEntries.push({
-			full: match[0],
-			ns: match[1],
-			start: match.index,
-			end: match.index + match[0].length,
-		});
-	}
-
-	if (usingEntries.length === 0) {
+	const usingBlock = collectTopLevelUsingBlock(content);
+	if (!usingBlock) {
 		return undefined;
 	}
 
-	// Build the "body" — everything after the using block
-	const bodyStart = usingEntries[usingEntries.length - 1].end;
-	let body = content.slice(bodyStart);
+	let body = content.slice(usingBlock.end);
 
 	// Strip single-line and multi-line string literals to avoid false positives
 	// (e.g. "System.IO" in a string)
@@ -54,22 +41,21 @@ export function removeUnusedUsingsFromContent(content: string): string | undefin
 
 	const toRemove = new Set<number>();
 
-	for (let i = 0; i < usingEntries.length; i++) {
-		const { ns } = usingEntries[i];
-
-		// Always keep "using static" and aliases (they are not matched by the regex above,
-		// but add a safety guard)
-		if (ns === '') { continue; }
+	for (let i = 0; i < usingBlock.directives.length; i++) {
+		const usingDirective = usingBlock.directives[i];
+		if (usingDirective.isGlobal || usingDirective.kind !== 'namespace') {
+			continue;
+		}
 
 		// Check full namespace usage (e.g. "System.IO.File" written explicitly)
-		const fullNsEscaped = ns.replace(/\./g, '\\.');
+		const fullNsEscaped = usingDirective.namespace.replace(/\./g, '\\.');
 		if (new RegExp(`\\b${fullNsEscaped}\\b`).test(body)) {
 			continue; // referenced explicitly, keep it
 		}
 
 		// Check segments: last segment and second-to-last segment
-		const segments = ns.split('.');
-		const last = segments[segments.length - 1];
+		const segments = usingDirective.namespace.split('.');
+		const last = lastSegment(usingDirective.namespace);
 		const secondLast = segments.length >= 2 ? segments[segments.length - 2] : null;
 
 		const lastUsed = new RegExp(`\\b${last}\\b`).test(body);
@@ -85,19 +71,15 @@ export function removeUnusedUsingsFromContent(content: string): string | undefin
 	}
 
 	// Reconstruct content without the removed using lines
-	const eol = content.includes('\r\n') ? '\r\n' : '\n';
-	const keptUsings = usingEntries
+	const keptUsings = usingBlock.directives
 		.filter((_, i) => !toRemove.has(i))
-		.map(u => u.full.replace(/\r?\n$/, ''));
+		.map(u => u.fullText);
 
 	const keptBlock = keptUsings.length > 0
-		? keptUsings.join(eol) + eol
+		? keptUsings.join(usingBlock.eol) + usingBlock.eol
 		: '';
 
-	const regionStart = usingEntries[0].start;
-	const regionEnd = usingEntries[usingEntries.length - 1].end;
-
-	return content.slice(0, regionStart) + keptBlock + content.slice(regionEnd);
+	return content.slice(0, usingBlock.start) + keptBlock + content.slice(usingBlock.end);
 }
 
 /**
@@ -173,6 +155,3 @@ export async function removeUnusedUsingsInFolder(folderUri: vscode.Uri): Promise
 		vscode.window.showInformationMessage('No unused using directives found.');
 	}
 }
-
-// Re-export lastSegment for potential future use
-export { lastSegment };

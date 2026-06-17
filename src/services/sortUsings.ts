@@ -1,13 +1,34 @@
 import * as vscode from 'vscode';
 import { collectCsFiles } from '../utils/fileUtils.js';
+import { type TopLevelUsingDirective, collectTopLevelUsingBlock } from '../utils/usingBlock.js';
 
 /**
  * Groups for sorting using directives.
  * Order: System.* → everything else (alphabetically)
  */
-function getUsingGroup(ns: string): number {
-	if (ns.startsWith('System')) { return 0; }
-	return 1;
+function getUsingGroup(usingDirective: TopLevelUsingDirective): number {
+	if (usingDirective.isGlobal) {
+		return 0;
+	}
+	if (usingDirective.kind === 'namespace' && usingDirective.namespace.startsWith('System')) {
+		return 1;
+	}
+	if (usingDirective.kind === 'namespace') {
+		return 2;
+	}
+	if (usingDirective.kind === 'static') {
+		return 3;
+	}
+	return 4;
+}
+
+function getDeduplicationKey(usingDirective: TopLevelUsingDirective): string {
+	return [
+		usingDirective.isGlobal ? 'global' : 'local',
+		usingDirective.kind,
+		usingDirective.alias ?? '',
+		usingDirective.namespace,
+	].join(':');
 }
 
 /**
@@ -15,68 +36,40 @@ function getUsingGroup(ns: string): number {
  * Returns the updated content, or undefined if no changes were made.
  */
 export function sortUsingsInContent(content: string): string | undefined {
-	// Match the contiguous block(s) of using directives at the top of the file
-	// (may be separated only by blank lines or single-line comments)
-	const usingLineRegex = /^(using\s+[\w.]+\s*;[ \t]*(\/\/[^\n]*)?)(\r?\n|$)/gm;
-
-	// Collect all using lines and their positions
-	const usingLines: { line: string; ns: string; start: number; end: number }[] = [];
-
-	let match: RegExpExecArray | null;
-	while ((match = usingLineRegex.exec(content)) !== null) {
-		const nsMatch = match[0].match(/^using\s+([\w.]+)\s*;/);
-		if (nsMatch) {
-			usingLines.push({
-				line: match[0].replace(/\r?\n$/, ''),
-				ns: nsMatch[1],
-				start: match.index,
-				end: match.index + match[0].length,
-			});
-		}
-	}
-
-	if (usingLines.length === 0) {
+	const usingBlock = collectTopLevelUsingBlock(content);
+	if (!usingBlock) {
 		return undefined;
 	}
 
-	// Detect the region from the first using to the last using
-	const regionStart = usingLines[0].start;
-	const regionEnd = usingLines[usingLines.length - 1].end;
-	const eol = content.includes('\r\n') ? '\r\n' : '\n';
-
-	// Deduplicate by namespace name
 	const seen = new Set<string>();
-	const unique = usingLines.filter(u => {
-		if (seen.has(u.ns)) { return false; }
-		seen.add(u.ns);
+	const unique = usingBlock.directives.filter(u => {
+		const key = getDeduplicationKey(u);
+		if (seen.has(key)) {
+			return false;
+		}
+		seen.add(key);
 		return true;
 	});
 
-	if (unique.length === usingLines.length) {
-		// Check if already sorted
-		const sortedCopy = [...unique].sort((a, b) => {
-			const ga = getUsingGroup(a.ns);
-			const gb = getUsingGroup(b.ns);
-			if (ga !== gb) { return ga - gb; }
-			return a.ns.localeCompare(b.ns);
-		});
-		const alreadySorted = sortedCopy.every((u, i) => u.ns === unique[i].ns);
-		if (alreadySorted) {
-			return undefined; // nothing to do
+	const sorted = [...unique].sort((a, b) => {
+		const groupDiff = getUsingGroup(a) - getUsingGroup(b);
+		if (groupDiff !== 0) {
+			return groupDiff;
 		}
-	}
-
-	// Sort
-	unique.sort((a, b) => {
-		const ga = getUsingGroup(a.ns);
-		const gb = getUsingGroup(b.ns);
-		if (ga !== gb) { return ga - gb; }
-		return a.ns.localeCompare(b.ns);
+		const namespaceDiff = a.namespace.localeCompare(b.namespace);
+		if (namespaceDiff !== 0) {
+			return namespaceDiff;
+		}
+		return (a.alias ?? '').localeCompare(b.alias ?? '');
 	});
 
-	const sortedBlock = unique.map(u => u.line).join(eol) + eol;
+	const sortedBlock = sorted.map(u => u.fullText).join(usingBlock.eol) + usingBlock.eol;
+	const originalBlock = content.slice(usingBlock.start, usingBlock.end);
+	if (sortedBlock === originalBlock) {
+		return undefined;
+	}
 
-	return content.slice(0, regionStart) + sortedBlock + content.slice(regionEnd);
+	return content.slice(0, usingBlock.start) + sortedBlock + content.slice(usingBlock.end);
 }
 
 /**

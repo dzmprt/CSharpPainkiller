@@ -9,7 +9,11 @@ import { uriIsDirectory, uriIsFile } from './utils/fileUtils.js';
 import { detectMediatorFile } from './utils/contentParser.js';
 import { MapToCodeActionProvider } from './codeActions/mapToCodeActionProvider.js';
 import { GoToHandlerCodeActionProvider } from './codeActions/goToHandlerCodeActionProvider.js';
+import { ExtractTypeCodeActionProvider } from './codeActions/extractTypeCodeActionProvider.js';
+import { extractTypeToFile } from './services/extractTypeToFile.js';
 import { generateMapToForDocument, generateMapFromForDocument } from './services/generateMapTo.js';
+import { generateDtoForDocument } from './services/generateDto.js';
+import { generateFluentValidatorForDocument } from './services/generateFluentValidator.js';
 import {
 	createEmptyController,
 	createEfCrudController,
@@ -43,11 +47,12 @@ import {
 	efCoreScriptMigration,
 	efCoreRemoveMigration,
 } from './services/efCoreCommands.js';
-import { validateUri as validateSharedUri } from './utils/sharedUtilities.js';
+import { validateUri as validateSharedUri, resolveCommandFileContext } from './utils/sharedUtilities.js';
 
 import { CsprojCache } from './utils/csprojCache.js';
 import { fetchDotnetTemplates, registerDynamicTemplateCommands } from './services/dotnetTemplates.js';
 import { CsprojFolderDecorationProvider } from './decoration/csprojFolderDecorationProvider.js';
+import { ParserCache } from './codeActions/parserCache.js';
 
 /**
  * List of all "Create" commands for C# types.
@@ -106,16 +111,37 @@ export async function activate(context: vscode.ExtensionContext) {
 	);
 	context.subscriptions.push(goToHandlerCodeActionProvider);
 
+	const extractTypeCodeActionProvider = vscode.languages.registerCodeActionsProvider(
+		{ language: 'csharp', scheme: 'file' },
+		new ExtractTypeCodeActionProvider(),
+		{ providedCodeActionKinds: ExtractTypeCodeActionProvider.providedCodeActionKinds }
+	);
+	context.subscriptions.push(extractTypeCodeActionProvider);
+
+	const parserCache = ParserCache.getInstance();
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeTextDocument(event => {
+			if (event.document.languageId === 'csharp') {
+				parserCache.clearAllCaches(event.document);
+			}
+		}),
+		vscode.workspace.onDidCloseTextDocument(document => {
+			if (document.languageId === 'csharp') {
+				parserCache.clearAllCaches(document);
+			}
+		})
+	);
+
 	// Register MapTo command
 	const generateMapToDisposable = vscode.commands.registerCommand(
 		'csharppainkiller.generateMapTo',
-		async (document?: vscode.TextDocument) => {
-			const doc = document ?? vscode.window.activeTextEditor?.document;
-			if (!doc || !doc.uri.path.endsWith('.cs')) {
+		async (...args: unknown[]) => {
+			const ctx = await resolveCommandFileContext(...args);
+			if (!ctx) {
 				vscode.window.showErrorMessage('CSharp Painkiller: Open a .cs file to generate a MapTo method.');
 				return;
 			}
-			await generateMapToForDocument(doc);
+			await generateMapToForDocument(ctx.document, ctx.typeName);
 		}
 	);
 	context.subscriptions.push(generateMapToDisposable);
@@ -123,16 +149,60 @@ export async function activate(context: vscode.ExtensionContext) {
 	// Register MapFrom command
 	const generateMapFromDisposable = vscode.commands.registerCommand(
 		'csharppainkiller.generateMapFrom',
-		async (document?: vscode.TextDocument) => {
-			const doc = document ?? vscode.window.activeTextEditor?.document;
-			if (!doc || !doc.uri.path.endsWith('.cs')) {
+		async (...args: unknown[]) => {
+			const ctx = await resolveCommandFileContext(...args);
+			if (!ctx) {
 				vscode.window.showErrorMessage('CSharp Painkiller: Open a .cs file to generate a MapFrom method.');
 				return;
 			}
-			await generateMapFromForDocument(doc);
+			await generateMapFromForDocument(ctx.document, ctx.typeName);
 		}
 	);
 	context.subscriptions.push(generateMapFromDisposable);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.extractTypeToFile',
+			async (...args: unknown[]) => {
+				const ctx = await resolveCommandFileContext(...args);
+				if (!ctx?.typeName) {
+					vscode.window.showErrorMessage('CSharp Painkiller: Place the cursor on a type name to extract it to a file.');
+					return;
+				}
+				await extractTypeToFile(ctx.document, ctx.typeName);
+			}
+		)
+	);
+
+	// Register Generate DTO command
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.generateDto',
+			async (...args: unknown[]) => {
+				const ctx = await resolveCommandFileContext(...args);
+				if (!ctx) {
+					vscode.window.showErrorMessage('CSharp Painkiller: Open a .cs file to generate a DTO.');
+					return;
+				}
+				await generateDtoForDocument(ctx.document, ctx.typeName);
+			}
+		)
+	);
+
+	// Register FluentValidation validator command
+	context.subscriptions.push(
+		vscode.commands.registerCommand(
+			'csharppainkiller.generateFluentValidator',
+			async (...args: unknown[]) => {
+				const ctx = await resolveCommandFileContext(...args);
+				if (!ctx) {
+					vscode.window.showErrorMessage('CSharp Painkiller: Open a .cs file to generate a validator.');
+					return;
+				}
+				await generateFluentValidatorForDocument(ctx.document, ctx.typeName);
+			}
+		)
+	);
 
 
 	// -------------------------------------------------------------------------

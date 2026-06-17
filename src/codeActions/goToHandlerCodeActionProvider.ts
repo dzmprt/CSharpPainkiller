@@ -21,14 +21,16 @@ export class GoToHandlerCodeActionProvider implements vscode.CodeActionProvider 
 			return [];
 		}
 
-		// Use cached mediator detection instead of scanning full content every time
-		if (!GoToHandlerCodeActionProvider.parserCache.isMediatorFile(document)) {
+		// Use cached mediator detection instead of scanning full content every time.
+		const mediatorInfo = GoToHandlerCodeActionProvider.parserCache.getMediatorFileInfo(document);
+		if (!mediatorInfo) {
 			return [];
 		}
 
-		// Use cached type name extraction at the cursor position
+		// Offer the action only on the request/notification type, not every identifier.
 		const position = range instanceof vscode.Selection ? range.active : range.start;
-		if (!GoToHandlerCodeActionProvider.parserCache.getTypeNameAt(document, position.line, position.character)) {
+		const typeName = GoToHandlerCodeActionProvider.parserCache.getTypeNameAt(document, position.line, position.character);
+		if (typeName !== mediatorInfo.className) {
 			return [];
 		}
 

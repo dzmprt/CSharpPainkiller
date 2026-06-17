@@ -9,7 +9,7 @@ const typeTemplates: Record<CType, TemplateParts> = {
 	record: { prefix: 'public record', suffix: ';' },
 	struct: { prefix: 'public struct', suffix: '\n{\n}' },
 	enum: { prefix: 'public enum', suffix: '\n{\n}' },
-	interface: { prefix: 'public interface ', suffix: '\n{\n}' },
+	interface: { prefix: 'public interface', suffix: '\n{\n}' },
 	'record struct': { prefix: 'public readonly record struct', suffix: ';' },
 };
 

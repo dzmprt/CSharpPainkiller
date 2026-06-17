@@ -55,6 +55,71 @@ export function extractUsingDirectives(content: string): string[] {
 	return namespaces;
 }
 
+const TYPE_EXTRACTION_PATTERNS: { type: CType; regex: RegExp }[] = [
+	{ type: 'record struct', regex: /\b(?:public|internal)\s+(?:[\w\s]*?)record\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+	{ type: 'record', regex: /\b(?:public|internal)\s+(?:[\w\s]*?)record\s+(?!struct\b)([A-Za-z_][A-Za-z0-9_]*)/g },
+	{ type: 'class', regex: /\b(?:public|internal)\s+(?:[\w\s]*?)class\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+	{ type: 'struct', regex: /\b(?:public|internal)\s+(?:[\w\s]*?)struct\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+	{ type: 'enum', regex: /\b(?:public|internal)\s+(?:[\w\s]*?)enum\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+	{ type: 'interface', regex: /\b(?:public|internal)\s+(?:[\w\s]*?)interface\s+([A-Za-z_][A-Za-z0-9_]*)/g },
+];
+
+function findMatchingBrace(content: string, openPos: number): number {
+	let depth = 0;
+	for (let i = openPos; i < content.length; i++) {
+		if (content[i] === '{') {
+			depth++;
+		} else if (content[i] === '}') {
+			depth--;
+			if (depth === 0) {
+				return i;
+			}
+		}
+	}
+	return -1;
+}
+
+function collectTypesFromBody(body: string, namespace: string): TypeDefinition[] {
+	const types: TypeDefinition[] = [];
+	const seen = new Set<string>();
+
+	for (const { type, regex } of TYPE_EXTRACTION_PATTERNS) {
+		regex.lastIndex = 0;
+		let match: RegExpExecArray | null;
+		while ((match = regex.exec(body)) !== null) {
+			const name = match[1];
+			if (seen.has(name)) {
+				continue;
+			}
+			seen.add(name);
+			types.push({ name, type, namespace });
+		}
+	}
+
+	return types;
+}
+
+function extractBlockNamespaceBodies(content: string): { ns: string; body: string }[] {
+	const results: { ns: string; body: string }[] = [];
+	const nsStartRegex = /namespace\s+([\w.]+)\s*\{/g;
+	let match: RegExpExecArray | null;
+
+	while ((match = nsStartRegex.exec(content)) !== null) {
+		const openBrace = match.index + match[0].length - 1;
+		const closeBrace = findMatchingBrace(content, openBrace);
+		if (closeBrace === -1) {
+			continue;
+		}
+		results.push({
+			ns: match[1],
+			body: content.slice(openBrace + 1, closeBrace),
+		});
+		nsStartRegex.lastIndex = closeBrace + 1;
+	}
+
+	return results;
+}
+
 /**
  * Extracts type definitions from file content along with the namespace.
  * Used internally for analyzing partial types and file structure.
@@ -73,36 +138,10 @@ export function extractTypesFromContent(content: string): TypeExtractionResult {
 	// First, try file-scoped namespace pattern: namespace X; followed by types
 	const fileScopedMatch = normalised.match(/^namespace\s+([\w.]+)\s*;/m);
 	if (fileScopedMatch) {
-		// File-scoped namespace - extract types that follow
-		const typeRegex = /(?<![a-zA-Z_])(public|internal)?\s*(readonly\s+record\s+struct\s+)?(class|record|struct|enum|interface)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
-		let match;
-		while ((match = typeRegex.exec(normalised)) !== null) {
-			const isRecordStruct = match[2] !== undefined;
-			if (isRecordStruct) {
-				types.push({ name: match[4], type: 'record struct', namespace: fileScopedMatch[1] });
-			} else {
-				types.push({ name: match[4], type: match[3] as CType, namespace: fileScopedMatch[1] });
-			}
-		}
+		types.push(...collectTypesFromBody(normalised, fileScopedMatch[1]));
 	} else {
-		// Block-scoped namespace - extract types within each namespace block
-		const namespaceBlockRegex = /namespace\s+([\w.]+)\s*\{([^}]*(?:\{[^}]*\}[^}]*)*)\}/g;
-		let nsMatch;
-		while ((nsMatch = namespaceBlockRegex.exec(normalised)) !== null) {
-			const ns = nsMatch[1];
-			const body = nsMatch[2];
-
-			// Find types within this namespace block
-			const typeRegex = /(?<![a-zA-Z_])(public|internal)?\s*(readonly\s+record\s+struct\s+)?(class|record|struct|enum|interface)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
-			let typeMatch;
-			while ((typeMatch = typeRegex.exec(body)) !== null) {
-				const isRecordStruct = typeMatch[2] !== undefined;
-				if (isRecordStruct) {
-					types.push({ name: typeMatch[4], type: 'record struct', namespace: ns });
-				} else {
-					types.push({ name: typeMatch[4], type: typeMatch[3] as CType, namespace: ns });
-				}
-			}
+		for (const { ns, body } of extractBlockNamespaceBodies(normalised)) {
+			types.push(...collectTypesFromBody(body, ns));
 		}
 	}
 
@@ -138,16 +177,11 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 		}
 
 		// Match other public types (class, record, struct, enum, interface)
-		if (matches.length === 0) {
-			const typeRegex = new RegExp(
-				`public\\s+${EXTRA_MODS}(?:(?:readonly\\s+)?record\\s+struct|(class|record|struct|enum|interface))\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
-			);
-			while ((match = typeRegex.exec(content)) !== null) {
-				// match[1] is the simple keyword (undefined when "record struct" matched)
-				if (match[1] !== undefined) {
-					matches.push({ name: match[2], type: match[1] as CType });
-				}
-			}
+		const typeRegex = new RegExp(
+			`public\\s+${EXTRA_MODS}(?:(class|record(?!\\s+struct\\b)|struct|enum|interface))\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+		);
+		while ((match = typeRegex.exec(content)) !== null) {
+			matches.push({ name: match[2], type: match[1] as CType });
 		}
 	} else {
 		// Search for internal types (explicit "internal" keyword)
@@ -287,6 +321,37 @@ export function hasPartialTypes(content: string): boolean {
  */
 export function escapeRegExp(str: string): string {
 	return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Extracts the type argument from a generic interface such as IRequest<T>.
+ * Handles nested generics, e.g. IRequest<List<Author>> → List<Author>.
+ */
+export function extractGenericInterfaceArgument(content: string, interfaceName: string): string | undefined {
+	const pattern = new RegExp(`\\b${escapeRegExp(interfaceName)}\\s*<`);
+	const match = pattern.exec(content);
+	if (!match) {
+		return undefined;
+	}
+
+	const start = match.index + match[0].length;
+	let depth = 1;
+	let i = start;
+	while (i < content.length && depth > 0) {
+		const ch = content[i];
+		if (ch === '<') {
+			depth++;
+		} else if (ch === '>') {
+			depth--;
+		}
+		i++;
+	}
+
+	if (depth !== 0) {
+		return undefined;
+	}
+
+	return content.slice(start, i - 1).trim();
 }
 
 // ============================================================================
@@ -611,9 +676,8 @@ export function detectMediatorFile(content: string): MediatorFileInfo | null {
 	}
 
 	// IRequest<T>
-	const requestGenericMatch = content.match(/\bIRequest<([^>]+)>/);
-	if (requestGenericMatch) {
-		const rt = requestGenericMatch[1].trim();
+	const rt = extractGenericInterfaceArgument(content, 'IRequest');
+	if (rt !== undefined) {
 		// Unit means void
 		const returnType = (rt === 'Unit') ? null : rt;
 		return { className, kind: 'request', library, returnType };

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { detectMediatorFile } from '../utils/contentParser.js';
+import { detectMediatorFile, type MediatorFileInfo } from '../utils/contentParser.js';
 
 /**
  * Cache for code actions parsing results.
@@ -10,7 +10,7 @@ export class ParserCache {
 	private static instance: ParserCache | null = null;
 
 	/** Cache mediator detection results per document. */
-	private mediatorCache = new WeakMap<vscode.TextDocument, boolean>();
+	private mediatorCache = new WeakMap<vscode.TextDocument, MediatorFileInfo | null>();
 
 	/** Tracks the number of entries in mediatorCache (WeakMap has no size). */
 	private mediatorCacheKeyList: vscode.TextDocument[] = [];
@@ -32,7 +32,7 @@ export class ParserCache {
 	/**
 	 * Check if file contains mediator types, using cached result.
 	 */
-	isMediatorFile(document: vscode.TextDocument): boolean {
+	getMediatorFileInfo(document: vscode.TextDocument): MediatorFileInfo | null {
 		const cached = this.mediatorCache.get(document);
 
 		if (cached !== undefined) {
@@ -40,7 +40,7 @@ export class ParserCache {
 		}
 
 		const content = document.getText();
-		const result = detectMediatorFile(content) !== null;
+		const result = detectMediatorFile(content);
 
 		if (!this.mediatorCache.has(document)) {
 			this.mediatorCacheKeyList.push(document);
@@ -48,6 +48,13 @@ export class ParserCache {
 		this.mediatorCache.set(document, result);
 
 		return result;
+	}
+
+	/**
+	 * Check if file contains mediator types, using cached result.
+	 */
+	isMediatorFile(document: vscode.TextDocument): boolean {
+		return this.getMediatorFileInfo(document) !== null;
 	}
 
 	/** Clear mediator cache for a document (e.g., on save). */
@@ -73,9 +80,6 @@ export class ParserCache {
 			typeMap = new Map<number, string | null>();
 			this.typeNameCache.set(document, typeMap);
 		}
-
-		// eslint-disable-next-line no-param-reassign
-		typeMap = this.typeNameCache.get(document)!;
 
 		// Limit cache size
 		if (typeMap.size >= ParserCache.MAX_TYPE_NAME_CACHE_SIZE) {
@@ -135,7 +139,7 @@ export class ParserCache {
 
 	/** Clear all caches globally. */
 	clearAll(): void {
-		this.mediatorCache = new WeakMap<vscode.TextDocument, boolean>();
+		this.mediatorCache = new WeakMap<vscode.TextDocument, MediatorFileInfo | null>();
 		this.mediatorCacheKeyList = [];
 		this.typeNameCache = new Map<vscode.TextDocument, Map<number, string | null>>();
 	}

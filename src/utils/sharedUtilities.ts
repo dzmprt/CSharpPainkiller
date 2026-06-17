@@ -104,13 +104,133 @@ export function validateUri(
 	return undefined;
 }
 
+function toFileUri(arg: object): vscode.Uri | undefined {
+	const u = arg as { scheme?: string; path?: string; fsPath?: string };
+	if (u.scheme !== 'file') {
+		return undefined;
+	}
+	if (u.fsPath) {
+		return vscode.Uri.file(u.fsPath);
+	}
+	if (u.path) {
+		return vscode.Uri.file(u.path);
+	}
+	return undefined;
+}
+
+/**
+ * Resolves a TextDocument from a VS Code command argument.
+ * Code actions must pass `document.uri` (not the TextDocument itself) because
+ * command arguments are JSON-serialized.
+ */
+export async function openDocumentFromCommandArg(
+	arg?: vscode.Uri | vscode.TextDocument | string
+): Promise<vscode.TextDocument | undefined> {
+	if (!arg) {
+		return vscode.window.activeTextEditor?.document;
+	}
+
+	if (typeof arg === 'string') {
+		return vscode.workspace.openTextDocument(vscode.Uri.parse(arg));
+	}
+
+	if ('lineCount' in arg && typeof arg.getText === 'function') {
+		return arg;
+	}
+
+	if (arg instanceof vscode.Uri) {
+		return vscode.workspace.openTextDocument(arg);
+	}
+
+	if (typeof arg === 'object') {
+		const fileUri = toFileUri(arg);
+		if (fileUri) {
+			return vscode.workspace.openTextDocument(fileUri);
+		}
+	}
+
+	return undefined;
+}
+
+/** Returns true when the value looks like a C# type identifier. */
+export function isValidTypeName(value: string): boolean {
+	return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
+}
+
+/** Coerces an unknown command argument to a type name, ignoring URIs and other values. */
+export function coerceTypeName(value: unknown): string | undefined {
+	return typeof value === 'string' && isValidTypeName(value) ? value : undefined;
+}
+
+function reviveFileUri(arg: unknown): vscode.Uri | undefined {
+	if (!arg || typeof arg !== 'object') {
+		return undefined;
+	}
+
+	if ('lineCount' in arg && typeof (arg as vscode.TextDocument).getText === 'function') {
+		return (arg as vscode.TextDocument).uri;
+	}
+
+	if (arg instanceof vscode.Uri) {
+		return arg;
+	}
+
+	return toFileUri(arg);
+}
+
+export interface CommandFileContext {
+	document: vscode.TextDocument;
+	typeName?: string;
+}
+
+/**
+ * Resolves the target .cs document and optional type name from command arguments.
+ * Handles explorer context menu (URI), code actions (URI + type name), and
+ * command palette (active editor).
+ */
+export async function resolveCommandFileContext(
+	...args: unknown[]
+): Promise<CommandFileContext | undefined> {
+	let fileUri: vscode.Uri | undefined;
+	let typeName: string | undefined;
+
+	for (const arg of args) {
+		const name = coerceTypeName(arg);
+		if (name) {
+			typeName = name;
+			continue;
+		}
+
+		const revived = reviveFileUri(arg);
+		if (revived) {
+			fileUri = revived;
+		}
+	}
+
+	if (fileUri) {
+		return {
+			document: await vscode.workspace.openTextDocument(fileUri),
+			typeName,
+		};
+	}
+
+	const editorDoc = vscode.window.activeTextEditor?.document;
+	if (editorDoc?.uri.path.endsWith('.cs')) {
+		return { document: editorDoc, typeName };
+	}
+
+	return undefined;
+}
+
 // ============================================================================
 // Shared string helpers
 // ============================================================================
 
 /** Capitalizes the first character of a string. */
 export function capitalize(s: string): string {
-	if (!s) return s;
+	if (!s) {
+		return s;
+	}
 	return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
@@ -163,7 +283,7 @@ export interface CqrsTemplateConfig {
 	generateHandler: (
 		handlerName: string,
 		requestType: { name: string; namespace: string; fileUri: vscode.Uri },
-		returnType: string,
+		returnType: string | null,
 		namespace: string,
 		returnedType?: { name: string; namespace: string; fileUri: vscode.Uri }
 	) => string;
@@ -266,7 +386,7 @@ export async function createCqrsRequestAndHandler(
 	const handlerName = createHandlerName(requestName);
 	const requestFoundType = { name: requestName, namespace, fileUri: vscode.Uri.joinPath(subfolderUri, `${requestName}.cs`) };
 
-	const rt = returnType ?? 'Unit';
+	const rt = returnType ?? (config.libraryName === 'MediatR' ? 'Unit' : null);
 	const handlerContent = config.generateHandler(handlerName, requestFoundType, rt, namespace, returnedType ?? undefined);
 	await writeAndOpen(subfolderUri, `${handlerName}.cs`, handlerContent);
 }

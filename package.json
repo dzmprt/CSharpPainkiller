@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -88,6 +88,18 @@
       {
         "command": "csharppainkiller.generateMapFrom",
         "title": "Generate MapFrom Method"
+      },
+      {
+        "command": "csharppainkiller.generateDto",
+        "title": "Generate DTO with MapFrom"
+      },
+      {
+        "command": "csharppainkiller.generateFluentValidator",
+        "title": "Generate FluentValidation Validator"
+      },
+      {
+        "command": "csharppainkiller.extractTypeToFile",
+        "title": "Extract Type to File"
       },
       {
         "command": "csharppainkiller.templates.aspnet.emptyController",
@@ -262,12 +274,12 @@
         },
         {
           "when": "!explorerResourceIsFolder && resourceExtname == .cs && csharppainkiller.isMediatorFile",
-          "command": "csharppainkiller.generateHandlerForFile",
+          "command": "csharppainkiller.goToHandlerForFile",
           "group": "2_csharp@3"
         },
         {
           "when": "!explorerResourceIsFolder && resourceExtname == .cs && csharppainkiller.isMediatorFile",
-          "command": "csharppainkiller.goToHandlerForFile",
+          "command": "csharppainkiller.generateHandlerForFile",
           "group": "2_csharp@4"
         },
         {
@@ -276,14 +288,24 @@
           "group": "2_csharp@5"
         },
         {
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs",
+          "command": "csharppainkiller.generateDto",
+          "group": "2_csharp@6"
+        },
+        {
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs",
+          "command": "csharppainkiller.generateFluentValidator",
+          "group": "2_csharp@7"
+        },
+        {
           "command": "csharppainkiller.dotnet.createProject",
           "when": "explorerResourceIsFolder",
-          "group": "2_csharp@6"
+          "group": "2_csharp@8"
         },
         {
           "when": "resourceExtname == .csproj",
           "submenu": "csharppainkiller.efcoreCmd",
-          "group": "2_csharp@7"
+          "group": "2_csharp@9"
         }
       ],
       "csharppainkiller.create": [
@@ -327,6 +349,7 @@
         },
         {
           "command": "csharppainkiller.extractInterface",
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs",
           "group": "1_refactor@4"
         }
       ],

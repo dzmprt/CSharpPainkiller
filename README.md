@@ -8,8 +8,6 @@ Smart file creation, code generation, project creation, namespace management and
 
 [VisualStudio Marketplace](https://marketplace.visualstudio.com/items?itemName=DzmitryPratsko.csharppainkiller)
 
-</div>
-
 ---
 
 ## Requirements
@@ -23,6 +21,9 @@ Smart file creation, code generation, project creation, namespace management and
   - [Adjust Namespaces](#adjust-namespaces)
   - [Rename File By Type](#rename-file-by-type)
   - [Generate Mapping Methods](#generate-mapping-methods)
+  - [Generate DTO](#generate-dto)
+  - [Generate FluentValidation Validator](#generate-fluentvalidation-validator)
+  - [Extract Type to File](#extract-type-to-file)
   - [Sort Usings](#sort-usings)
   - [Extract Interface](#extract-interface)
   - [.NET Project Creation](#net-project-creation)
@@ -57,9 +58,38 @@ Rename `.cs` files to match the C# type they contain. Right-click a file or fold
 
 ### Generate Mapping Methods
 
-Generate `MapTo` / `MapFrom` boilerplate for mapping between types. Available in the **C# Refactor** submenu.
+Generate static `MapTo{TargetType}` / `MapFrom{TargetType}` methods for mapping between types. Place the cursor on a type name and use the lightbulb (**Quick Fix** / **Refactor**) code actions:
+
+- **Generate MapTo method**
+- **Generate MapFrom method**
+
+The extension prompts for the target type, maps matching public properties, and inserts the method at the end of the source type.
 
 ![Generate Mapping demo](images/GenerateMappingDemo.gif)
+
+### Generate DTO
+
+Scaffold a DTO class with matching public properties and a static `MapFrom{SourceType}` factory method inside the DTO.
+
+- **Explorer** — right-click a `.cs` file → **Generate DTO with MapFrom**
+- **Editor** — place the cursor on a type name → lightbulb → **Generate DTO with MapFrom in DTO**
+
+The DTO file is created next to the source file. You can customize the DTO name in the input prompt.
+
+### Generate FluentValidation Validator
+
+Generate a FluentValidation `AbstractValidator<T>` for a class, record, or struct based on its public properties. Rules are inferred from property types (strings, numbers, dates, enums, collections, and more).
+
+- **Explorer** — right-click a `.cs` file → **Generate FluentValidation Validator**
+- **Editor** — place the cursor on a type name → lightbulb → **Generate FluentValidation validator**
+
+The validator file (`{TypeName}Validator.cs`) is created next to the source file.
+
+### Extract Type to File
+
+Move a type from a multi-type file into its own `{TypeName}.cs` file. Place the cursor on the type name and choose the lightbulb quick fix **Extract '{TypeName}' to file**.
+
+Supported types: class, struct, record, record struct, enum, and interface. Partial types cannot be extracted. The new file keeps relevant `using` directives, namespace, and XML documentation from the source file.
 
 ### Sort Usings
 
@@ -128,7 +158,12 @@ Run Entity Framework Core migration commands directly from the Explorer context 
 
 ### Go To Handler
 
-Navigate between a MediatR/MitMediator request file and its handler.
+Navigate between a MediatR/MitMediator request or notification file and its handler. Right-click a mediator `.cs` file in the Explorer:
+
+- **Go To Handler** — open the matching handler file
+- **Generate Handler** — create a handler if one does not exist yet
+
+Code actions in the editor offer the same navigation when the cursor is on a request or notification type.
 
 ![Go To Handler demo](images/goToHandler.gif)
 
@@ -141,6 +176,18 @@ The names of the folders containing project files are highlighted in purple.
 - If you find a bug please report it on [GitHub issues](https://github.com/dzmprt/CSharpPainkiller/issues)
 
 ## Release Notes
+
+### 0.0.4
+
+- Added **Generate DTO with MapFrom** — creates a DTO file with properties and a static `MapFrom{SourceType}` method
+- Added **Generate FluentValidation Validator** — scaffolds `AbstractValidator<T>` with type-aware rules
+- Added **Extract Type to File** — quick fix code action to move a type from a multi-type file into its own file
+- Improved **MapTo / MapFrom** generation — methods are now `static` with type-specific names (`MapToTarget`, `MapFromTarget`), code actions work on the type under the cursor
+- Fixed **Adjust Namespaces** — `using` directives are updated only when a file actually references moved types
+- Fixed **Extract Interface** menu — shown only for `.cs` files, not folders
+- Fixed **Go To Handler / Generate Handler** — nested generic return types (e.g. `IRequest<List<Author>>`) are parsed correctly
+- Fixed **MitMediator Handler** generation for void requests — `IRequestHandler<TRequest>` with `ValueTask<Unit> HandleAsync(...)`
+- Fixed type parsing for **Rename File By Type** — `record struct`, block-scoped namespaces with nested braces, and ambiguous multi-type files
 
 ### 0.0.3
 

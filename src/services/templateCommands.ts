@@ -35,6 +35,7 @@ import {
 	resolveTargetFolder as resolveTargetFolderShared,
 	capitalize,
 	isBuiltinType,
+	normalizeRequestName as normalizeSharedRequestName,
 	CqrsTemplateConfig,
 	createCqrsRequestAndHandler as createSharedCqrsRequestAndHandler,
 	createCqrsNotificationAndHandler as createSharedCqrsNotificationAndHandler,
@@ -104,36 +105,6 @@ async function resolveReturnType(returnTypeInput: string): Promise<{
 	return { returnType, innerTypeName, returnedType: foundType ?? null };
 }
 
-// ============================================================================
-// Shared request name finalization — uses constants.ts prefixes
-// ============================================================================
-
-function normalizeRequestName(name: string): string {
-	if (/(?:Request|Query|Command)$/i.test(name)) {
-		return name;
-	}
-
-	const firstWordMatch = name.match(/^([A-Z][a-z]*)/);
-	const firstWord = (firstWordMatch ? firstWordMatch[1] : name).toLowerCase();
-
-	const QUERY_PREFIXES = new Set<string>(['get', 'load', 'download', 'fetch']);
-	const COMMAND_PREFIXES = new Set<string>([
-		'post', 'put', 'delete', 'add', 'create', 'remove', 'change',
-		'update', 'edit', 'modify', 'import', 'upload', 'drop',
-	]);
-
-	let suffix: string;
-	if (QUERY_PREFIXES.has(firstWord)) {
-		suffix = 'Query';
-	} else if (COMMAND_PREFIXES.has(firstWord)) {
-		suffix = 'Command';
-	} else {
-		suffix = 'Request';
-	}
-
-	return name + suffix;
-}
-
 async function finalizeRequestName(input: string, entityName: string | null): Promise<string> {
 	const trimmed = capitalize(input.trim());
 	const lc = trimmed.toLowerCase();
@@ -144,10 +115,10 @@ async function finalizeRequestName(input: string, entityName: string | null): Pr
 		'update', 'edit', 'modify', 'import', 'upload', 'drop',
 	]);
 
-	const isKnownPrefix = QUERY_PREFIXES.has(lc);
+	const isKnownPrefix = QUERY_PREFIXES.has(lc) || COMMAND_PREFIXES.has(lc);
 
 	if (isKnownPrefix && entityName) {
-		return normalizeRequestName(trimmed + capitalize(entityName));
+		return normalizeSharedRequestName(trimmed + capitalize(entityName));
 	}
 
 	if (/(?:Request|Query|Command)$/i.test(trimmed)) {
@@ -175,7 +146,9 @@ async function finalizeRequestName(input: string, entityName: string | null): Pr
 
 async function resolveTargetFolder(uri?: vscode.Uri): Promise<vscode.Uri | undefined> {
 	const result = await resolveTargetFolderShared(uri);
-	if (result) return result;
+	if (result) {
+		return result;
+	}
 
 	// Fallback: ask user for path (original createFile.ts behavior)
 	const selected = await vscode.window.showInputBox({
@@ -564,14 +537,15 @@ export async function createMitMediatorHandler(folderUri?: vscode.Uri): Promise<
 			let returnedType: import('../utils/typeSearch.js').FoundType | undefined;
 			if (returnType) {
 				const { innerTypeName } = parseCqrsReturnType(returnType);
-				if (innerTypeName && !isBuiltinType(innerTypeName)) {
+				if (innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit') {
 					returnedType = await findTypeInWorkspace(innerTypeName);
 				}
 			}
 
 			const handlerName = `${requestInput}Handler`;
 			const namespace = await deriveNamespaceFromFolder(folder);
-			const content = generateMitMediatorHandler(handlerName, found, returnType, namespace, returnedType);
+			const rt = returnType === 'Unit' ? null : returnType;
+			const content = generateMitMediatorHandler(handlerName, found, rt, namespace, returnedType);
 			await writeAndOpen(folder, `${handlerName}.cs`, content);
 		}
 	);

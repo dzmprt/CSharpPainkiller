@@ -1,4 +1,5 @@
 import { type FoundType } from '../../utils/typeSearch.js';
+import { extractGenericInterfaceArgument } from '../../utils/contentParser.js';
 
 // ============================================================================
 // Return-type parsing
@@ -46,8 +47,7 @@ export function parseReturnType(input: string): { innerTypeName: string; returnT
  * Returns undefined if not found (e.g. void IRequest without generic).
  */
 export function extractIRequestReturnType(content: string): string | undefined {
-	const match = content.match(/IRequest<([^>]+)>/);
-	return match ? match[1].trim() : undefined;
+	return extractGenericInterfaceArgument(content, 'IRequest');
 }
 
 // ============================================================================
@@ -91,12 +91,13 @@ public sealed class ${requestName} : IRequest<${rt}>
 export function generateMediatRHandler(
 	handlerName: string,
 	requestType: FoundType,
-	returnType: string,
+	returnType: string | null,
 	namespace: string,
 	returnedType?: FoundType
 ): string {
 	const requestName = requestType.name;
-	const isVoid = returnType === 'Unit';
+	const rt = returnType ?? 'Unit';
+	const isVoid = rt === 'Unit';
 
 	const libUsings = ['MediatR'];
 	const entityUsings: string[] = [];
@@ -118,11 +119,11 @@ export function generateMediatRHandler(
         return Unit.Value;`
 		: `        throw new NotImplementedException();`;
 
-	const taskReturn = isVoid ? 'Task<Unit>' : `Task<${returnType}>`;
+	const taskReturn = isVoid ? 'Task<Unit>' : `Task<${rt}>`;
 
 	return `${usings}namespace ${namespace};
 
-public sealed class ${handlerName} : IRequestHandler<${requestName}, ${returnType}>
+public sealed class ${handlerName} : IRequestHandler<${requestName}, ${rt}>
 {
     public ${taskReturn} Handle(${requestName} request, CancellationToken cancellationToken)
     {
@@ -137,7 +138,7 @@ public sealed class ${handlerName} : IRequestHandler<${requestName}, ${returnTyp
 // ============================================================================
 // MitMediator uses the same IRequest<T>/IRequestHandler<,> interfaces as MediatR,
 // but the handler method is HandleAsync and returns ValueTask<T>.
-// For void requests: IRequest (no generic), handler returns ValueTask.
+// For void requests: IRequest (no generic), handler returns ValueTask<Unit>.
 
 /**
  * Generates an IRequest class file for MitMediator.
@@ -174,7 +175,7 @@ public sealed class ${requestName} : ${iface}
  * Uses ValueTask<T> and HandleAsync.
  *
  * When returnType is null/empty (void), generates IRequestHandler<TRequest>
- * with ValueTask HandleAsync(...).
+ * with ValueTask<Unit> HandleAsync(...).
  */
 export function generateMitMediatorHandler(
 	handlerName: string,
@@ -207,7 +208,7 @@ export function generateMitMediatorHandler(
 
 public sealed class ${handlerName} : IRequestHandler<${requestName}>
 {
-    public ValueTask HandleAsync(${requestName} request, CancellationToken cancellationToken)
+    public ValueTask<Unit> HandleAsync(${requestName} request, CancellationToken cancellationToken)
     {
         throw new NotImplementedException();
     }

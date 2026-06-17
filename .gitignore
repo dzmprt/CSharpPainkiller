@@ -404,3 +404,4 @@ FodyWeavers.xsd
 dist
 .vscode-test.mjs
 .DS_Store
+out/

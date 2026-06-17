@@ -310,12 +310,16 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: v
     prompt: `Enter ${template.name} project name`,
     placeHolder: `My${template.name}`,
     validateInput: (value) => {
-      if (!value || value.trim() === '') return 'Project name is required';
+      if (!value || value.trim() === '') {
+        return 'Project name is required';
+      }
       return null;
     },
   });
 
-  if (!projectName) return;
+  if (!projectName) {
+    return;
+  }
 
   const projectFolderPath = vscode.Uri.file(pathModule.join(baseFolderUri.fsPath, projectName));
 
@@ -352,7 +356,9 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: v
 
 async function findSolutionFileNear(uri: vscode.Uri): Promise<vscode.Uri | null> {
   const workspaceFolders = vscode.workspace.workspaceFolders;
-  if (!workspaceFolders) return null;
+  if (!workspaceFolders) {
+    return null;
+  }
 
   const workspaceRootPath = workspaceFolders[0].uri.fsPath;
   let currentDir = uri.fsPath;
