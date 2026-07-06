@@ -15,6 +15,12 @@ export interface DotnetTemplate {
   menuOrder: number; // order within submenu
 }
 
+interface DotnetCreateProjectTarget {
+  physicalBaseUri: vscode.Uri;
+  solutionUri?: vscode.Uri;
+  solutionFolderPath?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Parsing: run `dotnet new list` and parse the text table output
 // ---------------------------------------------------------------------------
@@ -120,7 +126,7 @@ function isRelevantFileTemplate(shorthand: string, tagsLower: string): boolean {
     'apicontroller', 'mvccontroller',
   ]);
 
-  if (relevantShorthands.has(shorthand)) {
+  if (getTemplateShorthandAliases(shorthand).some(alias => relevantShorthands.has(alias))) {
     return true;
   }
 
@@ -236,7 +242,7 @@ export function registerDynamicTemplateCommands(templates: DotnetTemplate[], con
 function registerUnifiedCreateProjectCommand(templates: DotnetTemplate[], context: vscode.ExtensionContext): void {
   const disposable = vscode.commands.registerCommand(
     'csharppainkiller.dotnet.createProject',
-    async (uri?: vscode.Uri) => {
+    async (target?: vscode.Uri | DotnetCreateProjectTarget) => {
       // Sort templates by shorthand for consistent ordering
       const sortedTemplates = [...templates].sort((a, b) => a.shorthand.localeCompare(b.shorthand));
 
@@ -244,7 +250,7 @@ function registerUnifiedCreateProjectCommand(templates: DotnetTemplate[], contex
       const picks: vscode.QuickPickItem[] = sortedTemplates.map(t => ({
         label: `$(file-code) ${t.name}`,
         description: t.shorthand,
-        detail: `dotnet new ${t.shorthand}`,
+        detail: `dotnet new ${getPrimaryTemplateShorthand(t.shorthand)}`,
       }));
 
       const pick = await vscode.window.showQuickPick(picks, {
@@ -255,7 +261,7 @@ function registerUnifiedCreateProjectCommand(templates: DotnetTemplate[], contex
       if (pick) {
         const template = sortedTemplates.find(t => t.shorthand === pick.description);
         if (template) {
-          await createProjectByTemplate(template, uri);
+          await createProjectByTemplate(template, target);
         }
       }
     }
@@ -278,7 +284,7 @@ export interface SubmenuDefinition {
 // Project creation handler for dynamic templates
 // ---------------------------------------------------------------------------
 
-async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: vscode.Uri): Promise<void> {
+async function createProjectByTemplate(template: DotnetTemplate, selectedTarget?: vscode.Uri | DotnetCreateProjectTarget): Promise<void> {
   // Use the URI from explorer selection (folder), or fall back to workspace root
   const workspaceFolders = vscode.workspace.workspaceFolders;
   if (!workspaceFolders || workspaceFolders.length === 0) {
@@ -288,6 +294,8 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: v
 
   // If user right-clicked a folder in explorer, use that folder as the base
   let baseFolderUri: vscode.Uri;
+  const projectTarget = isDotnetCreateProjectTarget(selectedTarget) ? selectedTarget : undefined;
+  const selectedUri = selectedTarget instanceof vscode.Uri ? selectedTarget : projectTarget?.physicalBaseUri;
   if (selectedUri) {
     // Check if it's a folder or file URI
     try {
@@ -306,6 +314,11 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: v
     baseFolderUri = workspaceFolders[0].uri;
   }
 
+  if (await isInsideExistingProject(baseFolderUri)) {
+    vscode.window.showErrorMessage('CSharp Painkiller: Create projects only in the workspace root or regular folders, not inside an existing project.');
+    return;
+  }
+
   const projectName = await vscode.window.showInputBox({
     prompt: `Enter ${template.name} project name`,
     placeHolder: `My${template.name}`,
@@ -322,25 +335,33 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: v
   }
 
   const projectFolderPath = vscode.Uri.file(pathModule.join(baseFolderUri.fsPath, projectName));
+  const projectFilePath = vscode.Uri.file(pathModule.join(projectFolderPath.fsPath, `${projectName}.csproj`));
 
-  // Search for solution near baseFolderUri
-  const solution = await findSolutionFileNear(baseFolderUri);
+  // Search for solution near baseFolderUri unless Solution Structure passed an explicit solution.
+  const solution = projectTarget?.solutionUri ?? await findSolutionFileNear(baseFolderUri);
 
   try {
     // Ensure parent directory exists
     await ensureDirectoryExists(pathModule.dirname(projectFolderPath.fsPath));
 
     // Build and run dotnet new command
-    const newArgs = ['new', template.shorthand, '-o', projectFolderPath.fsPath, '--name', projectName];
+    const newArgs = ['new', getPrimaryTemplateShorthand(template.shorthand), '-o', projectFolderPath.fsPath, '--name', projectName];
 
     if (solution) {
       const slnDir = pathModule.dirname(solution.fsPath);
       runDotnetCommand(newArgs, slnDir);
 
-      // Add to solution
-      await addProjectToSolution(solution, projectFolderPath, projectName, slnDir);
+      let addedToSolution = false;
+      // Only project templates create .csproj files that can be added to a solution.
+      if (await fileExists(projectFilePath)) {
+        addedToSolution = await addProjectToSolution(solution, projectFolderPath, projectName, slnDir, projectTarget?.solutionFolderPath);
+      }
 
-      vscode.window.showInformationMessage(`Created ${template.name} project "${projectName}" and added to solution.`);
+      vscode.window.showInformationMessage(
+        addedToSolution
+          ? `Created ${template.name} project "${projectName}" and added to solution.`
+          : `Created ${template.name} "${projectName}".`
+      );
     } else {
       runDotnetCommand(newArgs, pathModule.dirname(projectFolderPath.fsPath));
       vscode.window.showInformationMessage(`Created ${template.name} project "${projectName}".`);
@@ -348,6 +369,47 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedUri?: v
   } catch (error) {
     vscode.window.showErrorMessage(`Failed to create ${template.name} project: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function getPrimaryTemplateShorthand(shorthand: string): string {
+  return getTemplateShorthandAliases(shorthand)[0] ?? shorthand.trim();
+}
+
+function getTemplateShorthandAliases(shorthand: string): string[] {
+  return shorthand
+    .split(',')
+    .map(alias => alias.trim())
+    .filter(Boolean);
+}
+
+function isDotnetCreateProjectTarget(value: unknown): value is DotnetCreateProjectTarget {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<DotnetCreateProjectTarget>;
+  return candidate.physicalBaseUri instanceof vscode.Uri &&
+    (candidate.solutionUri === undefined || candidate.solutionUri instanceof vscode.Uri) &&
+    (candidate.solutionFolderPath === undefined || typeof candidate.solutionFolderPath === 'string');
+}
+
+async function fileExists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    const stat = await vscode.workspace.fs.stat(uri);
+    return stat.type === vscode.FileType.File;
+  } catch {
+    return false;
+  }
+}
+
+async function isInsideExistingProject(folderUri: vscode.Uri): Promise<boolean> {
+  const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+  const selectedPath = pathModule.normalize(folderUri.fsPath);
+
+  return csprojFiles.some(csprojUri => {
+    const projectDir = pathModule.normalize(pathModule.dirname(csprojUri.fsPath));
+    return selectedPath === projectDir || selectedPath.startsWith(projectDir + pathModule.sep);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -437,12 +499,272 @@ async function ensureDirectoryExists(dirPath: string): Promise<void> {
 // Helper: add project to solution (simplified from dotnetCommands.ts)
 // ---------------------------------------------------------------------------
 
-async function addProjectToSolution(_solutionUri: vscode.Uri, projectFolderUri: vscode.Uri, _projectName: string, slnDir: string): Promise<boolean> {
+async function addProjectToSolution(solutionUri: vscode.Uri, projectFolderUri: vscode.Uri, projectName: string, slnDir: string, solutionFolderPath?: string): Promise<boolean> {
   try {
-      runDotnetCommand(['sln', 'add', projectFolderUri.fsPath], slnDir);
+    const projectFilePath = pathModule.join(projectFolderUri.fsPath, `${projectName}.csproj`);
+    if (solutionUri.path.endsWith('.slnx')) {
+      await addProjectToSlnx(solutionUri, projectFilePath, slnDir, solutionFolderPath);
+    } else {
+      runDotnetCommand(['sln', solutionUri.fsPath, 'add', projectFilePath], slnDir);
+      if (solutionFolderPath) {
+        const content = await readUtf8(solutionUri);
+        const relativeProjectPath = pathModule.relative(slnDir, projectFilePath).replace(/\\/g, '/');
+        const updated = moveSlnProjectToFolder(content, relativeProjectPath, solutionFolderPath);
+        if (updated !== content) {
+          await vscode.workspace.fs.writeFile(solutionUri, Buffer.from(updated, 'utf-8'));
+        }
+      }
+    }
     return true;
   } catch {
     console.error('Failed to add project to solution');
     return false;
   }
+}
+
+async function addProjectToSlnx(solutionUri: vscode.Uri, projectFilePath: string, slnDir: string, solutionFolderPath?: string): Promise<void> {
+  const bytes = await vscode.workspace.fs.readFile(solutionUri);
+  const content = Buffer.from(bytes).toString('utf-8');
+  const relativeProjectPath = pathModule.relative(slnDir, projectFilePath).replace(/\\/g, '/');
+
+  if (content.includes(`Path="${relativeProjectPath}"`)) {
+    return;
+  }
+
+  const projectXml = `  <Project Path="${escapeXml(relativeProjectPath)}" />\n`;
+  const updated = insertSlnxProject(content, relativeProjectPath, projectXml, solutionFolderPath);
+  await vscode.workspace.fs.writeFile(solutionUri, Buffer.from(updated, 'utf-8'));
+}
+
+function insertSlnxProject(content: string, relativeProjectPath: string, projectXml: string, solutionFolderPath?: string): string {
+  const projectDir = normaliseSlnxPath(solutionFolderPath ?? pathModule.dirname(relativeProjectPath));
+  const folderMatches = findSlnxFolderStarts(content)
+    .filter(match => isProjectUnderSlnxFolder(projectDir, match.value))
+    .sort((a, b) => b.value.length - a.value.length);
+
+  for (const match of folderMatches) {
+    const inserted = insertXmlIntoSlnxFolder(content, match, projectXml);
+    if (inserted !== content) {
+      return inserted;
+    }
+  }
+
+  const solutionCloseIndex = content.lastIndexOf('</Solution>');
+  if (solutionCloseIndex >= 0) {
+    return `${content.slice(0, solutionCloseIndex)}${projectXml}${content.slice(solutionCloseIndex)}`;
+  }
+
+  return `${content.trimEnd()}\n${projectXml}`;
+}
+
+function findSlnxFolderStarts(content: string): Array<{ index: number; end: number; value: string; isSelfClosing: boolean }> {
+  const folders: Array<{ index: number; end: number; value: string; isSelfClosing: boolean }> = [];
+  const folderStack: string[] = [];
+  const tagRegex = /<\s*(\/?)\s*Folder\b([^>]*?)(\/?)>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = tagRegex.exec(content)) !== null) {
+    const isClosing = match[1] === '/';
+    const attrs = parseAttributes(match[2]);
+    const isSelfClosing = match[3] === '/' || /\/\s*$/.test(match[2]);
+
+    if (isClosing) {
+      folderStack.pop();
+      continue;
+    }
+
+    const folderName = attrs.get('Path') ?? attrs.get('Name');
+    if (!folderName) {
+      continue;
+    }
+
+    const folderPath = normaliseSlnxPath(attrs.has('Path') ? folderName : [...folderStack, folderName].join('/'));
+    folders.push({
+      index: match.index,
+      end: match.index + match[0].length,
+      value: folderPath,
+      isSelfClosing,
+    });
+
+    if (!isSelfClosing) {
+      folderStack.push(folderPath);
+    }
+  }
+
+  return folders;
+}
+
+function insertXmlIntoSlnxFolder(content: string, folderStart: { index: number; end: number; isSelfClosing: boolean }, xml: string): string {
+  const indent = getLineIndent(content, folderStart.index);
+  const childIndent = `${indent}  `;
+  const indentedXml = xml.replace(/^  /, childIndent);
+
+  if (folderStart.isSelfClosing) {
+    const openTag = content.slice(folderStart.index, folderStart.end).replace(/\s*\/>$/, '>');
+    const replacement = `${openTag}\n${indentedXml}${indent}</Folder>`;
+    return `${content.slice(0, folderStart.index)}${replacement}${content.slice(folderStart.end)}`;
+  }
+
+  const closeIndex = findClosingFolderIndex(content, folderStart.index);
+  if (closeIndex < 0) {
+    return content;
+  }
+
+  return `${content.slice(0, closeIndex)}${indentedXml}${content.slice(closeIndex)}`;
+}
+
+function findClosingFolderIndex(content: string, openIndex: number): number {
+  const tagRegex = /<\s*(\/?)\s*Folder\b[^>]*(\/?)>/gi;
+  tagRegex.lastIndex = openIndex;
+  let depth = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tagRegex.exec(content)) !== null) {
+    const isClosing = match[1] === '/';
+    const isSelfClosing = match[2] === '/';
+    if (!isClosing && !isSelfClosing) {
+      depth++;
+    } else if (isClosing) {
+      depth--;
+      if (depth === 0) {
+        return match.index;
+      }
+    }
+  }
+  return -1;
+}
+
+function parseAttributes(input: string): Map<string, string> {
+  const attrs = new Map<string, string>();
+  const attrRegex = /(\w+)\s*=\s*"([^"]*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = attrRegex.exec(input)) !== null) {
+    attrs.set(match[1], match[2]);
+  }
+  return attrs;
+}
+
+function getLineIndent(content: string, index: number): string {
+  const lineStart = content.lastIndexOf('\n', index - 1) + 1;
+  const linePrefix = content.slice(lineStart, index);
+  return linePrefix.match(/^\s*/)?.[0] ?? '';
+}
+
+function moveSlnProjectToFolder(content: string, projectPath: string, solutionFolderPath: string): string {
+  const normalizedProjectPath = normaliseSlnxPath(projectPath);
+  const normalizedFolderPath = normaliseSlnxPath(solutionFolderPath);
+  const projectGuid = findSlnProjectGuidByPath(content, normalizedProjectPath);
+  const folderGuid = findSlnFolderGuidByPath(content, normalizedFolderPath);
+  if (!projectGuid || !folderGuid) {
+    return content;
+  }
+
+  return upsertSlnNestedProject(content, projectGuid, folderGuid);
+}
+
+function findSlnProjectGuidByPath(content: string, normalizedProjectPath: string): string | undefined {
+  const projectRegex = /^Project\("\{[^}]+\}"\)\s*=\s*"[^"]+",\s*"([^"]+)",\s*"\{([^}]+)\}"/gm;
+  let match: RegExpExecArray | null;
+  while ((match = projectRegex.exec(content)) !== null) {
+    if (normaliseSlnxPath(match[1]) === normalizedProjectPath) {
+      return match[2].toUpperCase();
+    }
+  }
+  return undefined;
+}
+
+function findSlnFolderGuidByPath(content: string, normalizedFolderPath: string): string | undefined {
+  const solutionFolderTypeGuid = '66a26720-8fb5-11d2-aa7e-00c04f688dDE'.toLowerCase();
+  const entries = new Map<string, { name: string; parentGuid?: string; isFolder: boolean }>();
+  const projectRegex = /^Project\("\{([^}]+)\}"\)\s*=\s*"([^"]+)",\s*"[^"]+",\s*"\{([^}]+)\}"/gm;
+  let match: RegExpExecArray | null;
+  while ((match = projectRegex.exec(content)) !== null) {
+    entries.set(match[3].toUpperCase(), {
+      name: match[2],
+      isFolder: match[1].toLowerCase() === solutionFolderTypeGuid,
+    });
+  }
+
+  const nestedMatch = content.match(/GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/);
+  if (nestedMatch) {
+    const nestedRegex = /\{([^}]+)\}\s*=\s*\{([^}]+)\}/g;
+    let nested: RegExpExecArray | null;
+    while ((nested = nestedRegex.exec(nestedMatch[0])) !== null) {
+      entries.get(nested[1].toUpperCase())!.parentGuid = nested[2].toUpperCase();
+    }
+  }
+
+  for (const [guid, entry] of entries) {
+    if (!entry.isFolder) {
+      continue;
+    }
+    const segments = [entry.name];
+    let parentGuid = entry.parentGuid;
+    while (parentGuid) {
+      const parent = entries.get(parentGuid);
+      if (!parent) {
+        break;
+      }
+      segments.unshift(parent.name);
+      parentGuid = parent.parentGuid;
+    }
+    if (normaliseSlnxPath(segments.join('/')) === normalizedFolderPath) {
+      return guid;
+    }
+  }
+  return undefined;
+}
+
+function upsertSlnNestedProject(content: string, childGuid: string, parentGuid: string): string {
+  const nestedLine = `\t\t{${childGuid.toUpperCase()}} = {${parentGuid.toUpperCase()}}\n`;
+  const nestedSection = content.match(/GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/);
+  if (nestedSection?.index !== undefined) {
+    const childRegex = new RegExp(`\\t*\\s*\\{${escapeRegExp(childGuid)}\\}\\s*=\\s*\\{[^}]+\\}\\r?\\n?`, 'i');
+    let updated = content.replace(childRegex, '');
+    const updatedSection = updated.match(/GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/);
+    if (updatedSection?.index !== undefined) {
+      const insertIndex = updatedSection.index + updatedSection[0].lastIndexOf('EndGlobalSection');
+      updated = `${updated.slice(0, insertIndex)}${nestedLine}${updated.slice(insertIndex)}`;
+    }
+    return updated;
+  }
+
+  const endGlobalIndex = content.lastIndexOf('EndGlobal');
+  const section = [
+    '\tGlobalSection(NestedProjects) = preSolution',
+    nestedLine.trimEnd(),
+    '\tEndGlobalSection',
+  ].join('\n');
+  return endGlobalIndex >= 0
+    ? `${content.slice(0, endGlobalIndex)}${section}\n${content.slice(endGlobalIndex)}`
+    : `${content.trimEnd()}\nGlobal\n${section}\nEndGlobal\n`;
+}
+
+function isProjectUnderSlnxFolder(projectDir: string, folderPath: string): boolean {
+  const normalisedProjectDir = normaliseSlnxPath(projectDir);
+  return normalisedProjectDir === folderPath || normalisedProjectDir.startsWith(`${folderPath}/`);
+}
+
+function normaliseSlnxPath(value: string): string {
+  return value
+    .replace(/\\/g, '/')
+    .split('/')
+    .map(segment => segment.trim())
+    .filter(Boolean)
+    .join('/');
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function readUtf8(uri: vscode.Uri): Promise<string> {
+  const bytes = await vscode.workspace.fs.readFile(uri);
+  return Buffer.from(bytes).toString('utf-8');
 }

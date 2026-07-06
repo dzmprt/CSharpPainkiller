@@ -115,9 +115,9 @@ export function generateMediatRHandler(
 	const usings = buildSortedUsings(namespace, libUsings, entityUsings);
 
 	const body = isVoid
-		? `        throw new NotImplementedException();
+		? `throw new NotImplementedException();
         return Unit.Value;`
-		: `        throw new NotImplementedException();`;
+		: 'throw new NotImplementedException();';
 
 	const taskReturn = isVoid ? 'Task<Unit>' : `Task<${rt}>`;
 
@@ -125,7 +125,7 @@ export function generateMediatRHandler(
 
 public sealed class ${handlerName} : IRequestHandler<${requestName}, ${rt}>
 {
-    public ${taskReturn} Handle(${requestName} request, CancellationToken cancellationToken)
+    public async ${taskReturn} Handle(${requestName} request, CancellationToken cancellationToken)
     {
         ${body}
     }
@@ -208,9 +208,10 @@ export function generateMitMediatorHandler(
 
 public sealed class ${handlerName} : IRequestHandler<${requestName}>
 {
-    public ValueTask<Unit> HandleAsync(${requestName} request, CancellationToken cancellationToken)
+    public async ValueTask<Unit> HandleAsync(${requestName} request, CancellationToken cancellationToken)
     {
         throw new NotImplementedException();
+        return Unit.Value;
     }
 }
 `;
@@ -220,7 +221,7 @@ public sealed class ${handlerName} : IRequestHandler<${requestName}>
 
 public sealed class ${handlerName} : IRequestHandler<${requestName}, ${returnType}>
 {
-    public ValueTask<${returnType}> HandleAsync(${requestName} request, CancellationToken cancellationToken)
+    public async ValueTask<${returnType}> HandleAsync(${requestName} request, CancellationToken cancellationToken)
     {
         throw new NotImplementedException();
     }
@@ -265,7 +266,7 @@ export function generateMediatRNotificationHandler(
 
 public sealed class ${handlerName} : INotificationHandler<${notificationType.name}>
 {
-    public Task Handle(${notificationType.name} notification, CancellationToken cancellationToken)
+    public async Task Handle(${notificationType.name} notification, CancellationToken cancellationToken)
     {
         throw new NotImplementedException();
     }
@@ -311,7 +312,7 @@ export function generateMitMediatorNotificationHandler(
 
 public sealed class ${handlerName} : INotificationHandler<${notificationType.name}>
 {
-    public ValueTask HandleAsync(${notificationType.name} notification, CancellationToken cancellationToken)
+    public async ValueTask HandleAsync(${notificationType.name} notification, CancellationToken cancellationToken)
     {
         throw new NotImplementedException();
     }

@@ -9,6 +9,7 @@ import {
 	generateMitMediatorRequest,
 	generateMitMediatorHandler,
 	generateMitMediatorNotification,
+	generateMitMediatorNotificationHandler,
 	generateMediatREmptyPipelineBehavior,
 	generateMediatRFluentValidationBehavior,
 } from '../services/templates/cqrs.js';
@@ -82,6 +83,25 @@ suite('cqrsTemplates', () => {
 				returnedType
 			);
 			assert.ok(content.includes('IRequestHandler<GetAuthorsQuery, List<Author>>'));
+			assert.ok(content.includes('public async Task<List<Author>> Handle'));
+			assert.ok(content.includes('        throw new NotImplementedException();'));
+			assert.ok(!content.includes('                throw new NotImplementedException();'));
+		});
+
+		test('generateMediatRHandler with Unit throws before returning Unit.Value', () => {
+			const requestType = { name: 'DeleteAuthorCommand', namespace: 'MyApp.Application', fileUri: undefined as never };
+			const content = generateMediatRHandler(
+				'DeleteAuthorCommandHandler',
+				requestType,
+				null,
+				'MyApp.Application'
+			);
+			assert.ok(content.includes('IRequestHandler<DeleteAuthorCommand, Unit>'));
+			assert.ok(content.includes('public async Task<Unit> Handle'));
+			assert.ok(content.includes('        throw new NotImplementedException();'));
+			assert.ok(content.includes('        return Unit.Value;'));
+			assert.ok(content.indexOf('throw new NotImplementedException();') < content.indexOf('return Unit.Value;'));
+			assert.ok(!content.includes('                throw new NotImplementedException();'));
 		});
 
 		test('generateMediatRNotification', () => {
@@ -93,6 +113,7 @@ suite('cqrsTemplates', () => {
 			const notifType = { name: 'UserRegisteredNotification', namespace: 'MyApp.Application', fileUri: undefined as never };
 			const content = generateMediatRNotificationHandler('UserRegisteredNotificationHandler', notifType, 'MyApp.Application');
 			assert.ok(content.includes('INotificationHandler<UserRegisteredNotification>'));
+			assert.ok(content.includes('public async Task Handle'));
 		});
 
 		test('generateMediatREmptyPipelineBehavior', () => {
@@ -122,7 +143,7 @@ suite('cqrsTemplates', () => {
 				'MyApp.Application',
 				returnedType
 			);
-			assert.ok(content.includes('ValueTask<List<Author>> HandleAsync'));
+			assert.ok(content.includes('public async ValueTask<List<Author>> HandleAsync'));
 		});
 
 		test('generateMitMediatorHandler uses ValueTask<Unit> for void requests', () => {
@@ -135,13 +156,23 @@ suite('cqrsTemplates', () => {
 			);
 			assert.ok(content.includes('IRequestHandler<DeleteAuthorCommand>'));
 			assert.ok(!content.includes('IRequestHandler<DeleteAuthorCommand, Unit>'));
-			assert.ok(content.includes('ValueTask<Unit> HandleAsync'));
+			assert.ok(content.includes('public async ValueTask<Unit> HandleAsync'));
+			assert.ok(content.includes('        throw new NotImplementedException();'));
+			assert.ok(content.includes('        return Unit.Value;'));
+			assert.ok(content.indexOf('throw new NotImplementedException();') < content.indexOf('return Unit.Value;'));
 		});
 
 		test('generateMitMediatorNotification', () => {
 			const content = generateMitMediatorNotification('UserRegisteredNotification', 'MyApp.Application');
 			assert.ok(content.includes(': INotification'));
 			assert.ok(content.includes('using MitMediator;'));
+		});
+
+		test('generateMitMediatorNotificationHandler is async', () => {
+			const notifType = { name: 'UserRegisteredNotification', namespace: 'MyApp.Application', fileUri: undefined as never };
+			const content = generateMitMediatorNotificationHandler('UserRegisteredNotificationHandler', notifType, 'MyApp.Application');
+			assert.ok(content.includes('INotificationHandler<UserRegisteredNotification>'));
+			assert.ok(content.includes('public async ValueTask HandleAsync'));
 		});
 	});
 });

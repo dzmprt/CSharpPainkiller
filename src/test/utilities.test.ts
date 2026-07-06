@@ -53,6 +53,22 @@ suite('utilities', () => {
 			assert.notStrictEqual(fastContentHash('hello'), fastContentHash('world'));
 		});
 
+		test('fastContentHash returns 8-character hex string', () => {
+			assert.match(fastContentHash('test'), /^[0-9a-f]{8}$/);
+		});
+
+		test('fastContentHash is sensitive to single-character changes', () => {
+			assert.notStrictEqual(fastContentHash('namespace MyApp;'), fastContentHash('namespace MyApp '));
+		});
+
+		// Bug 4 regression: & 0xff caused chars sharing the same low byte to hash identically
+		test('fastContentHash distinguishes Unicode chars with the same low byte', () => {
+			// 'a' = U+0061, '\u0161' = U+0161 — same low byte (0x61), different chars
+			assert.notStrictEqual(fastContentHash('a'), fastContentHash('\u0161'));
+			// U+0041 ('A') vs U+0141 ('Ł') — same low byte (0x41)
+			assert.notStrictEqual(fastContentHash('A'), fastContentHash('\u0141'));
+		});
+
 		test('hasNonAsciiFast detects non-ASCII characters', () => {
 			assert.ok(hasNonAsciiFast('Книга'));
 			assert.ok(!hasNonAsciiFast('Book'));

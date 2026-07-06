@@ -3,8 +3,8 @@ import { CsprojCache } from '../utils/csprojCache.js';
 
 /**
  * Provides file decorations for folders containing .csproj files.
- * Decorates project folders with a purple badge to visually distinguish them
- * in the file explorer without interfering with git or error decorations.
+ * Adds a best-effort Explorer decoration. VS Code can still let diagnostics
+ * or SCM decorations take precedence for the same folder.
  */
 export class CsprojFolderDecorationProvider implements vscode.FileDecorationProvider {
 	private disposable: vscode.Disposable | null = null;
@@ -18,17 +18,22 @@ export class CsprojFolderDecorationProvider implements vscode.FileDecorationProv
 	 * Loads initial csproj folders and sets up watchers for changes.
 	 */
 	async initialize(): Promise<void> {
-		await this.refreshCsprojFolders();
+		await this.refresh();
 
 		// Listen for csproj file changes to update decorations
 		const csprojWatcher = vscode.workspace.createFileSystemWatcher('**/*.csproj');
 		this.disposable = csprojWatcher;
 
-		csprojWatcher.onDidCreate(() => this.refreshCsprojFolders());
-		csprojWatcher.onDidDelete(() => this.refreshCsprojFolders());
+		csprojWatcher.onDidCreate(() => this.refresh());
+		csprojWatcher.onDidDelete(() => this.refresh());
 		csprojWatcher.onDidChange(() => {
 			// Don't need to refresh on change, only creation/deletion affects structure
 		});
+	}
+
+	async refresh(): Promise<void> {
+		CsprojCache.getInstance().invalidate();
+		await this.refreshCsprojFolders();
 	}
 
 	/**
@@ -38,6 +43,7 @@ export class CsprojFolderDecorationProvider implements vscode.FileDecorationProv
 		const cache = CsprojCache.getInstance();
 		const csprojs = await cache.getCsprojs();
 
+		const previousFolders = this.csprojFolders;
 		const newFolders = new Set<string>();
 		for (const csproj of csprojs) {
 			newFolders.add(csproj.dirPath);
@@ -45,10 +51,9 @@ export class CsprojFolderDecorationProvider implements vscode.FileDecorationProv
 
 		this.csprojFolders = newFolders;
 
-		// Notify VS Code that decorations have changed for all folders
-		// We use a workspace root URI as a general refresh signal
-		if (vscode.workspace.workspaceFolders && vscode.workspace.workspaceFolders.length > 0) {
-			this.updateEmitter.fire(vscode.workspace.workspaceFolders[0].uri);
+		const changedFolders = new Set([...previousFolders, ...newFolders]);
+		for (const folderPath of changedFolders) {
+			this.updateEmitter.fire(vscode.Uri.file(folderPath));
 		}
 	}
 
@@ -62,7 +67,7 @@ export class CsprojFolderDecorationProvider implements vscode.FileDecorationProv
 
 		if (this.csprojFolders.has(normalizedPath)) {
 			return {
-				badge: '◇',
+				badge: 'C#',
 				color: new vscode.ThemeColor('charts.purple'),
 				tooltip: 'C# Project Folder (.csproj)',
 				propagate: false, // Don't propagate to parent folders

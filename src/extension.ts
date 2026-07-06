@@ -7,13 +7,12 @@ import { sortUsingsInFile, sortUsingsInFolder } from './services/sortUsings.js';
 import { extractInterfaceFromFile } from './services/extractInterface.js';
 import { uriIsDirectory, uriIsFile } from './utils/fileUtils.js';
 import { detectMediatorFile } from './utils/contentParser.js';
-import { MapToCodeActionProvider } from './codeActions/mapToCodeActionProvider.js';
-import { GoToHandlerCodeActionProvider } from './codeActions/goToHandlerCodeActionProvider.js';
 import { ExtractTypeCodeActionProvider } from './codeActions/extractTypeCodeActionProvider.js';
 import { extractTypeToFile } from './services/extractTypeToFile.js';
 import { generateMapToForDocument, generateMapFromForDocument } from './services/generateMapTo.js';
 import { generateDtoForDocument } from './services/generateDto.js';
 import { generateFluentValidatorForDocument } from './services/generateFluentValidator.js';
+import { registerTypeAndFileNameSync } from './services/syncTypeAndFileName.js';
 import {
 	createEmptyController,
 	createEfCrudController,
@@ -52,6 +51,7 @@ import { validateUri as validateSharedUri, resolveCommandFileContext } from './u
 import { CsprojCache } from './utils/csprojCache.js';
 import { fetchDotnetTemplates, registerDynamicTemplateCommands } from './services/dotnetTemplates.js';
 import { CsprojFolderDecorationProvider } from './decoration/csprojFolderDecorationProvider.js';
+import { CsprojProjectsTreeProvider } from './decoration/csprojProjectsTreeProvider.js';
 import { ParserCache } from './codeActions/parserCache.js';
 
 /**
@@ -76,6 +76,13 @@ const validateUri = validateSharedUri;
  */
 export async function activate(context: vscode.ExtensionContext) {
 	console.log('CSharp Painkiller is starting...');
+	await updateHasSolutionContext();
+	const solutionContextWatcher = vscode.workspace.createFileSystemWatcher('**/*.{sln,slnx}');
+	context.subscriptions.push(
+		solutionContextWatcher,
+		solutionContextWatcher.onDidCreate(() => updateHasSolutionContext()),
+		solutionContextWatcher.onDidDelete(() => updateHasSolutionContext())
+	);
 
 		// -------------------------------------------------------------------------
 	// Initialize CsprojCache — discover .csproj files once, then cache
@@ -89,27 +96,48 @@ export async function activate(context: vscode.ExtensionContext) {
 	// -------------------------------------------------------------------------
 	const decorationProvider = new CsprojFolderDecorationProvider();
 	await decorationProvider.initialize();
+	const projectsTreeProvider = new CsprojProjectsTreeProvider(context.extensionUri, () => decorationProvider.refresh());
+	const projectsTreeView = vscode.window.createTreeView('csharppainkiller.projects', {
+		treeDataProvider: projectsTreeProvider,
+		dragAndDropController: projectsTreeProvider,
+		showCollapseAll: false,
+	});
 	context.subscriptions.push(
-		vscode.window.registerFileDecorationProvider(decorationProvider)
+		vscode.window.registerFileDecorationProvider(decorationProvider),
+		projectsTreeView,
+		projectsTreeProvider,
+		vscode.commands.registerCommand('csharppainkiller.revealProjectFolder', async (uri: vscode.Uri) => {
+			await vscode.commands.executeCommand('revealInExplorer', uri);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.createProject', async (item?: { createProjectUri?: vscode.Uri; createFolderTarget?: unknown }) => {
+			const selectedItem = item ?? projectsTreeView.selection[0];
+			await vscode.commands.executeCommand('csharppainkiller.dotnet.createProject', selectedItem?.createFolderTarget ?? selectedItem?.createProjectUri);
+			await decorationProvider.refresh();
+			projectsTreeProvider.refresh();
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.createFolder', async (item) => {
+			await projectsTreeProvider.createSolutionFolder(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.deleteFolder', async (item) => {
+			await projectsTreeProvider.deleteSolutionFolder(item);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.excludeProject', async (item) => {
+			await projectsTreeProvider.excludeProject(item);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.includeProject', async (item) => {
+			await projectsTreeProvider.includeProject(item);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.deleteProject', async (item) => {
+			await projectsTreeProvider.deleteProject(item);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.addProjectReference', async (item) => {
+			await projectsTreeProvider.addProjectReference(item);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.removeProjectReference', async (item) => {
+			await projectsTreeProvider.removeProjectReference(item);
+		})
 	);
 	console.log('File decoration provider registered');
-
-	// -------------------------------------------------------------------------
-	// Register Code Action provider for MapTo generation
-	const mapToCodeActionProvider = vscode.languages.registerCodeActionsProvider(
-		{ language: 'csharp', scheme: 'file' },
-		new MapToCodeActionProvider(),
-		{ providedCodeActionKinds: MapToCodeActionProvider.providedCodeActionKinds }
-	);
-	context.subscriptions.push(mapToCodeActionProvider);
-
-	// Register Code Action provider for Go to Handler
-	const goToHandlerCodeActionProvider = vscode.languages.registerCodeActionsProvider(
-		{ language: 'csharp', scheme: 'file' },
-		new GoToHandlerCodeActionProvider(),
-		{ providedCodeActionKinds: GoToHandlerCodeActionProvider.providedCodeActionKinds }
-	);
-	context.subscriptions.push(goToHandlerCodeActionProvider);
 
 	const extractTypeCodeActionProvider = vscode.languages.registerCodeActionsProvider(
 		{ language: 'csharp', scheme: 'file' },
@@ -131,6 +159,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			}
 		})
 	);
+	registerTypeAndFileNameSync(context);
 
 	// Register MapTo command
 	const generateMapToDisposable = vscode.commands.registerCommand(
@@ -587,6 +616,11 @@ export async function activate(context: vscode.ExtensionContext) {
 			decorationProvider.dispose();
 		}
 	});
+}
+
+async function updateHasSolutionContext(): Promise<void> {
+	const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**}');
+	await vscode.commands.executeCommand('setContext', 'csharppainkiller.hasSolution', solutionFiles.length > 0);
 }
 
 export function deactivate() {

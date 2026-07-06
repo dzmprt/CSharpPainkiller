@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.4",
+  "version": "0.0.5",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -26,9 +26,12 @@
     "url": "https://github.com/dzmprt/CSharpPainkiller"
   },
   "homepage": "https://github.com/dzmprt/CSharpPainkiller/blob/main/README.md",
-  "icon": "images/CSharpPainkillerLogo.png",
+  "icon": "images/logo.png.png",
   "activationEvents": [
-    "onLanguage:csharp"
+    "onLanguage:csharp",
+    "workspaceContains:**/*.csproj",
+    "workspaceContains:**/*.sln",
+    "workspaceContains:**/*.slnx"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -194,6 +197,46 @@
         "title": ".NET NEW"
       },
       {
+        "command": "csharppainkiller.projects.createProject",
+        "title": "Create .NET Project",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "csharppainkiller.projects.createFolder",
+        "title": "Create Folder",
+        "icon": "$(folder)"
+      },
+      {
+        "command": "csharppainkiller.projects.deleteFolder",
+        "title": "Delete Folder",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "csharppainkiller.projects.excludeProject",
+        "title": "Exclude Project",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "csharppainkiller.projects.includeProject",
+        "title": "Include Existing Project",
+        "icon": "$(add)"
+      },
+      {
+        "command": "csharppainkiller.projects.deleteProject",
+        "title": "Delete Project",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "csharppainkiller.projects.addProjectReference",
+        "title": "Add Project Reference",
+        "icon": "$(references)"
+      },
+      {
+        "command": "csharppainkiller.projects.removeProjectReference",
+        "title": "Remove Project Reference",
+        "icon": "$(remove)"
+      },
+      {
         "command": "csharppainkiller.efcore.cmd.addMigration",
         "title": "Add Migration"
       },
@@ -256,7 +299,114 @@
         "label": "Entity Framework CMD"
       }
     ],
+    "views": {
+      "explorer": [
+        {
+          "id": "csharppainkiller.projects",
+          "name": "Solution Structure (beta)",
+          "when": "workspaceFolderCount != 0 && csharppainkiller.hasSolution && config.csharppainkiller.solutionStructure.show"
+        }
+      ]
+    },
     "menus": {
+      "commandPalette": [
+        {
+          "command": "csharppainkiller.generateHandlerForFile",
+          "when": "config.csharppainkiller.templates.showMediatR || config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.generateFluentValidator",
+          "when": "config.csharppainkiller.templates.showFluentValidation"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.emptyController",
+          "when": "config.csharppainkiller.templates.showAspNet"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.efCrudController",
+          "when": "config.csharppainkiller.templates.showAspNet"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.emptyMinimalApi",
+          "when": "config.csharppainkiller.templates.showAspNet"
+        },
+        {
+          "command": "csharppainkiller.templates.aspnet.efCrudMinimalApi",
+          "when": "config.csharppainkiller.templates.showAspNet"
+        },
+        {
+          "command": "csharppainkiller.efcore.createConfigurationFromFolder",
+          "when": "config.csharppainkiller.templates.showEfCore"
+        },
+        {
+          "command": "csharppainkiller.efcore.createConfigurationFromFile",
+          "when": "config.csharppainkiller.templates.showEfCore"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createRequestAndHandler",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createRequest",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createHandler",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createNotificationAndHandler",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createNotification",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createNotificationHandler",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createEmptyPipelineBehavior",
+          "when": "config.csharppainkiller.templates.showMediatR"
+        },
+        {
+          "command": "csharppainkiller.templates.mediatr.createFluentValidationBehavior",
+          "when": "config.csharppainkiller.templates.showMediatR && config.csharppainkiller.templates.showFluentValidation"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createRequestAndHandler",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createRequest",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createHandler",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createNotificationAndHandler",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createNotification",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createNotificationHandler",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createEmptyPipelineBehavior",
+          "when": "config.csharppainkiller.templates.showMitMediator"
+        },
+        {
+          "command": "csharppainkiller.templates.mitmediator.createFluentValidationBehavior",
+          "when": "config.csharppainkiller.templates.showMitMediator && config.csharppainkiller.templates.showFluentValidation"
+        }
+      ],
       "explorer/context": [
         {
           "when": "explorerResourceIsFolder",
@@ -278,12 +428,12 @@
           "group": "2_csharp@3"
         },
         {
-          "when": "!explorerResourceIsFolder && resourceExtname == .cs && csharppainkiller.isMediatorFile",
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs && csharppainkiller.isMediatorFile && (config.csharppainkiller.templates.showMediatR || config.csharppainkiller.templates.showMitMediator)",
           "command": "csharppainkiller.generateHandlerForFile",
           "group": "2_csharp@4"
         },
         {
-          "when": "!explorerResourceIsFolder && resourceExtname == .cs",
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs && config.csharppainkiller.templates.showEfCore",
           "command": "csharppainkiller.efcore.createConfigurationFromFile",
           "group": "2_csharp@5"
         },
@@ -293,7 +443,7 @@
           "group": "2_csharp@6"
         },
         {
-          "when": "!explorerResourceIsFolder && resourceExtname == .cs",
+          "when": "!explorerResourceIsFolder && resourceExtname == .cs && config.csharppainkiller.templates.showFluentValidation",
           "command": "csharppainkiller.generateFluentValidator",
           "group": "2_csharp@7"
         },
@@ -306,6 +456,81 @@
           "when": "resourceExtname == .csproj",
           "submenu": "csharppainkiller.efcoreCmd",
           "group": "2_csharp@9"
+        }
+      ],
+      "editor/context": [
+        {
+          "when": "editorLangId == csharp && resourceExtname == .cs && csharppainkiller.isMediatorFile",
+          "command": "csharppainkiller.goToHandlerForFile",
+          "group": "navigation@10"
+        },
+        {
+          "when": "editorLangId == csharp && resourceExtname == .cs",
+          "command": "csharppainkiller.generateMapTo",
+          "group": "2_csharp@1"
+        },
+        {
+          "when": "editorLangId == csharp && resourceExtname == .cs",
+          "command": "csharppainkiller.generateMapFrom",
+          "group": "2_csharp@2"
+        },
+        {
+          "when": "editorLangId == csharp && resourceExtname == .cs",
+          "command": "csharppainkiller.generateDto",
+          "group": "2_csharp@3"
+        },
+        {
+          "when": "editorLangId == csharp && resourceExtname == .cs && config.csharppainkiller.templates.showFluentValidation",
+          "command": "csharppainkiller.generateFluentValidator",
+          "group": "2_csharp@4"
+        }
+      ],
+      "view/title": [],
+      "view/item/context": [
+        {
+          "command": "csharppainkiller.projects.createProject",
+          "when": "view == csharppainkiller.projects && (viewItem == csharppainkiller.solution || viewItem == csharppainkiller.folder)",
+          "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.createFolder",
+          "when": "view == csharppainkiller.projects && (viewItem == csharppainkiller.solution || viewItem == csharppainkiller.folder)",
+          "group": "inline@2"
+        },
+        {
+          "command": "csharppainkiller.projects.deleteFolder",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.folder",
+          "group": "inline@3"
+        },
+        {
+          "command": "csharppainkiller.projects.includeProject",
+          "when": "view == csharppainkiller.projects && (viewItem == csharppainkiller.excludedProjects || viewItem == csharppainkiller.excludedProject)",
+          "group": "inline@4"
+        },
+        {
+          "command": "csharppainkiller.projects.includeProject",
+          "when": "view == csharppainkiller.projects && (viewItem == csharppainkiller.solution || viewItem == csharppainkiller.folder)",
+          "group": "navigation@4"
+        },
+        {
+          "command": "csharppainkiller.projects.addProjectReference",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.referenceGroup",
+          "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.removeProjectReference",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.projectReference",
+          "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.excludeProject",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.project",
+          "group": "inline@2"
+        },
+        {
+          "command": "csharppainkiller.projects.deleteProject",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.project",
+          "group": "inline@3"
         }
       ],
       "csharppainkiller.create": [
@@ -356,18 +581,22 @@
       "csharppainkiller.templates": [
         {
           "submenu": "csharppainkiller.templates.aspnet",
+          "when": "config.csharppainkiller.templates.showAspNet",
           "group": "1_templates@1"
         },
         {
           "submenu": "csharppainkiller.templates.mediatr",
+          "when": "config.csharppainkiller.templates.showMediatR",
           "group": "1_templates@2"
         },
         {
           "submenu": "csharppainkiller.templates.mitmediator",
+          "when": "config.csharppainkiller.templates.showMitMediator",
           "group": "1_templates@3"
         },
         {
           "submenu": "csharppainkiller.efcore",
+          "when": "config.csharppainkiller.templates.showEfCore",
           "group": "1_templates@4"
         }
       ],
@@ -426,6 +655,7 @@
         },
         {
           "command": "csharppainkiller.templates.mediatr.createFluentValidationBehavior",
+          "when": "config.csharppainkiller.templates.showFluentValidation",
           "group": "1_pipeline@2"
         }
       ],
@@ -466,6 +696,7 @@
         },
         {
           "command": "csharppainkiller.templates.mitmediator.createFluentValidationBehavior",
+          "when": "config.csharppainkiller.templates.showFluentValidation",
           "group": "1_pipeline@2"
         }
       ],
@@ -498,7 +729,46 @@
         }
       ]
     },
-    "configuration": []
+    "configuration": {
+      "title": "C# Painkiller",
+      "properties": {
+        "csharppainkiller.templates.showMediatR": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show MediatR generator commands in C# Painkiller template menus."
+        },
+        "csharppainkiller.templates.showMitMediator": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show MitMediator generator commands in C# Painkiller template menus."
+        },
+        "csharppainkiller.templates.showAspNet": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show ASP.NET generator commands in C# Painkiller template menus."
+        },
+        "csharppainkiller.templates.showEfCore": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show EF Core configuration generator commands in C# Painkiller template menus."
+        },
+        "csharppainkiller.templates.showFluentValidation": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show FluentValidation generator commands in C# Painkiller menus and code actions."
+        },
+        "csharppainkiller.solutionStructure.show": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Show the Solution Structure (beta) view in the Explorer sidebar when a solution file exists."
+        },
+        "csharppainkiller.syncTypeAndFileName": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically rename the `.cs` file when the single type inside it is renamed (on save), and rename the type name when the file is renamed."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",

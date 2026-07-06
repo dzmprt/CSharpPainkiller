@@ -13,12 +13,11 @@ export function fastContentHash(content: string): string {
 	let hash = 0x811c9dc5; // FNV offset basis (32-bit)
 
 	for (let i = 0; i < content.length; i++) {
-		// XOR with character code (only need lower 8 bits for speed)
-		hash ^= content.charCodeAt(i) & 0xff;
+		// XOR with full character code (not masked to 8 bits — preserves Unicode distinctness)
+		hash ^= content.charCodeAt(i);
 
-		// FNV prime: multiply by 2^24 + 2^8 + 0x93 (little-endian optimized)
-		hash = ((hash << 5) + hash) ^ (hash >>> 27); // equivalent to hash * 31
-		hash |= 0; // ensure signed 32-bit
+		// Multiply by FNV prime 0x01000193 using Math.imul for correct 32-bit overflow
+		hash = Math.imul(hash, 0x01000193);
 	}
 
 	// Convert to unsigned hex string (8 chars)

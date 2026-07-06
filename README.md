@@ -17,9 +17,11 @@ Smart file creation, code generation, project creation, namespace management and
 ## Table of Contents
 
 - [Features](#features)
+  - [Solution Structure](#solution-structure)
   - [Create C# Types](#create-c-types)
   - [Adjust Namespaces](#adjust-namespaces)
   - [Rename File By Type](#rename-file-by-type)
+  - [Sync Type and File Name](#sync-type-and-file-name)
   - [Generate Mapping Methods](#generate-mapping-methods)
   - [Generate DTO](#generate-dto)
   - [Generate FluentValidation Validator](#generate-fluentvalidation-validator)
@@ -33,10 +35,19 @@ Smart file creation, code generation, project creation, namespace management and
   - [Entity Framework CMD](#ef-core-cmd)
   - [Go To Handler](#go-to-handler)
   - [Color for projects](#color-for-projects)
+  - [Settings](#settings)
 - [Issues](#issues)
 - [Release Notes](#release-notes)
 
 ## Features
+
+### Solution Structure
+
+Explore and manage your `.sln` / `.slnx` solution directly from a dedicated **Solution Structure (beta)** panel in the Explorer sidebar. The panel appears automatically when a solution file is detected in the workspace.
+
+![Solution Structure demo](images/SolutionExplorer.gif)
+
+> The panel can be hidden via the `csharppainkiller.solutionStructure.show` setting.
 
 ### Create C# Types
 
@@ -54,14 +65,17 @@ Fix namespace declarations across one file or an entire folder in a single actio
 
 Rename `.cs` files to match the C# type they contain. Right-click a file or folder → **C# Refactor → C# Rename File By Type**.
 
-![Rename File By Type demo](images/RenameFile.gif)
+### Sync Type and File Name
+
+When you change the `.cs` file name, the name of the object in the file changes and vice versa.
+
+Supported type kinds: `class`, `record`, `struct`, `record struct`.
+
+> Can be disabled via the `csharppainkiller.syncTypeAndFileName` setting.
 
 ### Generate Mapping Methods
 
-Generate static `MapTo{TargetType}` / `MapFrom{TargetType}` methods for mapping between types. Place the cursor on a type name and use the lightbulb (**Quick Fix** / **Refactor**) code actions:
-
-- **Generate MapTo method**
-- **Generate MapFrom method**
+Generate static `MapTo{TargetType}` / `MapFrom{TargetType}` methods for mapping between types
 
 The extension prompts for the target type, maps matching public properties, and inserts the method at the end of the source type.
 
@@ -71,25 +85,13 @@ The extension prompts for the target type, maps matching public properties, and 
 
 Scaffold a DTO class with matching public properties and a static `MapFrom{SourceType}` factory method inside the DTO.
 
-- **Explorer** — right-click a `.cs` file → **Generate DTO with MapFrom**
-- **Editor** — place the cursor on a type name → lightbulb → **Generate DTO with MapFrom in DTO**
-
-The DTO file is created next to the source file. You can customize the DTO name in the input prompt.
-
 ### Generate FluentValidation Validator
 
 Generate a FluentValidation `AbstractValidator<T>` for a class, record, or struct based on its public properties. Rules are inferred from property types (strings, numbers, dates, enums, collections, and more).
 
-- **Explorer** — right-click a `.cs` file → **Generate FluentValidation Validator**
-- **Editor** — place the cursor on a type name → lightbulb → **Generate FluentValidation validator**
-
-The validator file (`{TypeName}Validator.cs`) is created next to the source file.
-
 ### Extract Type to File
 
-Move a type from a multi-type file into its own `{TypeName}.cs` file. Place the cursor on the type name and choose the lightbulb quick fix **Extract '{TypeName}' to file**.
-
-Supported types: class, struct, record, record struct, enum, and interface. Partial types cannot be extracted. The new file keeps relevant `using` directives, namespace, and XML documentation from the source file.
+Move a type from a multi-type file into its own `{TypeName}.cs` file
 
 ### Sort Usings
 
@@ -101,22 +103,16 @@ Generate an interface from a class definition in one click. Right-click a `.cs` 
 
 ### .NET Project Creation
 
-Scaffold new .NET projects using dynamic templates from `dotnet new list`. Right-click a **folder** in the Explorer → **.NET NEW**. The extension dynamically fetches available .NET templates and registers them as commands at startup, allowing you to create any project type supported by the .NET SDK.
+Scaffold new .NET projects using dynamic templates from `dotnet new list`. The extension dynamically fetches available .NET templates and registers them as commands at startup, allowing you to create any project type supported by the .NET SDK.
 
-![ASP.NET Templates demo](images/NETProjectCreation.gif)
+![NET Project Creation demo 2](images/NETProjectCreation_2.png)
+![NET Project Creation demo 1](images/NETProjectCreation_1.png)
 
 ### ASP.NET Templates
 
 Scaffold ASP.NET controllers and Minimal API endpoints. Right-click a folder → **C# Generator → ASP.NET**.
 
-![ASP.NET Templates demo](images/AspnetTemplatesGenerate.gif)
-
-| Template | Description |
-|----------|-------------|
-| **Empty Controller** | Bare-bones `[ApiController]` class |
-| **EF CRUD Controller** | Full CRUD controller wired to `DbContext` |
-| **Empty Minimal API** | Minimal API endpoint group stub |
-| **EF CRUD Minimal API** | Full CRUD Minimal API wired to `DbContext` |
+![ASP.NET Templates demo](images/AspnetTemplatesGenerate.png)
 
 
 ### MediatR and MitMediator templates
@@ -124,17 +120,6 @@ Scaffold ASP.NET controllers and Minimal API endpoints. Right-click a folder →
 Generate requests, handlers, notifications, and pipeline behaviors. Right-click a folder → **C# Generator → MediatR/MitMediator**. It is not necessary to enter the full name of the request, if it is a base request like "get, create, delete, update or other" the extension will automatically substitute the name and determine whether it is a command or a query.
 
 ![MediatR Templates demo](images/MediatrTemplatesDemo.gif)
-
-| Template | Description |
-|----------|-------------|
-| **Request and Handler** | `IRequest` + `IRequestHandler` pair |
-| **Request** | `IRequest` only |
-| **RequestHandler** | `IRequestHandler` only |
-| **Notification and Handler** | `INotification` + `INotificationHandler` pair |
-| **Notification** | `INotification` only |
-| **NotificationHandler** | `INotificationHandler` only |
-| **Empty PipelineBehavior** | Blank `IPipelineBehavior` |
-| **FluentValidation PipelineBehavior** | Validation behavior using FluentValidation |
 
 ### EF Core Configuration
 
@@ -145,14 +130,6 @@ Scaffold Entity Framework Core entity configurations. Right-click a folder → *
 ### Entity Framework CMD
 
 Run Entity Framework Core migration commands directly from the Explorer context menu on a `.csproj` file:
-
-| Command | Description |
-|---------|-------------|
-| **Add Migration** | Add a new EF Core migration |
-| **Remove Migration** | Remove the last migration |
-| **Update Database** | Update the database to the latest migration |
-| **List Migrations** | List all available migrations |
-| **Script Migration** | Generate a SQL script for migrations |
 
 ![Entity Framework CMD demo](images/EntityFrameworkCMDdemo.png)
 
@@ -165,11 +142,25 @@ Navigate between a MediatR/MitMediator request or notification file and its hand
 
 Code actions in the editor offer the same navigation when the cursor is on a request or notification type.
 
-![Go To Handler demo](images/goToHandler.gif)
+![Go To Handler demo](images/goToHandler.png)
 
 ### Color for projects
 
 The names of the folders containing project files are highlighted in purple.
+
+### Settings
+
+Use VS Code settings (`Ctrl+,` / `Cmd+,`) to control which feature groups are visible in context menus and code actions:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `csharppainkiller.templates.showMediatR` | `true` | Show MediatR generator commands |
+| `csharppainkiller.templates.showMitMediator` | `true` | Show MitMediator generator commands |
+| `csharppainkiller.templates.showAspNet` | `true` | Show ASP.NET generator commands |
+| `csharppainkiller.templates.showEfCore` | `true` | Show EF Core configuration commands |
+| `csharppainkiller.templates.showFluentValidation` | `true` | Show FluentValidation commands |
+| `csharppainkiller.solutionStructure.show` | `true` | Show the Solution Structure panel in the Explorer sidebar |
+| `csharppainkiller.syncTypeAndFileName` | `true` | Automatically rename the `.cs` file when the single type inside it is renamed (on save), and rename the type when the file is renamed |
 
 ## Issues
 
@@ -177,39 +168,4 @@ The names of the folders containing project files are highlighted in purple.
 
 ## Release Notes
 
-### 0.0.4
-
-- Added **Generate DTO with MapFrom** — creates a DTO file with properties and a static `MapFrom{SourceType}` method
-- Added **Generate FluentValidation Validator** — scaffolds `AbstractValidator<T>` with type-aware rules
-- Added **Extract Type to File** — quick fix code action to move a type from a multi-type file into its own file
-- Improved **MapTo / MapFrom** generation — methods are now `static` with type-specific names (`MapToTarget`, `MapFromTarget`), code actions work on the type under the cursor
-- Fixed **Adjust Namespaces** — `using` directives are updated only when a file actually references moved types
-- Fixed **Extract Interface** menu — shown only for `.cs` files, not folders
-- Fixed **Go To Handler / Generate Handler** — nested generic return types (e.g. `IRequest<List<Author>>`) are parsed correctly
-- Fixed **MitMediator Handler** generation for void requests — `IRequestHandler<TRequest>` with `ValueTask<Unit> HandleAsync(...)`
-- Fixed type parsing for **Rename File By Type** — `record struct`, block-scoped namespaces with nested braces, and ambiguous multi-type files
-
-### 0.0.3
-
-- Added **Entity Framework CMD** commands — Add Migration, Remove Migration, Update Database, List Migrations, Script Migration via `dotnet ef` CLI. Added **Entity Framework CMD** submenu to `.csproj` file context menu
-- Custom color for C# project folders
-
-### 0.0.2
-
-- Added **.NET Project Creation** (`.NET NEW`) — dynamic template scaffolding from `dotnet new list`
-- Real-time diagnostics have been removed due to performance issues. This may be added in the future
-- Changed sort usings logic
-
-### 0.0.1
-
-Initial release with:
-- C# type creation (class, record, struct, enum, interface, record struct)
-- Namespace adjustment for files and folders with automatic `using` directive updates
-- File renaming based on the contained C# type name
-- Sort usings, extract interface, generate MapTo/MapFrom mapping methods
-- ASP.NET templates (Empty Controller, EF CRUD Controller, Empty Minimal API, EF CRUD Minimal API)
-- MediatR and MitMediator templates (Request, Handler, Notification, PipelineBehavior)
-- EF Core Entity Configuration generation
-- Real-time diagnostics (wrong namespace, wrong filename, unsorted usings, mixed-language identifiers)
-- Generate Request and handler for MediatR and MitMediator request files
-- Go To Handler navigation for MediatR and MitMediator
+See [CHANGELOG.md](CHANGELOG.md) for the full version history.

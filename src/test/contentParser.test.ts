@@ -121,6 +121,37 @@ suite('contentParser', () => {
 		test('returns null when no types found', () => {
 			assert.strictEqual(searchTypesByVisibility('namespace MyApp;', 'public'), null);
 		});
+
+		// Bug 3 regression: internal record struct was misdetected as type=record, name=struct
+		test('correctly detects internal record struct — name is not "struct"', () => {
+			const content = 'namespace MyApp;\n\ninternal record struct MyPoint { }';
+			const result = searchTypesByVisibility(content, 'internal');
+			assert.notStrictEqual(result, 'ambiguous');
+			assert.ok(result !== null && result !== 'ambiguous');
+			assert.strictEqual(result.name, 'MyPoint');
+			assert.strictEqual(result.type, 'record struct');
+		});
+
+		test('correctly detects internal readonly record struct', () => {
+			const content = 'namespace MyApp;\n\ninternal readonly record struct Point;';
+			const result = searchTypesByVisibility(content, 'internal');
+			assert.ok(result !== null && result !== 'ambiguous');
+			assert.strictEqual(result.name, 'Point');
+			assert.strictEqual(result.type, 'record struct');
+		});
+
+		test('internal record struct does not shadow internal record', () => {
+			const content = 'namespace MyApp;\n\ninternal record MyEvent;';
+			const result = searchTypesByVisibility(content, 'internal');
+			assert.ok(result !== null && result !== 'ambiguous');
+			assert.strictEqual(result.name, 'MyEvent');
+			assert.strictEqual(result.type, 'record');
+		});
+
+		test('ambiguous when internal record struct and internal class coexist', () => {
+			const content = 'namespace MyApp;\n\ninternal record struct Point;\ninternal class Helper { }';
+			assert.strictEqual(searchTypesByVisibility(content, 'internal'), 'ambiguous');
+		});
 	});
 
 	suite('getPublicTypeName', () => {
@@ -141,6 +172,23 @@ suite('contentParser', () => {
 			const content = 'namespace MyApp;\n\ninternal class Hidden { }';
 			const result = getTypeNameForFileDiagnostic(content);
 			assert.deepStrictEqual(result, { name: 'Hidden', type: 'class' });
+		});
+
+		// Bug 3 regression: internal record struct must produce correct type name
+		test('correctly identifies internal record struct for filename diagnostic', () => {
+			const content = 'namespace MyApp;\n\ninternal record struct Coordinate;';
+			const result = getTypeNameForFileDiagnostic(content);
+			assert.ok(result !== null && result !== 'ambiguous');
+			assert.strictEqual(result.name, 'Coordinate');
+			assert.strictEqual(result.type, 'record struct');
+		});
+
+		test('correctly identifies internal readonly record struct for filename diagnostic', () => {
+			const content = 'namespace MyApp;\n\ninternal readonly record struct Vector3;';
+			const result = getTypeNameForFileDiagnostic(content);
+			assert.ok(result !== null && result !== 'ambiguous');
+			assert.strictEqual(result.name, 'Vector3');
+			assert.strictEqual(result.type, 'record struct');
 		});
 	});
 

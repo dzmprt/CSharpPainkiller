@@ -184,19 +184,22 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 			matches.push({ name: match[2], type: match[1] as CType });
 		}
 	} else {
-		// Search for internal types (explicit "internal" keyword)
-		const internalRegex = new RegExp(
-			`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}((?:readonly\\s+)?record\\s+struct\\s+)?(class|record|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+		// Match internal record struct first (most specific) to avoid misdetection
+		// where the regex engine backtracks and captures 'struct' as the type name
+		const internalRecordStructRegex = new RegExp(
+			`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}(?:readonly\\s+)?record\\s+struct\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
 		);
 		let match;
+		while ((match = internalRecordStructRegex.exec(content)) !== null) {
+			matches.push({ name: match[1], type: 'record struct' });
+		}
+
+		// Search for other internal types (class, record, struct, enum, interface)
+		const internalRegex = new RegExp(
+			`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}(class|record(?!\\s+struct\\b)|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+		);
 		while ((match = internalRegex.exec(content)) !== null) {
-			const typeName = match[3];
-			const isRecordStruct = match[1] !== undefined;
-			if (isRecordStruct) {
-				matches.push({ name: typeName, type: 'record struct' });
-			} else {
-				matches.push({ name: typeName, type: match[2] as CType });
-			}
+			matches.push({ name: match[2], type: match[1] as CType });
 		}
 
 		// If no internal types found, search for types without any access modifier
@@ -283,16 +286,21 @@ export function getTypeNameForFileDiagnostic(content: string): TypeSearchResult 
 
 	// 2. No public types – check only explicitly declared internal types (no fallback to unmodified)
 	const internalMatches: { name: string; type: CType }[] = [];
-	const internalRegex = new RegExp(
-		`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}((?:readonly\\s+)?record\\s+struct\\s+)?(class|record|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+
+	// Match internal record struct first to avoid the backtracking misdetection bug
+	const internalRecordStructRegex2 = new RegExp(
+		`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}(?:readonly\\s+)?record\\s+struct\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
 	);
 	let match;
+	while ((match = internalRecordStructRegex2.exec(content)) !== null) {
+		internalMatches.push({ name: match[1], type: 'record struct' });
+	}
+
+	const internalRegex = new RegExp(
+		`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}(class|record(?!\\s+struct\\b)|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+	);
 	while ((match = internalRegex.exec(content)) !== null) {
-		const isRecordStruct = match[1] !== undefined;
-		internalMatches.push({
-			name: match[3],
-			type: isRecordStruct ? 'record struct' : match[2] as CType,
-		});
+		internalMatches.push({ name: match[2], type: match[1] as CType });
 	}
 
 	if (internalMatches.length === 0) {
