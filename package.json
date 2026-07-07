@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "engines": {
     "vscode": "^1.92.0"
   },

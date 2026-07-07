@@ -1469,7 +1469,7 @@ function addSlnxFolder(content: string, folderName: string, parentPath?: string)
 		}
 	}
 
-	const folderXml = `  <Folder Name="${escapeXml(folderName)}" />\n`;
+	const folderXml = `  <Folder Name="/${escapeXml(folderName)}/" />\n`;
 	const solutionCloseIndex = content.lastIndexOf('</Solution>');
 	return solutionCloseIndex >= 0
 		? `${content.slice(0, solutionCloseIndex)}${folderXml}${content.slice(solutionCloseIndex)}`
@@ -1504,7 +1504,7 @@ function insertFolderIntoSlnxFolder(content: string, targetFolderPath: string, f
 
 	const indent = getLineIndent(content, folderStart.index);
 	const childIndent = `${indent}  `;
-	const folderXml = `${childIndent}<Folder Name="${escapeXml(folderName)}" />\n`;
+	const folderXml = `${childIndent}<Folder Name="/${escapeXml(folderName)}/" />\n`;
 
 	if (folderStart.isSelfClosing) {
 		const openTag = content.slice(folderStart.index, folderStart.end).replace(/\s*\/>$/, '>');

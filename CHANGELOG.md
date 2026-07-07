@@ -4,6 +4,12 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.7]
+
+### Fixed
+
+- **Solution Structure `.slnx` folders** — solution folders were written as `<Folder Name="src" />` instead of the correct `<Folder Name="/src/" />` (leading and trailing slashes required by the `.slnx` format)
+
 ## [0.0.6]
 
 ### Added
