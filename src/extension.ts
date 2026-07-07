@@ -135,6 +135,12 @@ export async function activate(context: vscode.ExtensionContext) {
 		}),
 		vscode.commands.registerCommand('csharppainkiller.projects.removeProjectReference', async (item) => {
 			await projectsTreeProvider.removeProjectReference(item);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.addPackageReference', async (item) => {
+			await projectsTreeProvider.addPackageReference(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.removePackageReference', async (item) => {
+			await projectsTreeProvider.removePackageReference(item ?? projectsTreeView.selection[0]);
 		})
 	);
 	console.log('File decoration provider registered');

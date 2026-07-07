@@ -672,7 +672,7 @@ function findSlnProjectGuidByPath(content: string, normalizedProjectPath: string
 }
 
 function findSlnFolderGuidByPath(content: string, normalizedFolderPath: string): string | undefined {
-  const solutionFolderTypeGuid = '66a26720-8fb5-11d2-aa7e-00c04f688dDE'.toLowerCase();
+  const solutionFolderTypeGuid = '2150e333-8fdc-42a3-9474-1a3956d46de8';
   const entries = new Map<string, { name: string; parentGuid?: string; isFolder: boolean }>();
   const projectRegex = /^Project\("\{([^}]+)\}"\)\s*=\s*"([^"]+)",\s*"[^"]+",\s*"\{([^}]+)\}"/gm;
   let match: RegExpExecArray | null;

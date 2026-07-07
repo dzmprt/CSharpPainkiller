@@ -4,6 +4,20 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.6]
+
+### Added
+
+- **NuGet Package Management** — add/remove NuGet packages from the Solution Structure panel. Search across `nuget.config` sources (falls back to nuget.org), toggle pre-release, pick a version
+
+### Changed
+
+- **Solution Structure** — project nodes show target framework (e.g. `net8.0`) instead of generic type labels
+
+### Fixed
+
+- Extension icon path typo (`logo.png.png` → `logo.png`)
+
 ## [0.0.5]
 
 ### Added

@@ -43,11 +43,14 @@ Smart file creation, code generation, project creation, namespace management and
 
 ### Solution Structure
 
-Explore and manage your `.sln` / `.slnx` solution directly from a dedicated **Solution Structure (beta)** panel in the Explorer sidebar. The panel appears automatically when a solution file is detected in the workspace.
+Explore and manage your `.sln` / `.slnx` solution from the **Solution Structure (beta)** panel in the Explorer sidebar.
 
 ![Solution Structure demo](images/SolutionExplorer.gif)
 
-> The panel can be hidden via the `csharppainkiller.solutionStructure.show` setting.
+- Create/delete solution folders and projects, manage project references
+- Add/remove NuGet packages — search across `nuget.config` sources with pre-release toggle and version picker
+
+> Hide with the `csharppainkiller.solutionStructure.show` setting.
 
 ### Create C# Types
 

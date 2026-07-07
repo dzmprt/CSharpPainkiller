@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as pathModule from 'path';
 import { spawnSync } from 'child_process';
+import { showAddPackagePicker } from '../services/nugetCommands.js';
 
 type CsprojTreeNode =
 	| SolutionNode
@@ -47,6 +48,7 @@ interface ProjectNode {
 	isAspNet: boolean;
 	isTest: boolean;
 	virtualPath?: string;
+	targetFramework?: string;
 }
 
 interface ReferenceGroupNode {
@@ -59,6 +61,7 @@ interface ReferenceGroupNode {
 interface PackageGroupNode {
 	kind: 'packageGroup';
 	label: string;
+	project: ProjectNode;
 	children: PackageReferenceNode[];
 }
 
@@ -73,6 +76,7 @@ interface PackageReferenceNode {
 	kind: 'packageReference';
 	label: string;
 	version?: string;
+	project: ProjectNode;
 }
 
 interface ExcludedProjectsNode {
@@ -108,7 +112,7 @@ interface DraggedProjectPayload {
 	virtualPath?: string;
 }
 
-const SOLUTION_FOLDER_TYPE_GUID = '66a26720-8fb5-11d2-aa7e-00c04f688dDE'.toLowerCase();
+const SOLUTION_FOLDER_TYPE_GUID = '2150e333-8fdc-42a3-9474-1a3956d46de8';
 const PROJECT_TREE_DRAG_MIME = 'application/vnd.csharppainkiller.project';
 
 export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<CsprojProjectTreeItem>, vscode.TreeDragAndDropController<CsprojProjectTreeItem>, vscode.Disposable {
@@ -224,13 +228,12 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				kind: 'packageReference' as const,
 				label: pkg.name,
 				version: pkg.version,
+				project,
 			}));
 
 		const children: CsprojTreeNode[] = [];
 		children.push({ kind: 'referenceGroup', label: 'Project References', project, children: references });
-		if (packages.length > 0) {
-			children.push({ kind: 'packageGroup', label: 'Packages', children: packages });
-		}
+		children.push({ kind: 'packageGroup', label: 'Packages', project, children: packages });
 		return children;
 	}
 
@@ -609,6 +612,49 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 	}
 
+	async addPackageReference(item?: CsprojProjectTreeItem): Promise<void> {
+		const project = item?.node.kind === 'packageGroup'
+			? item.node.project
+			: item?.node.kind === 'project'
+				? item.node
+				: undefined;
+		if (!project) {
+			vscode.window.showErrorMessage('CSharp Painkiller: Select a project or its Packages group.');
+			return;
+		}
+
+		const result = await showAddPackagePicker(project.csprojUri.fsPath);
+		if (!result) {
+			return;
+		}
+
+		const content = await readUtf8(project.csprojUri);
+		const updated = addPackageReferenceToCsproj(content, result.id, result.version);
+		await vscode.workspace.fs.writeFile(project.csprojUri, Buffer.from(updated, 'utf-8'));
+		this.refresh();
+	}
+
+	async removePackageReference(item?: CsprojProjectTreeItem): Promise<void> {
+		if (!item || item.node.kind !== 'packageReference') {
+			vscode.window.showErrorMessage('CSharp Painkiller: Select a package reference to remove.');
+			return;
+		}
+
+		const answer = await vscode.window.showWarningMessage(
+			`Remove package "${item.node.label}"?`,
+			{ modal: true },
+			'Remove'
+		);
+		if (answer !== 'Remove') {
+			return;
+		}
+
+		const content = await readUtf8(item.node.project.csprojUri);
+		const updated = removePackageReferenceFromCsproj(content, item.node.label);
+		await vscode.workspace.fs.writeFile(item.node.project.csprojUri, Buffer.from(updated, 'utf-8'));
+		this.refresh();
+	}
+
 	async removeProjectReference(item?: CsprojProjectTreeItem): Promise<void> {
 		if (!item || item.node.kind !== 'projectReference') {
 			vscode.window.showErrorMessage('CSharp Painkiller: Select a project reference.');
@@ -930,6 +976,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			isAspNet: await this.isAspNetProject(csprojUri),
 			isTest: await this.isTestProject(csprojUri),
 			virtualPath,
+			targetFramework: await this.getTargetFramework(csprojUri),
 		};
 	}
 
@@ -954,6 +1001,24 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 	}
 
+	private async getTargetFramework(csprojUri: vscode.Uri): Promise<string | undefined> {
+		try {
+			const bytes = await vscode.workspace.fs.readFile(csprojUri);
+			const content = Buffer.from(bytes).toString('utf-8');
+			const single = content.match(/<TargetFramework>\s*([^<]+?)\s*<\/TargetFramework>/i);
+			if (single) {
+				return single[1].trim();
+			}
+			const multi = content.match(/<TargetFrameworks>\s*([^<]+?)\s*<\/TargetFrameworks>/i);
+			if (multi) {
+				return multi[1].trim().split(';')[0].trim();
+			}
+			return undefined;
+		} catch {
+			return undefined;
+		}
+	}
+
 	dispose(): void {
 		this.watcher.dispose();
 		this.solutionWatcher.dispose();
@@ -973,7 +1038,8 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 		this.contextValue = `csharppainkiller.${node.kind}`;
 
 		if (node.kind === 'project') {
-			this.description = node.virtualPath ?? (node.isTest ? 'Tests' : node.isAspNet ? 'ASP.NET' : '.NET');
+			const parts = [node.targetFramework, node.virtualPath].filter(Boolean);
+			this.description = parts.length > 0 ? parts.join(', ') : undefined;
 			this.tooltip = `${node.virtualPath ? `Solution path: ${node.virtualPath}\n` : ''}${node.csprojUri.fsPath}`;
 			this.updateProjectIcon(extensionUri);
 			this.command = {
@@ -1781,6 +1847,30 @@ function parsePackageReferences(content: string): { name: string; version?: stri
 	return packages;
 }
 
+function addPackageReferenceToCsproj(content: string, packageId: string, version: string): string {
+	const referenceXml = `  <ItemGroup>\n    <PackageReference Include="${escapeXml(packageId)}" Version="${escapeXml(version)}" />\n  </ItemGroup>\n`;
+	const projectCloseIndex = content.lastIndexOf('</Project>');
+	return projectCloseIndex >= 0
+		? `${content.slice(0, projectCloseIndex)}${referenceXml}${content.slice(projectCloseIndex)}`
+		: `${content.trimEnd()}\n${referenceXml}`;
+}
+
+function removePackageReferenceFromCsproj(content: string, packageId: string): string {
+	const escapedId = escapeRegExp(packageId);
+	// Self-closing: <PackageReference Include="Id" ... />
+	let updated = content.replace(
+		new RegExp(`^[ \\t]*<PackageReference\\b[^>]*\\bInclude="${escapedId}"[^>]*/>[ \\t]*\\r?\\n?`, 'gmi'),
+		''
+	);
+	// Multi-line: <PackageReference Include="Id">...</PackageReference>
+	updated = updated.replace(
+		new RegExp(`^[ \\t]*<PackageReference\\b[^>]*\\bInclude="${escapedId}"[^>]*>[\\s\\S]*?</PackageReference>[ \\t]*\\r?\\n?`, 'gmi'),
+		''
+	);
+	updated = updated.replace(/<ItemGroup>\s*<\/ItemGroup>\r?\n?/g, '');
+	return removeExtraBlankLines(updated);
+}
+
 function addProjectReferenceToCsproj(content: string, relativePath: string): string {
 	const referenceXml = `  <ItemGroup>\n    <ProjectReference Include="${escapeXml(relativePath)}" />\n  </ItemGroup>\n`;
 	const projectCloseIndex = content.lastIndexOf('</Project>');
@@ -1825,7 +1915,12 @@ function getNodeId(node: CsprojTreeNode): string {
 	if (node.kind === 'excludedProject') {
 		return `excludedProject:${node.csprojUri.toString()}`;
 	}
-	return `packageReference:${node.label}:${node.version ?? ''}`;
+	if (node.kind === 'packageReference') {
+		return `packageReference:${node.project.csprojUri.toString()}:${node.label}:${node.version ?? ''}`;
+	}
+	// exhaustive — TypeScript will error here if a new kind is added without handling
+	const _exhaustive: never = node;
+	return String(_exhaustive);
 }
 
 function parseDraggedProjects(raw: string): ProjectNode[] {

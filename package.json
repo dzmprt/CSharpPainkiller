@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.5",
+  "version": "0.0.6",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -26,7 +26,7 @@
     "url": "https://github.com/dzmprt/CSharpPainkiller"
   },
   "homepage": "https://github.com/dzmprt/CSharpPainkiller/blob/main/README.md",
-  "icon": "images/logo.png.png",
+  "icon": "images/logo.png",
   "activationEvents": [
     "onLanguage:csharp",
     "workspaceContains:**/*.csproj",
@@ -234,6 +234,16 @@
       {
         "command": "csharppainkiller.projects.removeProjectReference",
         "title": "Remove Project Reference",
+        "icon": "$(remove)"
+      },
+      {
+        "command": "csharppainkiller.projects.addPackageReference",
+        "title": "Add NuGet Package",
+        "icon": "$(add)"
+      },
+      {
+        "command": "csharppainkiller.projects.removePackageReference",
+        "title": "Remove NuGet Package",
         "icon": "$(remove)"
       },
       {
@@ -521,6 +531,21 @@
           "command": "csharppainkiller.projects.removeProjectReference",
           "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.projectReference",
           "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.addPackageReference",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.packageGroup",
+          "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.removePackageReference",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.packageReference",
+          "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.addPackageReference",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.project",
+          "group": "navigation@5"
         },
         {
           "command": "csharppainkiller.projects.excludeProject",
