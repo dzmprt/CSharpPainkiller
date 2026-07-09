@@ -10,6 +10,7 @@ export const DIAGNOSTIC_CODE_NAMESPACE = 'wrong-namespace';
 export const DIAGNOSTIC_CODE_FILENAME = 'wrong-filename';
 export const DIAGNOSTIC_CODE_UNSORTED_USINGS = 'unsorted-usings';
 export const DIAGNOSTIC_CODE_MIXED_LANGUAGE = 'mixed-language-identifier';
+export const DIAGNOSTIC_CODE_DUPLICATE_TYPE_NAME = 'duplicate-type-name';
 
 // ============================================================================
 // Scheduler import — handles batch processing and debounce optimization
@@ -19,9 +20,17 @@ import { runDiagnosticsInBatches } from './scheduler.js';
 // ============================================================================
 // Content parser and namespace utilities (static imports)
 // ============================================================================
-import { extractFileNamespace, getTypeNameForFileDiagnostic, hasPartialTypes, findMixedLanguageIdentifiers } from '../utils/contentParser.js';
+import {
+	extractFileNamespace,
+	getTypeNameForFileDiagnostic,
+	hasPartialTypes,
+	findMixedLanguageIdentifiers,
+	extractTypesFromContent,
+} from '../utils/contentParser.js';
 import { deriveNamespaceFromFile } from '../namespace/compute.js';
 import { isPathExcluded } from '../utils/fileUtils.js';
+import { collectTopLevelUsingBlock, isUsingOrderSorted } from '../utils/usingBlock.js';
+import { ProjectTypeIndex } from '../utils/projectTypeIndex.js';
 
 // ============================================================================
 // Optimization #4: Content-based caching — avoids redundant analysis
@@ -39,10 +48,12 @@ const analysisCache = new Map<string, DiagnosticCacheEntry>();
 
 /**
  * Get cached diagnostics for a file if the content hash matches.
+ * Returns null on a miss (no entry, or the file content/analyzer settings changed
+ * since the entry was stored) so callers know to re-analyze.
  */
-function getCachedDiagnostics(uri: vscode.Uri): vscode.Diagnostic[] | null {
+function getCachedDiagnostics(uri: vscode.Uri, hash: string): vscode.Diagnostic[] | null {
 	const entry = analysisCache.get(uri.toString());
-	if (entry) {
+	if (entry && entry.hash === hash) {
 		return entry.diagnostics; // Cache hit — return precomputed diagnostics instantly.
 	}
 	return null;
@@ -92,24 +103,42 @@ interface AnalysisContext {
 	unsortedUsingsEnabled: boolean;
 	/** Whether mixed-language diagnostic is enabled. */
 	mixedLanguageEnabled: boolean;
+	/** Whether the duplicate-type-name diagnostic is enabled. */
+	duplicateTypeNameEnabled: boolean;
+}
+
+/**
+ * Explicit per-analyzer enable/disable selection. Used to override the persisted
+ * `csharppainkiller.diagnostics.*` settings for a single one-off run (e.g. the
+ * "Analyze Solution" command), without mutating the user's actual configuration.
+ */
+export interface AnalyzerSelection {
+	wrongNamespace: boolean;
+	wrongFilename: boolean;
+	unsortedUsings: boolean;
+	mixedLanguageIdentifiers: boolean;
+	duplicateTypeName: boolean;
 }
 
 /**
  * Creates a new analysis context for unified single-pass processing.
  * (Optimization #1: all diagnostics are collected in ONE pass over the file.)
+ * When `overrides` is provided, it takes precedence over the persisted settings.
  */
 function createAnalysisContext(
 	uri: vscode.Uri,
-	content: string
+	content: string,
+	overrides?: AnalyzerSelection
 ): AnalysisContext {
 	return {
 		uri,
 		content,
 		diagnostics: [],
-		namespaceEnabled: isAnalyzerEnabled('wrongNamespace'),
-		filenameEnabled: isAnalyzerEnabled('wrongFilename'),
-		unsortedUsingsEnabled: isAnalyzerEnabled('unsortedUsings'),
-		mixedLanguageEnabled: isAnalyzerEnabled('mixedLanguageIdentifiers'),
+		namespaceEnabled: overrides ? overrides.wrongNamespace : isAnalyzerEnabled('wrongNamespace'),
+		filenameEnabled: overrides ? overrides.wrongFilename : isAnalyzerEnabled('wrongFilename'),
+		unsortedUsingsEnabled: overrides ? overrides.unsortedUsings : isAnalyzerEnabled('unsortedUsings'),
+		mixedLanguageEnabled: overrides ? overrides.mixedLanguageIdentifiers : isAnalyzerEnabled('mixedLanguageIdentifiers'),
+		duplicateTypeNameEnabled: overrides ? overrides.duplicateTypeName : isAnalyzerEnabled('duplicateTypeName'),
 	};
 }
 
@@ -141,7 +170,8 @@ export async function runDiagnosticsForDocument(
  */
 export async function runDiagnosticsForUri(
 	uri: vscode.Uri,
-	collection: vscode.DiagnosticCollection
+	collection: vscode.DiagnosticCollection,
+	overrides?: AnalyzerSelection
 ): Promise<void> {
 	if (!uri.path.endsWith('.cs')) {
 		return;
@@ -151,7 +181,7 @@ export async function runDiagnosticsForUri(
 	}
 
 	const timer = performance.now();
-	await analyzeCsFile(uri, collection);
+	await analyzeCsFile(uri, collection, overrides);
 	logTiming('analyzeCsFile (URI)', performance.now() - timer);
 }
 
@@ -167,15 +197,48 @@ export async function runDiagnosticsForOpenEditors(
 	await Promise.all(promises);
 }
 
+/** Options controlling a solution-wide diagnostics run. */
+export interface WorkspaceAnalysisOptions {
+	/** Which analyzers to run; defaults to the persisted settings when omitted. */
+	overrides?: AnalyzerSelection;
+	/** Allows the caller (e.g. a progress notification) to cancel the scan between batches. */
+	token?: vscode.CancellationToken;
+	/** Invoked after each batch with the running total of processed/total files. */
+	onProgress?: (processed: number, total: number) => void;
+}
+
+/** Result summary of a solution-wide diagnostics run. */
+export interface WorkspaceAnalysisResult {
+	processed: number;
+	total: number;
+	cancelled: boolean;
+	diagnosticCount: number;
+}
+
 /**
  * Runs diagnostics for all .cs files in the workspace using batch processing.
  * Processes files in batches to limit peak memory usage on large projects.
+ * Supports an explicit analyzer selection, cancellation, and progress reporting —
+ * used by the "Analyze Solution" command for an on-demand deep scan (as opposed to
+ * the lightweight open-files-only live diagnostics).
  */
 export async function runDiagnosticsForWorkspace(
-	collection: vscode.DiagnosticCollection
-): Promise<void> {
+	collection: vscode.DiagnosticCollection,
+	options?: WorkspaceAnalysisOptions
+): Promise<WorkspaceAnalysisResult> {
 	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
-	await runDiagnosticsInBatches(collection, files);
+	const { processed, cancelled } = await runDiagnosticsInBatches(collection, files, {
+		overrides: options?.overrides,
+		token: options?.token,
+		onProgress: options?.onProgress,
+	});
+
+	let diagnosticCount = 0;
+	collection.forEach((_uri, diagnostics) => {
+		diagnosticCount += diagnostics.length;
+	});
+
+	return { processed, total: files.length, cancelled, diagnosticCount };
 }
 
 // ============================================================================
@@ -207,7 +270,8 @@ async function analyzeCsFileFromDocument(
  */
 async function analyzeCsFile(
 	uri: vscode.Uri,
-	collection: vscode.DiagnosticCollection
+	collection: vscode.DiagnosticCollection,
+	overrides?: AnalyzerSelection
 ): Promise<void> {
 	// Skip excluded paths (bin, obj)
 	if (isPathExcluded(uri.path)) {
@@ -226,7 +290,7 @@ async function analyzeCsFile(
 		return;
 	}
 
-	await runUnifiedAnalysis(uri, content, collection);
+	await runUnifiedAnalysis(uri, content, collection, overrides);
 }
 
 // ============================================================================
@@ -244,20 +308,36 @@ async function analyzeCsFile(
 async function runUnifiedAnalysis(
 	uri: vscode.Uri,
 	content: string,
-	collection: vscode.DiagnosticCollection
+	collection: vscode.DiagnosticCollection,
+	overrides?: AnalyzerSelection
 ): Promise<void> {
-	// ── Optimization #4: Cache check — skip analysis if content unchanged ──
-	const cachedDiagnostics = getCachedDiagnostics(uri);
+	// ── Create unified analysis context (Optimization #1) — also reads enabled-analyzer settings ──
+	const ctx = createAnalysisContext(uri, content, overrides);
+
+	// ── Compute cache key from BOTH content and enabled-analyzer flags (Optimization #4) ──
+	// Including the flags ensures toggling a `csharppainkiller.diagnostics.*` setting invalidates
+	// stale cache entries even when the file content itself hasn't changed.
+	const contentHash = fastContentHash(
+		`${content}\u0000${ctx.namespaceEnabled}${ctx.filenameEnabled}${ctx.unsortedUsingsEnabled}${ctx.mixedLanguageEnabled}` +
+		`${ctx.duplicateTypeNameEnabled}`
+	);
+
+	// ── Optimization #4: Cache check — skip analysis if content+settings unchanged ──
+	const cachedDiagnostics = getCachedDiagnostics(uri, contentHash);
 	if (cachedDiagnostics !== null) {
 		collection.set(uri, cachedDiagnostics);
 		return; // Cache hit — diagnostics returned instantly.
 	}
 
-	// ── Compute content hash for cache storage (Optimization #4) ──
-	const contentHash = fastContentHash(content);
-
-	// ── Create unified analysis context (Optimization #1) ──
-	const ctx = createAnalysisContext(uri, content);
+	// ── Keep the cross-file project index fresh with this file's latest content BEFORE
+	// running the duplicate-type-name analyzer that depends on it, so unsaved edits are
+	// reflected without waiting for a save + file-watcher event. Cheap (sync, no I/O) —
+	// only runs on a cache miss, i.e. only when this file's content actually changed.
+	if (ctx.duplicateTypeNameEnabled) {
+		const projectTypeIndex = ProjectTypeIndex.getInstance();
+		await projectTypeIndex.waitUntilInitialized();
+		projectTypeIndex.updateFileContent(uri, content);
+	}
 
 	// ── Single-pass: run all enabled diagnostics on the unified context ──
 	// Namespace analysis must be awaited since it calls deriveNamespaceFromFile (async).
@@ -283,6 +363,12 @@ async function runUnifiedAnalysis(
 		const t0 = performance.now();
 		analyzeMixedLanguageUnified(ctx);
 		logTiming('  mixed-lang', performance.now() - t0);
+	}
+
+	if (ctx.duplicateTypeNameEnabled) {
+		const t0 = performance.now();
+		analyzeDuplicateTypeNameUnified(ctx);
+		logTiming('  duplicate-type-name', performance.now() - t0);
 	}
 
 	const diagnostics = ctx.diagnostics;
@@ -423,47 +509,31 @@ function analyzeFileNameUnified(ctx: AnalysisContext): void {
 
 /**
  * Using sort analysis (unified — uses AnalysisContext.content).
+ * Uses the same canonical order as the "Sort Usings" command (global → System.* →
+ * other namespaces → static → alias, then alphabetically) so the diagnostic never
+ * disagrees with what the quick fix actually produces.
  */
 function analyzeUsingSortingUnified(ctx: AnalysisContext): void {
 	const content = ctx.content;
 
-	// Fast path: extract only the using lines and compare them in order.
-	const lines = content.split('\n');
-	const usingLines: { lineIndex: number; namespace: string }[] = [];
-
-	for (let i = 0; i < lines.length; i++) {
-		const m = lines[i].match(/^using\s+([\w.]+)\s*;$/);
-		if (m) {
-			usingLines.push({ lineIndex: i, namespace: m[1] });
-		}
+	const usingBlock = collectTopLevelUsingBlock(content);
+	if (!usingBlock || usingBlock.directives.length < 2) {
+		return; // No using block, or fewer than 2 directives — always considered sorted.
 	}
 
-	// If fewer than 2 usings, they are always sorted.
-	if (usingLines.length < 2) {
+	if (isUsingOrderSorted(usingBlock.directives)) {
 		return;
 	}
 
-	// Check if using lines are in alphabetical order by namespace.
-	let isSorted = true;
-	for (let i = 1; i < usingLines.length; i++) {
-		if (usingLines[i].namespace.localeCompare(usingLines[i - 1].namespace) < 0) {
-			isSorted = false;
-			break;
-		}
-	}
+	// Report on the first using directive in the block — that's where a user would
+	// look first to fix the ordering.
+	const first = usingBlock.directives[0];
+	const lineIndex = content.slice(0, first.start).split('\n').length - 1;
 
-	if (isSorted) {
-		return;
-	}
-
-	// Report on the first unsorted using line.
-	const firstUnsorted = usingLines[0];
-	const lineText = lines[firstUnsorted.lineIndex];
-
-	const range = new vscode.Range(firstUnsorted.lineIndex, 0, firstUnsorted.lineIndex, lineText.trimEnd().length);
+	const range = new vscode.Range(lineIndex, 0, lineIndex, first.fullText.trimEnd().length);
 	const diagnostic = new vscode.Diagnostic(
 		range,
-		'Using directives are not sorted.',
+		'Using directives are not sorted (expected order: System.* first, then other namespaces alphabetically).',
 		vscode.DiagnosticSeverity.Warning
 	);
 	diagnostic.source = DIAGNOSTIC_SOURCE;
@@ -488,6 +558,59 @@ function analyzeMixedLanguageUnified(ctx: AnalysisContext): void {
 		);
 		diagnostic.source = DIAGNOSTIC_SOURCE;
 		diagnostic.code = DIAGNOSTIC_CODE_MIXED_LANGUAGE;
+		ctx.diagnostics.push(diagnostic);
+	}
+}
+
+/**
+ * Finds the line/column range of a `class`/`record`/`struct` declaration's name in
+ * `content`, falling back to line 0 / the full name length if not found (keeps the
+ * diagnostic range best-effort rather than failing outright).
+ */
+function findTypeDeclarationRange(content: string, typeName: string): vscode.Range {
+	const lines = content.split('\n');
+	const escapedName = escapeRegExp(typeName);
+	const declarationRegex = new RegExp(`\\b(?:class|record|struct)\\s+(${escapedName})\\b`);
+
+	for (let i = 0; i < lines.length; i++) {
+		const match = lines[i].match(declarationRegex);
+		if (match && match.index !== undefined) {
+			const charStart = lines[i].indexOf(typeName, match.index);
+			if (charStart >= 0) {
+				return new vscode.Range(i, charStart, i, charStart + typeName.length);
+			}
+		}
+	}
+
+	return new vscode.Range(0, 0, 0, typeName.length);
+}
+
+/**
+ * Duplicate-type-name analysis (unified — cross-file via `ProjectTypeIndex`).
+ * Flags each type declared in this file that is also declared in another file within
+ * the same project (scoped per-project, so identically-named types in different
+ * projects of the same solution are not flagged).
+ */
+function analyzeDuplicateTypeNameUnified(ctx: AnalysisContext): void {
+	const { types } = extractTypesFromContent(ctx.content);
+	if (types.length === 0) {
+		return;
+	}
+
+	const index = ProjectTypeIndex.getInstance();
+	for (const type of types) {
+		if (!index.hasDuplicateTypeInProject(ctx.uri, type.name)) {
+			continue;
+		}
+
+		const range = findTypeDeclarationRange(ctx.content, type.name);
+		const diagnostic = new vscode.Diagnostic(
+			range,
+			`Type '${type.name}' is also declared in another file within this project.`,
+			vscode.DiagnosticSeverity.Warning
+		);
+		diagnostic.source = DIAGNOSTIC_SOURCE;
+		diagnostic.code = DIAGNOSTIC_CODE_DUPLICATE_TYPE_NAME;
 		ctx.diagnostics.push(diagnostic);
 	}
 }

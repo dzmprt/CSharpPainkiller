@@ -49,10 +49,15 @@ import {
 import { validateUri as validateSharedUri, resolveCommandFileContext } from './utils/sharedUtilities.js';
 
 import { CsprojCache } from './utils/csprojCache.js';
+import { ProjectTypeIndex } from './utils/projectTypeIndex.js';
 import { fetchDotnetTemplates, registerDynamicTemplateCommands } from './services/dotnetTemplates.js';
 import { CsprojFolderDecorationProvider } from './decoration/csprojFolderDecorationProvider.js';
 import { CsprojProjectsTreeProvider } from './decoration/csprojProjectsTreeProvider.js';
 import { ParserCache } from './codeActions/parserCache.js';
+import { runDiagnosticsForDocument, runDiagnosticsForOpenEditors, clearDiagnosticsCacheForUri, clearDiagnosticsCache } from './diagnostics/diagnosticsProvider.js';
+import { scheduleDiagnosticsForDocumentChange, clearDebounceForDocument } from './diagnostics/scheduler.js';
+import { CSharpDiagnosticsCodeActionProvider } from './diagnostics/codeActionProvider.js';
+import { analyzeSolutionCommand } from './services/analyzeSolution.js';
 
 /**
  * List of all "Create" commands for C# types.
@@ -92,6 +97,14 @@ export async function activate(context: vscode.ExtensionContext) {
 	console.log('CsprojCache initialized');
 
 	// -------------------------------------------------------------------------
+	// Initialize ProjectTypeIndex — backs the cross-file diagnostics (request-without-
+	// handler, duplicate-type-name). Scans the workspace in the background (not awaited)
+	// so activation isn't delayed by a full .cs file scan on large solutions; kept fresh
+	// afterwards via a file watcher and via live document updates from the diagnostics pipeline.
+	// -------------------------------------------------------------------------
+	void ProjectTypeIndex.getInstance().initialize(context);
+
+	// -------------------------------------------------------------------------
 	// Register file decoration provider for csproj folders
 	// -------------------------------------------------------------------------
 	const decorationProvider = new CsprojFolderDecorationProvider();
@@ -102,6 +115,7 @@ export async function activate(context: vscode.ExtensionContext) {
 		dragAndDropController: projectsTreeProvider,
 		showCollapseAll: false,
 	});
+	projectsTreeProvider.bindTreeView(projectsTreeView);
 	context.subscriptions.push(
 		vscode.window.registerFileDecorationProvider(decorationProvider),
 		projectsTreeView,
@@ -141,6 +155,18 @@ export async function activate(context: vscode.ExtensionContext) {
 		}),
 		vscode.commands.registerCommand('csharppainkiller.projects.removePackageReference', async (item) => {
 			await projectsTreeProvider.removePackageReference(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.updatePackageReference', async (item) => {
+			await projectsTreeProvider.updatePackageReference(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.updateAllPackageReferences', async (item) => {
+			await projectsTreeProvider.updateAllPackageReferences(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.checkPackageUpdates', async (item) => {
+			await projectsTreeProvider.checkPackageUpdates(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.openPackageVulnerability', async (item) => {
+			await projectsTreeProvider.openPackageVulnerability(item ?? projectsTreeView.selection[0]);
 		})
 	);
 	console.log('File decoration provider registered');
@@ -166,6 +192,69 @@ export async function activate(context: vscode.ExtensionContext) {
 		})
 	);
 	registerTypeAndFileNameSync(context);
+
+	// -------------------------------------------------------------------------
+	// Diagnostics: namespace-mismatch (and other opt-in) warnings.
+	// Only analyzes files that are currently open in editors — never scans the
+	// whole workspace — and edits are debounced + content-hash cached to keep
+	// performance impact minimal.
+	// -------------------------------------------------------------------------
+	const diagnosticCollection = vscode.languages.createDiagnosticCollection('csharppainkiller');
+	context.subscriptions.push(diagnosticCollection);
+
+	context.subscriptions.push(
+		vscode.languages.registerCodeActionsProvider(
+			{ language: 'csharp', scheme: 'file' },
+			new CSharpDiagnosticsCodeActionProvider(),
+			{ providedCodeActionKinds: CSharpDiagnosticsCodeActionProvider.providedCodeActionKinds }
+		)
+	);
+
+	// Analyze .cs files already open in editors at startup (no workspace-wide scan).
+	void runDiagnosticsForOpenEditors(diagnosticCollection);
+
+	context.subscriptions.push(
+		vscode.workspace.onDidOpenTextDocument(document => {
+			if (document.languageId === 'csharp' && document.uri.scheme === 'file') {
+				void runDiagnosticsForDocument(document, diagnosticCollection);
+			}
+		}),
+		vscode.workspace.onDidChangeTextDocument(event => {
+			if (event.document.languageId === 'csharp' && event.document.uri.scheme === 'file') {
+				scheduleDiagnosticsForDocumentChange(event.document, diagnosticCollection);
+			}
+		}),
+		vscode.workspace.onDidCloseTextDocument(document => {
+			if (document.languageId === 'csharp') {
+				diagnosticCollection.delete(document.uri);
+				clearDiagnosticsCacheForUri(document.uri);
+				clearDebounceForDocument(document);
+			}
+		})
+	);
+
+	// Re-analyze open editors immediately when diagnostics settings change, instead of
+	// waiting for the next edit (the cache key already includes the enabled flags, but
+	// the Problems panel otherwise wouldn't refresh until something triggers re-analysis).
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(event => {
+			if (
+				event.affectsConfiguration('csharppainkiller.diagnostics') ||
+				event.affectsConfiguration('csharppainkiller.diagnosticDebounceDelay')
+			) {
+				clearDiagnosticsCache();
+				void runDiagnosticsForOpenEditors(diagnosticCollection);
+			}
+		})
+	);
+
+	// "Analyze Solution" — on-demand deep scan of every .cs file in the workspace, with a
+	// picker to choose which analyzers to run for this one-off run (all enabled by default).
+	context.subscriptions.push(
+		vscode.commands.registerCommand('csharppainkiller.analyzeSolution', async () => {
+			await analyzeSolutionCommand(diagnosticCollection);
+		})
+	);
 
 	// Register MapTo command
 	const generateMapToDisposable = vscode.commands.registerCommand(

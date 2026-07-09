@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
+import { getFileBaseNameFromUri } from '../utils/fileUtils.js';
 import {
 	buildExtractedFileContent,
 	canExtractTypeFromFile,
@@ -18,9 +19,9 @@ export {
 export async function extractTypeToFile(document: vscode.TextDocument, typeName: string): Promise<void> {
 	const content = document.getText();
 
-	if (!canExtractTypeFromFile(content, typeName)) {
+	if (!canExtractTypeFromFile(content, typeName, getFileBaseNameFromUri(document.uri))) {
 		vscode.window.showErrorMessage(
-			`CSharp Painkiller: Cannot extract "${typeName}" — the file must contain multiple types and the selected type must not be partial.`
+			`CSharp Painkiller: Cannot extract "${typeName}" — the file must contain multiple types, the file name must not match the type name, and the selected type must not be partial.`
 		);
 		return;
 	}

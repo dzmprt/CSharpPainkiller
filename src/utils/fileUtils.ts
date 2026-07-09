@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { type CsprojInfo, type ProjectContext } from '../types.js';
+import { CsprojCache } from './csprojCache.js';
 
 // ============================================================================
 // Path segments excluded from C# file operations
@@ -110,6 +111,11 @@ export async function preloadCsprojs(_folderUri: vscode.Uri): Promise<ProjectCon
 /**
  * Finds the project directory containing the given folder.
  * Used for single-file operations and new file creation.
+ *
+ * Uses the shared `CsprojCache` instead of a fresh `workspace.findFiles` scan on every
+ * call — this function is on the hot path of the (debounced, per-keystroke) namespace
+ * diagnostic, so re-scanning the whole workspace's disk here on every edit would be a
+ * significant performance problem for large workspaces.
  */
 export async function findProjectDirectory(folderUri: vscode.Uri): Promise<string | undefined> {
 	const wsFolder = vscode.workspace.getWorkspaceFolder(folderUri);
@@ -117,30 +123,12 @@ export async function findProjectDirectory(folderUri: vscode.Uri): Promise<strin
 		return undefined;
 	}
 
-	const exclusionPattern = '{**/bin/**,**/obj/**}';
-	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', exclusionPattern);
-	if (csprojFiles.length === 0) {
+	const csprojs = await CsprojCache.getInstance().getCsprojs();
+	if (csprojs.length === 0) {
 		return undefined;
 	}
 
-	const targetPath = '/' + folderUri.path.replace(/^\/+/, '');
-
-	const containingCsprojs = csprojFiles
-		.map(uri => ({
-			uri,
-			dirPath: uri.path.replace(/\/[^/]*$/, ''),
-		}))
-		.filter(({ dirPath }) => {
-			const normalized = '/' + dirPath.replace(/^\/+/, '');
-			return targetPath === normalized || targetPath.startsWith(normalized + '/');
-		});
-
-	if (containingCsprojs.length === 0) {
-		return undefined;
-	}
-
-	containingCsprojs.sort((a, b) => b.dirPath.split('/').length - a.dirPath.split('/').length);
-	return containingCsprojs[0].dirPath;
+	return findProjectRootForPath(folderUri.path, csprojs);
 }
 
 // ============================================================================
@@ -160,6 +148,14 @@ export function getParentFolder(fileUri: vscode.Uri): vscode.Uri {
 export function getFileNameFromUri(uri: vscode.Uri): string {
 	const pathSegments = uri.path.split('/').filter(Boolean);
 	return pathSegments[pathSegments.length - 1] ?? uri.fsPath;
+}
+
+/**
+ * Extracts the file base name (without .cs extension) from a vscode.Uri.
+ */
+export function getFileBaseNameFromUri(uri: vscode.Uri): string {
+	const fileName = getFileNameFromUri(uri);
+	return fileName.endsWith('.cs') ? fileName.slice(0, -3) : fileName;
 }
 
 /**

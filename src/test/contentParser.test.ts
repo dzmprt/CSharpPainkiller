@@ -276,5 +276,20 @@ suite('contentParser', () => {
 		test('returns null for non-mediator file', () => {
 			assert.strictEqual(detectMediatorFile('namespace MyApp;\npublic class Book { }'), null);
 		});
+
+		test('regression: does not misclassify a pipeline behavior as a request', () => {
+			// The `where TRequest : IRequest<TResponse>` generic constraint contains the
+			// literal text "IRequest<...>" but is NOT part of ValidationBehavior's own
+			// base-type list — it must not be picked up as a request declaration.
+			const content = [
+				'using MediatR;',
+				'namespace MyApp;',
+				'internal class ValidationBehavior<TRequest, TResponse> : IPipelineBehavior<TRequest, TResponse>',
+				'    where TRequest : IRequest<TResponse>',
+				'{',
+				'}',
+			].join('\n');
+			assert.strictEqual(detectMediatorFile(content), null);
+		});
 	});
 });

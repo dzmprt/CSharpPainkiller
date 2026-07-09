@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as pathModule from 'path';
 import { spawnSync } from 'child_process';
-import { showAddPackagePicker } from '../services/nugetCommands.js';
+import { showAddPackagePicker, getLatestPackageVersion, getPackageDependencies, compareVersions, getProjectPackageUpdates, getProjectPackages, getProjectPackageVulnerabilities, type PackageDependencyInfo, type PackageInfo } from '../services/nugetCommands.js';
 
 type CsprojTreeNode =
 	| SolutionNode
@@ -11,8 +11,11 @@ type CsprojTreeNode =
 	| PackageGroupNode
 	| ProjectReferenceNode
 	| PackageReferenceNode
+	| PackageDependencyNode
 	| ExcludedProjectsNode
-	| ExcludedProjectNode;
+	| ExcludedProjectNode
+	| VulnerablePackagesNode
+	| VulnerablePackageNode;
 
 interface CreateFolderTarget {
 	solutionUri: vscode.Uri;
@@ -45,10 +48,13 @@ interface ProjectNode {
 	csprojUri: vscode.Uri;
 	solutionUri: vscode.Uri;
 	projectPath: string;
+	existsOnDisk: boolean;
+	solutionProjectPaths: ReadonlySet<string>;
 	isAspNet: boolean;
 	isTest: boolean;
 	virtualPath?: string;
 	targetFramework?: string;
+	languageVersion?: string;
 }
 
 interface ReferenceGroupNode {
@@ -70,13 +76,29 @@ interface ProjectReferenceNode {
 	label: string;
 	project: ProjectNode;
 	referencePath: string;
+	resolvedUri: vscode.Uri;
+	existsOnDisk: boolean;
+	includedInSolution: boolean;
 }
 
 interface PackageReferenceNode {
 	kind: 'packageReference';
 	label: string;
 	version?: string;
+	/** Latest available version found by "Check for Package Updates", if newer than `version`. */
+	latestVersion?: string;
+	/** Transitive dependencies declared by the installed version, if any (read-only display). */
+	dependencies?: PackageDependencyNode[];
 	project: ProjectNode;
+}
+
+interface PackageDependencyNode {
+	kind: 'packageDependency';
+	label: string;
+	version?: string;
+	dependencies?: PackageDependencyNode[];
+	project: ProjectNode;
+	parentPackageId: string;
 }
 
 interface ExcludedProjectsNode {
@@ -91,6 +113,22 @@ interface ExcludedProjectNode {
 	label: string;
 	solutionUri: vscode.Uri;
 	csprojUri: vscode.Uri;
+}
+
+interface VulnerablePackagesNode {
+	kind: 'vulnerablePackages';
+	label: string;
+	solutionUri: vscode.Uri;
+	children: VulnerablePackageNode[];
+}
+
+interface VulnerablePackageNode {
+	kind: 'vulnerablePackage';
+	label: string;
+	version?: string;
+	severity: string;
+	advisoryUrl?: string;
+	projectLabels: string[];
 }
 
 interface SlnProjectEntry {
@@ -115,10 +153,73 @@ interface DraggedProjectPayload {
 const SOLUTION_FOLDER_TYPE_GUID = '2150e333-8fdc-42a3-9474-1a3956d46de8';
 const PROJECT_TREE_DRAG_MIME = 'application/vnd.csharppainkiller.project';
 
+/** Max concurrent NuGet lookups when checking many packages for updates at once. */
+const PACKAGE_CHECK_CONCURRENCY = 4;
+const WATCHER_REFRESH_DEBOUNCE_MS = 150;
+const AUTO_CHECK_PACKAGES_SETTING = 'solutionStructure.autoCheckPackages';
+
+/**
+ * Runs `worker` over `items` with at most `limit` concurrent invocations in flight —
+ * keeps a bulk "check all packages" scan from firing dozens/hundreds of simultaneous
+ * HTTP requests against NuGet sources.
+ */
+async function runWithConcurrencyLimit<T>(
+	items: readonly T[],
+	limit: number,
+	worker: (item: T) => Promise<void>,
+): Promise<void> {
+	let cursor = 0;
+	const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+		while (cursor < items.length) {
+			const item = items[cursor++];
+			await worker(item);
+		}
+	});
+	await Promise.all(runners);
+}
+
+function createPackageDependencyNode(
+	dependency: PackageDependencyInfo,
+	project: ProjectNode,
+	parentPackageId: string,
+): PackageDependencyNode {
+	return {
+		kind: 'packageDependency',
+		label: dependency.id,
+		version: dependency.version,
+		dependencies: dependency.dependencies?.map(child => createPackageDependencyNode(child, project, dependency.id)),
+		project,
+		parentPackageId,
+	};
+}
+
+export function isAutomaticPackageCheckEnabled(
+	config: Pick<vscode.WorkspaceConfiguration, 'get'> = vscode.workspace.getConfiguration('csharppainkiller'),
+): boolean {
+	return config.get<boolean>(AUTO_CHECK_PACKAGES_SETTING, true) ?? true;
+}
+
 export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<CsprojProjectTreeItem>, vscode.TreeDragAndDropController<CsprojProjectTreeItem>, vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<CsprojProjectTreeItem | undefined>();
 	private readonly watcher: vscode.FileSystemWatcher;
 	private readonly solutionWatcher: vscode.FileSystemWatcher;
+	private readonly workspaceDeleteWatcher: vscode.FileSystemWatcher;
+	private treeView: vscode.TreeView<CsprojProjectTreeItem> | undefined;
+	private initialPackageUpdateCheckScheduled = false;
+	private initialPackageUpdateCheckTimer: ReturnType<typeof setTimeout> | undefined;
+	private watcherRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+	/** Latest known available version per package, keyed by `csprojUri::packageId (lowercase)`. */
+	private readonly packageUpdateCache = new Map<string, string>();
+
+	/** Installed/resolved package version per package, including central package management projects. */
+	private readonly packageVersionCache = new Map<string, string>();
+
+	/** Declared dependencies of the installed package version, keyed the same way as `packageUpdateCache`. */
+	private readonly packageDependencyCache = new Map<string, PackageDependencyInfo[]>();
+
+	/** Known vulnerable top-level packages per project, filled during NuGet package checks. */
+	private readonly packageVulnerabilityCache = new Map<string, VulnerablePackageNode[]>();
 
 	readonly onDidChangeTreeData = this.changeEmitter.event;
 	readonly dragMimeTypes = [PROJECT_TREE_DRAG_MIME];
@@ -129,22 +230,61 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		private readonly onProjectFoldersChanged?: () => Promise<void> | void
 	) {
 		this.watcher = vscode.workspace.createFileSystemWatcher('**/*.csproj');
-		this.watcher.onDidCreate(() => this.refresh());
-		this.watcher.onDidDelete(() => this.refresh());
-		this.watcher.onDidChange(() => this.refresh());
+		this.watcher.onDidCreate(() => this.scheduleRefresh());
+		this.watcher.onDidDelete(() => this.scheduleRefresh());
+		this.watcher.onDidChange(() => this.scheduleRefresh());
 
 		this.solutionWatcher = vscode.workspace.createFileSystemWatcher('**/*.{sln,slnx}');
-		this.solutionWatcher.onDidCreate(() => this.refresh());
-		this.solutionWatcher.onDidDelete(() => this.refresh());
-		this.solutionWatcher.onDidChange(() => this.refresh());
+		this.solutionWatcher.onDidCreate(() => this.scheduleRefresh());
+		this.solutionWatcher.onDidDelete(() => this.scheduleRefresh());
+		this.solutionWatcher.onDidChange(() => this.scheduleRefresh());
+
+		this.workspaceDeleteWatcher = vscode.workspace.createFileSystemWatcher('**/*');
+		this.workspaceDeleteWatcher.onDidDelete(() => this.scheduleRefresh());
 	}
 
 	refresh(): void {
 		this.changeEmitter.fire(undefined);
 	}
 
+	private scheduleRefresh(): void {
+		if (this.watcherRefreshTimer) {
+			clearTimeout(this.watcherRefreshTimer);
+		}
+
+		this.watcherRefreshTimer = setTimeout(() => {
+			this.watcherRefreshTimer = undefined;
+			this.refresh();
+		}, WATCHER_REFRESH_DEBOUNCE_MS);
+	}
+
+	bindTreeView(treeView: vscode.TreeView<CsprojProjectTreeItem>): void {
+		this.treeView = treeView;
+	}
+
+	private packageCacheKey(csprojUri: vscode.Uri, packageId: string): string {
+		return `${csprojUri.toString()}::${packageId.toLowerCase()}`;
+	}
+
 	getTreeItem(element: CsprojProjectTreeItem): vscode.TreeItem {
 		return element;
+	}
+
+	async getParent(element: CsprojProjectTreeItem): Promise<CsprojProjectTreeItem | undefined> {
+		const node = element.node;
+		if (node.kind === 'referenceGroup' || node.kind === 'packageGroup') {
+			return this.createTreeItem(node.project);
+		}
+		if (node.kind === 'packageReference') {
+			return this.createTreeItem({ kind: 'packageGroup', label: 'Packages', project: node.project, children: [] });
+		}
+		if (node.kind === 'projectReference') {
+			return this.createTreeItem({ kind: 'referenceGroup', label: 'Project References', project: node.project, children: [] });
+		}
+
+		const roots = await this.buildTree();
+		const parent = findParentNode(roots, node);
+		return parent ? this.createTreeItem(parent) : undefined;
 	}
 
 	handleDrag(source: readonly CsprojProjectTreeItem[], dataTransfer: vscode.DataTransfer): void {
@@ -201,13 +341,43 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				return projectChildren.map(node => this.createTreeItem(node));
 			}
 
+			if (element.node.kind === 'packageReference') {
+				return (element.node.dependencies ?? []).map(node => this.createTreeItem(node));
+			}
+
+			if (element.node.kind === 'packageDependency') {
+				return (element.node.dependencies ?? []).map(node => this.createTreeItem(node));
+			}
+
 			return 'children' in element.node
 				? element.node.children.map(node => this.createTreeItem(node))
 				: [];
 		}
 
 		const nodes = await this.buildTree();
+		this.scheduleInitialPackageUpdateCheck();
 		return nodes.map(node => this.createTreeItem(node));
+	}
+
+	private scheduleInitialPackageUpdateCheck(): void {
+		if (!isAutomaticPackageCheckEnabled()) {
+			return;
+		}
+		if (this.initialPackageUpdateCheckScheduled) {
+			return;
+		}
+		this.initialPackageUpdateCheckScheduled = true;
+
+		this.initialPackageUpdateCheckTimer = setTimeout(() => {
+			this.initialPackageUpdateCheckTimer = undefined;
+			if (!isAutomaticPackageCheckEnabled()) {
+				this.initialPackageUpdateCheckScheduled = false;
+				return;
+			}
+			void this.checkAllProjectsForUpdates().catch(err => {
+				console.warn('CSharp Painkiller: background NuGet update check failed', err);
+			});
+		}, 1500);
 	}
 
 	private createTreeItem(node: CsprojTreeNode): CsprojProjectTreeItem {
@@ -215,21 +385,40 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	}
 
 	private async getProjectChildren(project: ProjectNode): Promise<CsprojTreeNode[]> {
+		if (!project.existsOnDisk) {
+			return [];
+		}
+
 		const content = await readUtf8(project.csprojUri);
-		const references = parseProjectReferences(content)
-			.map(referencePath => ({
+		const sourceProjectDir = pathModule.dirname(project.csprojUri.fsPath);
+		const references = await Promise.all(parseProjectReferences(content)
+			.map(async referencePath => {
+				const resolvedPath = resolveProjectReferencePath(sourceProjectDir, referencePath);
+				const resolvedUri = vscode.Uri.file(resolvedPath);
+				const normalizedResolvedPath = normalizePath(resolvedPath);
+				return {
 				kind: 'projectReference' as const,
 				label: getProjectReferenceDisplayName(referencePath),
 				project,
 				referencePath,
+				resolvedUri,
+				existsOnDisk: await pathExists(resolvedUri),
+				includedInSolution: project.solutionProjectPaths.has(normalizedResolvedPath),
+			};
 			}));
 		const packages = parsePackageReferences(content)
-			.map(pkg => ({
-				kind: 'packageReference' as const,
-				label: pkg.name,
-				version: pkg.version,
-				project,
-			}));
+			.map(pkg => {
+				const cacheKey = this.packageCacheKey(project.csprojUri, pkg.name);
+				const dependencies = this.packageDependencyCache.get(cacheKey);
+				return {
+					kind: 'packageReference' as const,
+					label: pkg.name,
+					version: pkg.version ?? this.packageVersionCache.get(cacheKey),
+					latestVersion: this.packageUpdateCache.get(cacheKey),
+					dependencies: dependencies?.map(dep => createPackageDependencyNode(dep, project, pkg.name)),
+					project,
+				};
+			});
 
 		const children: CsprojTreeNode[] = [];
 		children.push({ kind: 'referenceGroup', label: 'Project References', project, children: references });
@@ -631,7 +820,402 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const content = await readUtf8(project.csprojUri);
 		const updated = addPackageReferenceToCsproj(content, result.id, result.version);
 		await vscode.workspace.fs.writeFile(project.csprojUri, Buffer.from(updated, 'utf-8'));
+		this.packageUpdateCache.delete(this.packageCacheKey(project.csprojUri, result.id));
+		this.packageVersionCache.delete(this.packageCacheKey(project.csprojUri, result.id));
+		this.packageDependencyCache.delete(this.packageCacheKey(project.csprojUri, result.id));
+		this.packageVulnerabilityCache.delete(project.csprojUri.toString());
 		this.refresh();
+
+		// Immediately check whether a newer version of the just-installed package is
+		// available and whether it has known vulnerabilities, so the tree reflects both
+		// without requiring a separate manual "Check for Package Updates" run.
+		void Promise.all([
+			this.refreshPackageInfo(project.csprojUri, result.id, result.version),
+			this.refreshProjectVulnerabilities(project.csprojUri),
+		]).then(() => this.refresh());
+	}
+
+	/**
+	 * Replaces an outdated package's `Version` with its latest available version.
+	 */
+	async updatePackageReference(item?: CsprojProjectTreeItem): Promise<void> {
+		if (!item || item.node.kind !== 'packageReference' || !item.node.latestVersion) {
+			vscode.window.showErrorMessage('CSharp Painkiller: Select an outdated package to update.');
+			return;
+		}
+
+		const { project, label: packageId, latestVersion } = item.node;
+		const updated = await updatePackageVersionForProject(project.csprojUri, packageId, latestVersion);
+		if (!updated) {
+			vscode.window.showErrorMessage(`CSharp Painkiller: Could not locate "${packageId}" in the project file.`);
+			return;
+		}
+
+		this.packageUpdateCache.delete(this.packageCacheKey(project.csprojUri, packageId));
+		this.packageVulnerabilityCache.delete(project.csprojUri.toString());
+		await this.refreshAndRevealPackageGroup(project);
+		vscode.window.showInformationMessage(`CSharp Painkiller: Updated "${packageId}" to ${latestVersion}.`);
+
+		// Re-check in the background — an even newer version may already exist, and the
+		// dependency list can differ between versions.
+		void this.refreshPackageInfo(project.csprojUri, packageId, latestVersion).then(() => this.refreshAndRevealPackageGroup(project));
+	}
+
+	/**
+	 * Updates every outdated package reference in a project to its latest known version in
+	 * one go. Only shown (via the "Packages" group's inline button) when at least one package
+	 * in that project has a newer version cached — mirrors `updatePackageReference()` but
+	 * applies all pending updates instead of a single package.
+	 */
+	async updateAllPackageReferences(item?: CsprojProjectTreeItem): Promise<void> {
+		if (!item || item.node.kind !== 'packageGroup') {
+			vscode.window.showErrorMessage('CSharp Painkiller: Select a project\'s Packages group to update all packages.');
+			return;
+		}
+
+		const project = item.node.project;
+		const outdated = item.node.children.filter(pkg => pkg.latestVersion && pkg.latestVersion !== pkg.version);
+		if (outdated.length === 0) {
+			vscode.window.showInformationMessage(`CSharp Painkiller: No package updates available in ${project.label}.`);
+			return;
+		}
+
+		const updatedPackages: { packageId: string; version: string }[] = [];
+		for (const pkg of outdated) {
+			const updated = await updatePackageVersionForProject(project.csprojUri, pkg.label, pkg.latestVersion!);
+			if (updated) {
+				updatedPackages.push({ packageId: pkg.label, version: pkg.latestVersion! });
+			}
+		}
+
+		if (updatedPackages.length === 0) {
+			vscode.window.showErrorMessage(`CSharp Painkiller: Could not locate the outdated package(s) in ${project.label}'s project file.`);
+			return;
+		}
+
+		for (const pkg of updatedPackages) {
+			this.packageUpdateCache.delete(this.packageCacheKey(project.csprojUri, pkg.packageId));
+			this.packageVersionCache.set(this.packageCacheKey(project.csprojUri, pkg.packageId), pkg.version);
+		}
+		this.packageVulnerabilityCache.delete(project.csprojUri.toString());
+		await this.refreshAndRevealPackageGroup(project);
+		vscode.window.showInformationMessage(`CSharp Painkiller: Updated ${updatedPackages.length} package(s) in ${project.label}.`);
+
+		// Re-check all just-updated packages in the background — an even newer version may
+		// already exist for some of them.
+		void Promise.all(
+			updatedPackages.map(pkg => this.refreshPackageInfo(project.csprojUri, pkg.packageId, pkg.version)),
+		).then(() => this.refreshAndRevealPackageGroup(project));
+	}
+
+	/**
+	 * Fetches the latest available (stable) version and the declared dependencies for a
+	 * single installed package, updating the shared caches.
+	 *
+	 * `checkFailed` is `true` when the version check itself couldn't reach any configured
+	 * NuGet source (e.g. no internet connection) — callers must treat that differently from
+	 * "checked successfully, no update available" instead of silently reporting "up to date".
+	 * On failure, any previously cached update/dependency info is left untouched rather than
+	 * cleared, so a transient offline check doesn't erase a previously known update.
+	 */
+	private async refreshPackageInfo(
+		csprojUri: vscode.Uri,
+		packageId: string,
+		installedVersion: string,
+	): Promise<{ hasUpdate: boolean; checkFailed: boolean }> {
+		const key = this.packageCacheKey(csprojUri, packageId);
+
+		let latest: string | undefined;
+		let checkFailed = false;
+		try {
+			latest = await getLatestPackageVersion(csprojUri.fsPath, packageId);
+		} catch {
+			checkFailed = true;
+		}
+
+		const dependencies = await getPackageDependencies(csprojUri.fsPath, packageId, installedVersion).catch(() => []);
+
+		const hasUpdate = Boolean(latest && compareVersions(latest, installedVersion) > 0);
+		if (hasUpdate) {
+			this.packageUpdateCache.set(key, latest!);
+		} else if (!checkFailed) {
+			this.packageUpdateCache.delete(key);
+		}
+
+		if (dependencies.length > 0) {
+			this.packageDependencyCache.set(key, dependencies);
+		} else if (!checkFailed) {
+			this.packageDependencyCache.delete(key);
+		}
+
+		return { hasUpdate, checkFailed };
+	}
+
+	private async refreshProjectVulnerabilities(csprojUri: vscode.Uri): Promise<boolean> {
+		try {
+			const vulnerabilities = await getProjectPackageVulnerabilities(csprojUri.fsPath);
+			this.packageVulnerabilityCache.set(
+				csprojUri.toString(),
+				vulnerabilities.map(vulnerability => ({
+					kind: 'vulnerablePackage' as const,
+					label: vulnerability.id,
+					version: vulnerability.version,
+					severity: vulnerability.severity,
+					advisoryUrl: vulnerability.advisoryUrl,
+					projectLabels: [],
+				})),
+			);
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	/**
+	 * Checks every installed package in the target project against its configured NuGet
+	 * sources, and caches the latest available (stable) version and dependency list for
+	 * each — shown in the tree as "current → latest" plus an expandable dependency list.
+	 */
+	async checkPackageUpdates(item?: CsprojProjectTreeItem): Promise<void> {
+		const project = item?.node.kind === 'packageGroup'
+			? item.node.project
+			: item?.node.kind === 'project'
+				? item.node
+				: undefined;
+		if (!project) {
+			vscode.window.showErrorMessage('CSharp Painkiller: Select a project or its Packages group to check for updates.');
+			return;
+		}
+
+		const result = await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: `Checking for package updates — ${project.label}`,
+				cancellable: false,
+			},
+			async progress => {
+				progress.report({ message: 'Reading project packages...' });
+				const content = await readUtf8(project.csprojUri);
+				const packageRefs = parsePackageReferences(content);
+
+				if (packageRefs.length === 0) {
+					return { kind: 'empty' as const };
+				}
+
+				let updateCount = 0;
+				let failedCount = 0;
+				progress.report({ message: 'Checking configured NuGet sources...' });
+				const [projectUpdates, projectPackages] = await Promise.all([
+					getProjectPackageUpdates(project.csprojUri.fsPath).catch(() => undefined),
+					getProjectPackages(project.csprojUri.fsPath).catch(() => undefined),
+				]);
+				await this.refreshProjectVulnerabilities(project.csprojUri);
+
+				const packages = packageRefs.map(pkg => {
+					const resolved = projectPackages?.get(pkg.name.toLowerCase());
+					return {
+						name: pkg.name,
+						version: pkg.version ?? resolved?.resolvedVersion ?? resolved?.requestedVersion,
+					};
+				});
+
+				let done = 0;
+				await runWithConcurrencyLimit(packages, PACKAGE_CHECK_CONCURRENCY, async pkg => {
+					const key = this.packageCacheKey(project.csprojUri, pkg.name);
+					if (pkg.version) {
+						this.packageVersionCache.set(key, pkg.version);
+					} else {
+						this.packageVersionCache.delete(key);
+					}
+
+					let hasUpdate = false;
+					let checkFailed = false;
+					if (projectUpdates) {
+						const update = projectUpdates.get(pkg.name.toLowerCase());
+						hasUpdate = Boolean(update && (!pkg.version || compareVersions(update.latestVersion, pkg.version) > 0));
+						if (hasUpdate) {
+							this.packageUpdateCache.set(key, update!.latestVersion);
+						} else {
+							this.packageUpdateCache.delete(key);
+						}
+
+						const dependencies = pkg.version
+							? await getPackageDependencies(project.csprojUri.fsPath, pkg.name, pkg.version, projectPackages).catch(() => [])
+							: [];
+						if (dependencies.length > 0) {
+							this.packageDependencyCache.set(key, dependencies);
+						} else {
+							this.packageDependencyCache.delete(key);
+						}
+					} else if (pkg.version) {
+						({ hasUpdate, checkFailed } = await this.refreshPackageInfo(project.csprojUri, pkg.name, pkg.version));
+					} else {
+						checkFailed = true;
+					}
+					if (checkFailed) {
+						failedCount++;
+					} else if (hasUpdate) {
+						updateCount++;
+					}
+					done++;
+					progress.report({ increment: (1 / packages.length) * 100, message: `${done}/${packages.length}` });
+				});
+				return { kind: 'checked' as const, packagesLength: packages.length, updateCount, failedCount };
+			},
+		);
+
+		this.refresh();
+
+		if (result.kind === 'empty') {
+			vscode.window.showInformationMessage(`CSharp Painkiller: ${project.label} has no NuGet package references.`);
+			return;
+		}
+
+		if (result.failedCount === result.packagesLength) {
+			vscode.window.showWarningMessage(
+				`CSharp Painkiller: Could not check for package updates in ${project.label} — no configured NuGet source could be reached. Check your internet connection.`,
+			);
+			return;
+		}
+
+		if (result.failedCount > 0) {
+			vscode.window.showWarningMessage(
+				`CSharp Painkiller: Checked ${result.packagesLength - result.failedCount} of ${result.packagesLength} package(s) in ${project.label} ` +
+				`(${result.failedCount} could not be reached). ` +
+				(result.updateCount > 0 ? `${result.updateCount} update(s) available.` : 'No updates found among the checked packages.'),
+			);
+			return;
+		}
+
+		vscode.window.showInformationMessage(
+			result.updateCount > 0
+				? `CSharp Painkiller: ${result.updateCount} package update(s) available in ${project.label}.`
+				: `CSharp Painkiller: All packages in ${project.label} are up to date.`,
+		);
+	}
+
+	/**
+	 * Checks every installed package across every project in the workspace for updates and
+	 * dependency info. Runs silently in the background right after the Solution Structure
+	 * view initializes — no completion message when everything checks out — but shows a
+	 * warning if some (or all) packages couldn't be checked at all (e.g. no internet), so a
+	 * failed check is never silently mistaken for "everything is up to date".
+	 */
+	async checkAllProjectsForUpdates(): Promise<void> {
+		const checkResult = await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Window,
+				title: 'CSharp Painkiller: Checking for NuGet package updates…',
+			},
+			async progress => {
+				progress.report({ message: 'Finding projects...' });
+				const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+				const projectTasks: { csprojUri: vscode.Uri; packages: { packageId: string; version?: string }[] }[] = [];
+				let packageCount = 0;
+
+				for (const csprojUri of csprojFiles) {
+					try {
+						const content = await readUtf8(csprojUri);
+						const packages: { packageId: string; version?: string }[] = [];
+						for (const pkg of parsePackageReferences(content)) {
+							packages.push({ packageId: pkg.name, version: pkg.version });
+						}
+						if (packages.length > 0) {
+							packageCount += packages.length;
+							projectTasks.push({ csprojUri, packages });
+						}
+					} catch {
+						// Skip unreadable project files.
+					}
+				}
+
+				if (packageCount === 0) {
+					return { failedCount: 0, packageCount: 0 };
+				}
+
+				let failedCount = 0;
+				let done = 0;
+				const reportProjectDone = () => {
+					done++;
+					progress.report({ increment: (1 / projectTasks.length) * 100, message: `${done}/${projectTasks.length}` });
+				};
+				await runWithConcurrencyLimit(projectTasks, PACKAGE_CHECK_CONCURRENCY, async projectTask => {
+					try {
+						let projectUpdates: Map<string, { latestVersion: string }> | undefined;
+						let projectPackages: Map<string, PackageInfo> | undefined;
+						try {
+							projectUpdates = await getProjectPackageUpdates(projectTask.csprojUri.fsPath);
+						} catch {
+							projectUpdates = undefined;
+						}
+						try {
+							projectPackages = await getProjectPackages(projectTask.csprojUri.fsPath);
+						} catch {
+							projectPackages = undefined;
+						}
+						await this.refreshProjectVulnerabilities(projectTask.csprojUri);
+
+						if (projectUpdates) {
+							for (const pkg of projectTask.packages) {
+								const key = this.packageCacheKey(projectTask.csprojUri, pkg.packageId);
+								const resolved = projectPackages?.get(pkg.packageId.toLowerCase());
+								const version = pkg.version ?? resolved?.resolvedVersion ?? resolved?.requestedVersion;
+								if (version) {
+									this.packageVersionCache.set(key, version);
+								} else {
+									this.packageVersionCache.delete(key);
+								}
+
+								const update = projectUpdates.get(pkg.packageId.toLowerCase());
+								if (update && (!version || compareVersions(update.latestVersion, version) > 0)) {
+									this.packageUpdateCache.set(key, update.latestVersion);
+								} else {
+									this.packageUpdateCache.delete(key);
+								}
+
+								const dependencies = version
+									? await getPackageDependencies(projectTask.csprojUri.fsPath, pkg.packageId, version, projectPackages).catch(() => [])
+									: [];
+								if (dependencies.length > 0) {
+									this.packageDependencyCache.set(key, dependencies);
+								} else {
+									this.packageDependencyCache.delete(key);
+								}
+							}
+							return;
+						}
+
+						for (const pkg of projectTask.packages) {
+							const resolved = projectPackages?.get(pkg.packageId.toLowerCase());
+							const version = pkg.version ?? resolved?.resolvedVersion ?? resolved?.requestedVersion;
+							if (!version) {
+								failedCount++;
+								continue;
+							}
+
+							this.packageVersionCache.set(this.packageCacheKey(projectTask.csprojUri, pkg.packageId), version);
+							const { checkFailed } = await this.refreshPackageInfo(projectTask.csprojUri, pkg.packageId, version);
+							if (checkFailed) {
+								failedCount++;
+							}
+						}
+					} finally {
+						reportProjectDone();
+					}
+				});
+			return { failedCount, packageCount };
+		},
+		);
+
+		this.refresh();
+
+		if (checkResult.failedCount > 0) {
+			vscode.window.showWarningMessage(
+				checkResult.failedCount === checkResult.packageCount
+					? 'CSharp Painkiller: Could not check for NuGet package updates — no configured source could be reached. Check your internet connection.'
+					: `CSharp Painkiller: Could not check ${checkResult.failedCount} of ${checkResult.packageCount} package(s) for updates (no configured source could be reached).`,
+			);
+		}
 	}
 
 	async removePackageReference(item?: CsprojProjectTreeItem): Promise<void> {
@@ -652,8 +1236,36 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const content = await readUtf8(item.node.project.csprojUri);
 		const updated = removePackageReferenceFromCsproj(content, item.node.label);
 		await vscode.workspace.fs.writeFile(item.node.project.csprojUri, Buffer.from(updated, 'utf-8'));
-		this.refresh();
+		const key = this.packageCacheKey(item.node.project.csprojUri, item.node.label);
+		this.packageUpdateCache.delete(key);
+		this.packageVersionCache.delete(key);
+		this.packageDependencyCache.delete(key);
+		this.packageVulnerabilityCache.delete(item.node.project.csprojUri.toString());
+		await this.refreshAndRevealPackageGroup(item.node.project);
 	}
+
+	async openPackageVulnerability(item?: CsprojProjectTreeItem): Promise<void> {
+		if (!item || item.node.kind !== 'vulnerablePackage' || !item.node.advisoryUrl) {
+			vscode.window.showInformationMessage('CSharp Painkiller: No advisory URL is available for this vulnerability.');
+			return;
+		}
+
+		await vscode.env.openExternal(vscode.Uri.parse(item.node.advisoryUrl));
+	}
+
+	private async refreshAndRevealPackageGroup(project: ProjectNode): Promise<void> {
+		this.refresh();
+		if (!this.treeView) {
+			return;
+		}
+
+		await new Promise(resolve => setTimeout(resolve, 0));
+		await this.treeView.reveal(
+			this.createTreeItem({ kind: 'packageGroup', label: 'Packages', project, children: [] }),
+			{ expand: true, focus: false, select: false },
+		).then(undefined, err => console.warn('CSharp Painkiller: could not restore Packages tree expansion', err));
+	}
+
 
 	async removeProjectReference(item?: CsprojProjectTreeItem): Promise<void> {
 		if (!item || item.node.kind !== 'projectReference') {
@@ -814,6 +1426,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			? parseSlnxProjects(content)
 			: parseSlnProjects(content);
 		const children = await this.createSolutionChildren(entries, solutionUri, solutionDir, projectByPath, usedProjectPaths);
+		const vulnerablePackages = this.createVulnerablePackagesNode(solutionUri, solutionDir, entries);
+		if (vulnerablePackages.children.length > 0) {
+			children.push(vulnerablePackages);
+		}
 		const excludedProjects = await this.createExcludedProjectsNode(solutionUri, solutionDir, entries);
 		if (excludedProjects.children.length > 0) {
 			children.push(excludedProjects);
@@ -827,6 +1443,38 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				solutionUri,
 				physicalBaseUri: vscode.Uri.file(solutionDir),
 			},
+			children,
+		};
+	}
+
+	private createVulnerablePackagesNode(solutionUri: vscode.Uri, solutionDir: string, entries: SlnProjectEntry[]): VulnerablePackagesNode {
+		const byPackage = new Map<string, VulnerablePackageNode>();
+		for (const entry of entries.filter(item => !item.isSolutionFolder)) {
+			const csprojUri = vscode.Uri.file(pathModule.resolve(solutionDir, entry.projectPath));
+			const vulnerabilities = this.packageVulnerabilityCache.get(csprojUri.toString()) ?? [];
+			for (const vulnerability of vulnerabilities) {
+				const key = `${vulnerability.label.toLowerCase()}::${vulnerability.version ?? ''}::${vulnerability.severity.toLowerCase()}::${vulnerability.advisoryUrl ?? ''}`;
+				const existing = byPackage.get(key);
+				if (existing) {
+					if (!existing.projectLabels.includes(entry.name)) {
+						existing.projectLabels.push(entry.name);
+					}
+					continue;
+				}
+
+				byPackage.set(key, {
+					...vulnerability,
+					projectLabels: [entry.name],
+				});
+			}
+		}
+
+		const children = [...byPackage.values()]
+			.sort((a, b) => compareVulnerabilitySeverity(b.severity, a.severity) || a.label.localeCompare(b.label));
+		return {
+			kind: 'vulnerablePackages',
+			label: 'Vulnerable Packages',
+			solutionUri,
 			children,
 		};
 	}
@@ -919,15 +1567,17 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			getFolderNode(folder);
 		}
 
+		const solutionProjectPaths = new Set(entries
+			.filter(item => !item.isSolutionFolder)
+			.map(item => normalizePath(pathModule.resolve(solutionDir, item.projectPath))));
+
 		for (const entry of entries.filter(item => !item.isSolutionFolder)) {
 			const absoluteProjectPath = normalizePath(pathModule.resolve(solutionDir, entry.projectPath));
-			const csprojUri = projectByPath.get(absoluteProjectPath);
-			if (!csprojUri) {
-				continue;
-			}
+			const csprojUri = projectByPath.get(absoluteProjectPath) ?? vscode.Uri.file(pathModule.resolve(solutionDir, entry.projectPath));
+			const existsOnDisk = await pathExists(csprojUri);
 
 			usedProjectPaths.add(absoluteProjectPath);
-			const projectNode = await this.createProjectNode(csprojUri, solutionUri, entry.projectPath, this.getVirtualPath(entry, foldersByGuid), entry.name);
+			const projectNode = await this.createProjectNode(csprojUri, solutionUri, entry.projectPath, existsOnDisk, solutionProjectPaths, this.getVirtualPath(entry, foldersByGuid), entry.name);
 
 			if (entry.parentGuid && foldersByGuid.has(entry.parentGuid)) {
 				getFolderNode(foldersByGuid.get(entry.parentGuid)!).children.push(projectNode);
@@ -959,12 +1609,16 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		csprojUri: vscode.Uri,
 		solutionUri: vscode.Uri,
 		projectPath: string,
+		existsOnDisk: boolean,
+		solutionProjectPaths: ReadonlySet<string>,
 		virtualPath?: string,
 		displayName?: string
 	): Promise<ProjectNode> {
 		const folderPath = csprojUri.path.replace(/\/[^/]*$/, '');
 		const folderUri = csprojUri.with({ path: folderPath });
 		const label = displayName ?? folderPath.split('/').filter(Boolean).pop() ?? csprojUri.fsPath;
+
+		const targetFramework = existsOnDisk ? await this.getTargetFramework(csprojUri) : undefined;
 
 		return {
 			kind: 'project',
@@ -973,10 +1627,13 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			csprojUri,
 			solutionUri,
 			projectPath,
-			isAspNet: await this.isAspNetProject(csprojUri),
-			isTest: await this.isTestProject(csprojUri),
+			existsOnDisk,
+			solutionProjectPaths,
+			isAspNet: existsOnDisk ? await this.isAspNetProject(csprojUri) : false,
+			isTest: existsOnDisk ? await this.isTestProject(csprojUri) : false,
 			virtualPath,
-			targetFramework: await this.getTargetFramework(csprojUri),
+			targetFramework,
+			languageVersion: existsOnDisk ? await this.getLanguageVersion(csprojUri) : undefined,
 		};
 	}
 
@@ -1019,9 +1676,27 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 	}
 
+	private async getLanguageVersion(csprojUri: vscode.Uri): Promise<string | undefined> {
+		try {
+			const bytes = await vscode.workspace.fs.readFile(csprojUri);
+			const content = Buffer.from(bytes).toString('utf-8');
+			const explicitVersion = content.match(/<LangVersion>\s*([^<]+?)\s*<\/LangVersion>/i)?.[1]?.trim();
+			return formatLanguageVersion(explicitVersion);
+		} catch {
+			return undefined;
+		}
+	}
+
 	dispose(): void {
+		if (this.initialPackageUpdateCheckTimer) {
+			clearTimeout(this.initialPackageUpdateCheckTimer);
+		}
+		if (this.watcherRefreshTimer) {
+			clearTimeout(this.watcherRefreshTimer);
+		}
 		this.watcher.dispose();
 		this.solutionWatcher.dispose();
+		this.workspaceDeleteWatcher.dispose();
 		this.changeEmitter.dispose();
 	}
 }
@@ -1038,9 +1713,14 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 		this.contextValue = `csharppainkiller.${node.kind}`;
 
 		if (node.kind === 'project') {
-			const parts = [node.targetFramework, node.virtualPath].filter(Boolean);
+			const parts = [node.existsOnDisk ? node.targetFramework : 'missing on disk', node.languageVersion, node.virtualPath].filter(Boolean);
 			this.description = parts.length > 0 ? parts.join(', ') : undefined;
-			this.tooltip = `${node.virtualPath ? `Solution path: ${node.virtualPath}\n` : ''}${node.csprojUri.fsPath}`;
+			this.tooltip = `${node.virtualPath ? `Solution path: ${node.virtualPath}\n` : ''}${node.existsOnDisk ? node.csprojUri.fsPath : `Missing project file:\n${node.csprojUri.fsPath}`}`;
+			if (!node.existsOnDisk) {
+				this.contextValue = 'csharppainkiller.project.missing';
+				this.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('problemsWarningIcon.foreground'));
+				return;
+			}
 			this.updateProjectIcon(extensionUri);
 			this.command = {
 				command: 'csharppainkiller.revealProjectFolder',
@@ -1051,22 +1731,69 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 		}
 
 		if (node.kind === 'referenceGroup' || node.kind === 'packageGroup') {
-			this.contextValue = `csharppainkiller.${node.kind}`;
-			this.iconPath = new vscode.ThemeIcon(node.kind === 'referenceGroup' ? 'references' : 'package');
+			const hasOutdatedPackage = node.kind === 'packageGroup'
+				&& node.children.some(pkg => pkg.latestVersion && pkg.latestVersion !== pkg.version);
+			const hasBrokenProjectReference = node.kind === 'referenceGroup'
+				&& node.children.some(reference => !reference.existsOnDisk || !reference.includedInSolution);
+			this.contextValue = hasBrokenProjectReference
+				? 'csharppainkiller.referenceGroup.missing'
+				: hasOutdatedPackage
+				? 'csharppainkiller.packageGroup.outdated'
+				: `csharppainkiller.${node.kind}`;
+			this.iconPath = hasBrokenProjectReference
+				? new vscode.ThemeIcon('warning', new vscode.ThemeColor('problemsWarningIcon.foreground'))
+				: hasOutdatedPackage
+				? new vscode.ThemeIcon('package', new vscode.ThemeColor('problemsWarningIcon.foreground'))
+				: new vscode.ThemeIcon(node.kind === 'referenceGroup' ? 'references' : 'package');
+			if (hasBrokenProjectReference) {
+				this.tooltip = 'One or more project references are missing on disk or not included in the solution.';
+			}
+			if (hasOutdatedPackage) {
+				this.tooltip = 'One or more packages have updates available.';
+			}
 			return;
 		}
 
 		if (node.kind === 'projectReference') {
-			this.contextValue = 'csharppainkiller.projectReference';
-			this.description = pathModule.dirname(node.referencePath).replace(/\\/g, '/');
-			this.iconPath = new vscode.ThemeIcon('file-submodule');
+			const status = !node.existsOnDisk
+				? 'missing on disk'
+				: !node.includedInSolution ? 'not in solution' : undefined;
+			this.contextValue = status
+				? 'csharppainkiller.projectReference.missing'
+				: 'csharppainkiller.projectReference';
+			this.description = [status, pathModule.dirname(node.referencePath).replace(/\\/g, '/')].filter(Boolean).join(', ');
+			this.tooltip = status
+				? `${status}:\n${node.resolvedUri.fsPath}`
+				: node.resolvedUri.fsPath;
+			this.iconPath = status
+				? new vscode.ThemeIcon('warning', new vscode.ThemeColor('problemsWarningIcon.foreground'))
+				: new vscode.ThemeIcon('file-submodule');
 			return;
 		}
 
 		if (node.kind === 'packageReference') {
-			this.contextValue = 'csharppainkiller.packageReference';
+			const hasUpdate = Boolean(node.latestVersion && node.latestVersion !== node.version);
+			this.contextValue = hasUpdate
+				? 'csharppainkiller.packageReference.outdated'
+				: 'csharppainkiller.packageReference';
+			this.description = hasUpdate ? `${node.version}  →  ${node.latestVersion}` : node.version;
+			const depCount = node.dependencies?.length ?? 0;
+			this.tooltip = [
+				`Installed: ${node.version}`,
+				hasUpdate ? `Latest available: ${node.latestVersion}` : undefined,
+				depCount > 0 ? `Depends on ${depCount} package${depCount === 1 ? '' : 's'}` : undefined,
+			].filter((line): line is string => Boolean(line)).join('\n');
+			this.iconPath = hasUpdate
+				? new vscode.ThemeIcon('package', new vscode.ThemeColor('problemsWarningIcon.foreground'))
+				: new vscode.ThemeIcon('package');
+			return;
+		}
+
+		if (node.kind === 'packageDependency') {
+			this.contextValue = 'csharppainkiller.packageDependency';
 			this.description = node.version;
-			this.iconPath = new vscode.ThemeIcon('package');
+			this.tooltip = `${node.label}${node.version ? ` ${node.version}` : ''}`;
+			this.iconPath = new vscode.ThemeIcon('circle-small-filled');
 			return;
 		}
 
@@ -1081,6 +1808,30 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 			this.contextValue = 'csharppainkiller.excludedProject';
 			this.description = pathModule.relative(pathModule.dirname(node.solutionUri.fsPath), node.csprojUri.fsPath).replace(/\\/g, '/');
 			this.iconPath = new vscode.ThemeIcon('circle-slash');
+			return;
+		}
+
+		if (node.kind === 'vulnerablePackages') {
+			this.contextValue = 'csharppainkiller.vulnerablePackages';
+			this.description = `${node.children.length}`;
+			this.tooltip = 'Known vulnerabilities found in packages referenced by this solution.';
+			this.iconPath = new vscode.ThemeIcon('warning', new vscode.ThemeColor('problemsWarningIcon.foreground'));
+			return;
+		}
+
+		if (node.kind === 'vulnerablePackage') {
+			const isCritical = isCriticalVulnerability(node.severity);
+			this.contextValue = 'csharppainkiller.vulnerablePackage';
+			this.description = [node.version, node.severity].filter(Boolean).join(', ');
+			this.tooltip = [
+				`${node.label}${node.version ? ` ${node.version}` : ''}: ${node.severity} vulnerability`,
+				node.projectLabels.length > 0 ? `Projects: ${node.projectLabels.join(', ')}` : undefined,
+				node.advisoryUrl,
+			].filter((line): line is string => Boolean(line)).join('\n');
+			this.iconPath = new vscode.ThemeIcon(
+				'warning',
+				new vscode.ThemeColor(isCritical ? 'problemsErrorIcon.foreground' : 'problemsWarningIcon.foreground'),
+			);
 			return;
 		}
 
@@ -1110,13 +1861,51 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 }
 
 function getCollapsibleState(node: CsprojTreeNode): vscode.TreeItemCollapsibleState {
-	if (node.kind === 'project' || node.kind === 'referenceGroup' || node.kind === 'packageGroup' || node.kind === 'excludedProjects') {
+	if (node.kind === 'project' && !node.existsOnDisk) {
+		return vscode.TreeItemCollapsibleState.None;
+	}
+	if (node.kind === 'project' || node.kind === 'referenceGroup' || node.kind === 'packageGroup' || node.kind === 'excludedProjects' || node.kind === 'vulnerablePackages') {
 		return vscode.TreeItemCollapsibleState.Collapsed;
 	}
-	if (node.kind === 'projectReference' || node.kind === 'packageReference' || node.kind === 'excludedProject') {
+	if (node.kind === 'packageReference') {
+		return node.dependencies && node.dependencies.length > 0
+			? vscode.TreeItemCollapsibleState.Collapsed
+			: vscode.TreeItemCollapsibleState.None;
+	}
+	if (node.kind === 'packageDependency') {
+		return node.dependencies && node.dependencies.length > 0
+			? vscode.TreeItemCollapsibleState.Collapsed
+			: vscode.TreeItemCollapsibleState.None;
+	}
+	if (node.kind === 'projectReference' || node.kind === 'excludedProject' || node.kind === 'vulnerablePackage') {
 		return vscode.TreeItemCollapsibleState.None;
 	}
 	return vscode.TreeItemCollapsibleState.Expanded;
+}
+
+function getNestedTreeNodes(node: CsprojTreeNode): CsprojTreeNode[] {
+	if ('children' in node) {
+		return node.children;
+	}
+	if (node.kind === 'packageReference' || node.kind === 'packageDependency') {
+		return node.dependencies ?? [];
+	}
+	return [];
+}
+
+function findParentNode(nodes: readonly CsprojTreeNode[], target: CsprojTreeNode): CsprojTreeNode | undefined {
+	const targetId = getNodeId(target);
+	for (const node of nodes) {
+		const children = getNestedTreeNodes(node);
+		if (children.some(child => getNodeId(child) === targetId)) {
+			return node;
+		}
+		const nested = findParentNode(children, target);
+		if (nested) {
+			return nested;
+		}
+	}
+	return undefined;
 }
 
 function parseSlnProjects(content: string): SlnProjectEntry[] {
@@ -1222,10 +2011,10 @@ function parseSlnxProjects(content: string): SlnProjectEntry[] {
 
 function parseAttributes(input: string): Map<string, string> {
 	const attrs = new Map<string, string>();
-	const attrRegex = /(\w+)\s*=\s*"([^"]*)"/g;
+	const attrRegex = /(\w+)\s*=\s*(["'])(.*?)\2/g;
 	let match: RegExpExecArray | null;
 	while ((match = attrRegex.exec(input)) !== null) {
-		attrs.set(match[1], match[2]);
+		attrs.set(match[1], match[3]);
 	}
 	return attrs;
 }
@@ -1673,15 +2462,55 @@ function findLineEnd(content: string, start: number): number {
 function sortTree(nodes: CsprojTreeNode[]): void {
 	nodes.sort((a, b) => {
 		if (a.kind !== b.kind) {
-			return a.kind === 'folder' ? -1 : 1;
+			return getTreeSortRank(a) - getTreeSortRank(b);
 		}
 		return a.label.localeCompare(b.label);
 	});
 
 	for (const node of nodes) {
-		if ('children' in node) {
-			sortTree(node.children);
+		const children = getNestedTreeNodes(node);
+		if (children.length > 0) {
+			sortTree(children);
 		}
+	}
+}
+
+function getTreeSortRank(node: CsprojTreeNode): number {
+	switch (node.kind) {
+		case 'vulnerablePackages':
+			return 0;
+		case 'folder':
+			return 1;
+		case 'project':
+			return 2;
+		case 'excludedProjects':
+			return 3;
+		default:
+			return 4;
+	}
+}
+
+function compareVulnerabilitySeverity(a: string, b: string): number {
+	return vulnerabilitySeverityRank(a) - vulnerabilitySeverityRank(b);
+}
+
+function isCriticalVulnerability(severity: string): boolean {
+	return severity.toLowerCase() === 'critical';
+}
+
+function vulnerabilitySeverityRank(severity: string): number {
+	switch (severity.toLowerCase()) {
+		case 'critical':
+			return 4;
+		case 'high':
+			return 3;
+		case 'moderate':
+		case 'medium':
+			return 2;
+		case 'low':
+			return 1;
+		default:
+			return 0;
 	}
 }
 
@@ -1833,15 +2662,24 @@ function getProjectReferenceDisplayName(referencePath: string): string {
 	return fileName.replace(/\.csproj$/i, '');
 }
 
-function parsePackageReferences(content: string): { name: string; version?: string }[] {
+function formatLanguageVersion(version: string | undefined): string | undefined {
+	if (!version) {
+		return undefined;
+	}
+
+	return /^c#/i.test(version) ? version : `C# ${version}`;
+}
+
+export function parsePackageReferences(content: string): { name: string; version?: string }[] {
 	const packages: { name: string; version?: string }[] = [];
-	const regex = /<PackageReference\b([^>]*)\/?>/gi;
+	const regex = /<PackageReference\b([^>]*?)\/>|<PackageReference\b([^>]*?)>([\s\S]*?)<\/PackageReference>/gi;
 	let match: RegExpExecArray | null;
 	while ((match = regex.exec(content)) !== null) {
-		const attrs = parseAttributes(match[1]);
+		const attrs = parseAttributes(match[1] ?? match[2]);
 		const name = attrs.get('Include') ?? attrs.get('Update');
 		if (name) {
-			packages.push({ name, version: attrs.get('Version') });
+			const childVersion = match[3]?.match(/<Version>([^<]+)<\/Version>/i)?.[1]?.trim();
+			packages.push({ name, version: attrs.get('Version') ?? childVersion });
 		}
 	}
 	return packages;
@@ -1859,16 +2697,141 @@ function removePackageReferenceFromCsproj(content: string, packageId: string): s
 	const escapedId = escapeRegExp(packageId);
 	// Self-closing: <PackageReference Include="Id" ... />
 	let updated = content.replace(
-		new RegExp(`^[ \\t]*<PackageReference\\b[^>]*\\bInclude="${escapedId}"[^>]*/>[ \\t]*\\r?\\n?`, 'gmi'),
+		new RegExp(`^[ \t]*<PackageReference\\b[^>]*\\b(?:Include|Update)=(["'])${escapedId}\\1[^>]*/>[ \t]*\\r?\\n?`, 'gmi'),
 		''
 	);
 	// Multi-line: <PackageReference Include="Id">...</PackageReference>
 	updated = updated.replace(
-		new RegExp(`^[ \\t]*<PackageReference\\b[^>]*\\bInclude="${escapedId}"[^>]*>[\\s\\S]*?</PackageReference>[ \\t]*\\r?\\n?`, 'gmi'),
+		new RegExp(`^[ \t]*<PackageReference\\b[^>]*\\b(?:Include|Update)=(["'])${escapedId}\\1[^>]*>[\\s\\S]*?</PackageReference>[ \t]*\\r?\\n?`, 'gmi'),
 		''
 	);
 	updated = updated.replace(/<ItemGroup>\s*<\/ItemGroup>\r?\n?/g, '');
 	return removeExtraBlankLines(updated);
+}
+
+async function updatePackageVersionForProject(csprojUri: vscode.Uri, packageId: string, newVersion: string): Promise<boolean> {
+	const content = await readUtf8(csprojUri);
+	if (!hasLocalPackageReferenceVersion(content, packageId)) {
+		const centralPackageVersionsUri = await findCentralPackageVersionsFile(pathModule.dirname(csprojUri.fsPath));
+		if (centralPackageVersionsUri) {
+			const centralContent = await readUtf8(centralPackageVersionsUri);
+			const updatedCentralContent = updatePackageVersionInProps(centralContent, packageId, newVersion);
+			if (updatedCentralContent !== centralContent) {
+				await vscode.workspace.fs.writeFile(centralPackageVersionsUri, Buffer.from(updatedCentralContent, 'utf-8'));
+				return true;
+			}
+		}
+	}
+
+	const updated = updatePackageReferenceVersionInCsproj(content, packageId, newVersion);
+	if (updated === content) {
+		return false;
+	}
+
+	await vscode.workspace.fs.writeFile(csprojUri, Buffer.from(updated, 'utf-8'));
+	return true;
+}
+
+async function findCentralPackageVersionsFile(startDir: string): Promise<vscode.Uri | undefined> {
+	let dir = startDir;
+	const visited = new Set<string>();
+	while (dir && !visited.has(dir)) {
+		visited.add(dir);
+		const uri = vscode.Uri.file(pathModule.join(dir, 'Directory.Packages.props'));
+		try {
+			await vscode.workspace.fs.stat(uri);
+			return uri;
+		} catch {
+			// Walk up to the next parent.
+		}
+
+		const parent = pathModule.dirname(dir);
+		if (parent === dir) {
+			break;
+		}
+		dir = parent;
+	}
+	return undefined;
+}
+
+function hasLocalPackageReferenceVersion(content: string, packageId: string): boolean {
+	const regex = /<PackageReference\b([^>]*?)\/>|<PackageReference\b([^>]*?)>([\s\S]*?)<\/PackageReference>/gi;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(content)) !== null) {
+		const attrs = parseAttributes(match[1] ?? match[2]);
+		const name = attrs.get('Include') ?? attrs.get('Update');
+		if (name?.toLowerCase() === packageId.toLowerCase()) {
+			return Boolean(attrs.get('Version') ?? match[3]?.match(/<Version>([^<]+)<\/Version>/i)?.[1]?.trim());
+		}
+	}
+	return false;
+}
+
+function updatePackageVersionInProps(content: string, packageId: string, newVersion: string): string {
+	const escapedId = escapeRegExp(packageId);
+	const selfClosingRegex = new RegExp(`<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*)\\/>`, 'i');
+	let match = content.match(selfClosingRegex);
+	if (match) {
+		const originalTag = match[0];
+		const updatedTag = /\bVersion\s*=\s*(['"])[^'"]*\1/i.test(originalTag)
+			? originalTag.replace(/\bVersion\s*=\s*(['"])[^'"]*\1/i, (_versionAttr, quote: string) => `Version=${quote}${escapeXml(newVersion)}${quote}`)
+			: originalTag.replace(/\s*\/>$/, ` Version="${escapeXml(newVersion)}" />`);
+		const index = match.index ?? 0;
+		return content.slice(0, index) + updatedTag + content.slice(index + originalTag.length);
+	}
+
+	const pairedRegex = new RegExp(`<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*)>([\\s\\S]*?)<\\/PackageVersion>`, 'i');
+	match = content.match(pairedRegex);
+	if (!match) {
+		return content;
+	}
+
+	const originalTag = match[0];
+	const body = match[3];
+	const updatedBody = /<Version>[^<]*<\/Version>/i.test(body)
+		? body.replace(/<Version>[^<]*<\/Version>/i, `<Version>${escapeXml(newVersion)}</Version>`)
+		: `${body}\n    <Version>${escapeXml(newVersion)}</Version>`;
+	const updatedTag = originalTag.replace(body, updatedBody);
+	const index = match.index ?? 0;
+	return content.slice(0, index) + updatedTag + content.slice(index + originalTag.length);
+}
+
+/**
+ * Replaces an existing `<PackageReference Include="packageId" ...>` version with `newVersion`,
+ * supporting both `Version="..."` attributes and nested `<Version>...</Version>` elements.
+ * Returns `content` unchanged if the package reference can't be found.
+ */
+export function updatePackageReferenceVersionInCsproj(content: string, packageId: string, newVersion: string): string {
+	const escapedId = escapeRegExp(packageId);
+	const pairedRegex = new RegExp(`<PackageReference\\b[^>]*\\b(?:Include|Update)=(["'])${escapedId}\\1[^>]*>([\\s\\S]*?)<\\/PackageReference>`, 'i');
+	let match = content.match(pairedRegex);
+	if (match) {
+		const originalElement = match[0];
+		const body = match[2];
+		const updatedElement = /<Version>[^<]*<\/Version>/i.test(body)
+			? originalElement.replace(/<Version>[^<]*<\/Version>/i, `<Version>${escapeXml(newVersion)}</Version>`)
+			: updatePackageReferenceOpeningTag(originalElement, newVersion);
+		const index = match.index ?? 0;
+		return content.slice(0, index) + updatedElement + content.slice(index + originalElement.length);
+	}
+
+	const tagRegex = new RegExp(`<PackageReference\\b[^>]*\\b(?:Include|Update)=(["'])${escapedId}\\1[^>]*/>`, 'i');
+	match = content.match(tagRegex);
+	if (!match) {
+		return content;
+	}
+
+	const originalTag = match[0];
+	const updatedTag = updatePackageReferenceOpeningTag(originalTag, newVersion);
+	const index = match.index ?? 0;
+	return content.slice(0, index) + updatedTag + content.slice(index + originalTag.length);
+}
+
+function updatePackageReferenceOpeningTag(originalTag: string, newVersion: string): string {
+	const updatedTag = /\bVersion\s*=\s*(["'])[^"']*\1/i.test(originalTag)
+		? originalTag.replace(/\bVersion\s*=\s*(["'])[^"']*\1/i, (_versionAttr, quote: string) => `Version=${quote}${escapeXml(newVersion)}${quote}`)
+		: originalTag.replace(/\b(Include|Update)\s*=\s*(["'])[^"']*\2/i, includeAttr => `${includeAttr} Version="${escapeXml(newVersion)}"`);
+	return updatedTag;
 }
 
 function addProjectReferenceToCsproj(content: string, relativePath: string): string {
@@ -1906,6 +2869,9 @@ function getNodeId(node: CsprojTreeNode): string {
 	if (node.kind === 'project') {
 		return node.csprojUri.toString();
 	}
+	if (node.kind === 'referenceGroup' || node.kind === 'packageGroup') {
+		return `${node.kind}:${node.project.csprojUri.toString()}`;
+	}
 	if ('children' in node) {
 		return `${node.kind}:${node.label}:${node.children.map(getNodeId).join('|')}`;
 	}
@@ -1917,6 +2883,12 @@ function getNodeId(node: CsprojTreeNode): string {
 	}
 	if (node.kind === 'packageReference') {
 		return `packageReference:${node.project.csprojUri.toString()}:${node.label}:${node.version ?? ''}`;
+	}
+	if (node.kind === 'packageDependency') {
+		return `packageDependency:${node.project.csprojUri.toString()}:${node.parentPackageId}:${node.label}:${node.version ?? ''}`;
+	}
+	if (node.kind === 'vulnerablePackage') {
+		return `vulnerablePackage:${node.label}:${node.version ?? ''}:${node.severity}:${node.advisoryUrl ?? ''}`;
 	}
 	// exhaustive — TypeScript will error here if a new kind is added without handling
 	const _exhaustive: never = node;
@@ -1939,6 +2911,8 @@ function parseDraggedProjects(raw: string): ProjectNode[] {
 				csprojUri: vscode.Uri.file(project.csprojFsPath),
 				solutionUri: vscode.Uri.file(project.solutionFsPath),
 				projectPath: project.projectPath,
+				existsOnDisk: true,
+				solutionProjectPaths: new Set<string>(),
 				isAspNet: project.isAspNet,
 				isTest: project.isTest,
 				virtualPath: project.virtualPath,

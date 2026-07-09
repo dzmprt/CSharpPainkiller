@@ -1,26 +1,6 @@
 import * as vscode from 'vscode';
 import { collectCsFiles } from '../utils/fileUtils.js';
-import { type TopLevelUsingDirective, collectTopLevelUsingBlock } from '../utils/usingBlock.js';
-
-/**
- * Groups for sorting using directives.
- * Order: System.* → everything else (alphabetically)
- */
-function getUsingGroup(usingDirective: TopLevelUsingDirective): number {
-	if (usingDirective.isGlobal) {
-		return 0;
-	}
-	if (usingDirective.kind === 'namespace' && usingDirective.namespace.startsWith('System')) {
-		return 1;
-	}
-	if (usingDirective.kind === 'namespace') {
-		return 2;
-	}
-	if (usingDirective.kind === 'static') {
-		return 3;
-	}
-	return 4;
-}
+import { type TopLevelUsingDirective, collectTopLevelUsingBlock, compareUsingDirectives } from '../utils/usingBlock.js';
 
 function getDeduplicationKey(usingDirective: TopLevelUsingDirective): string {
 	return [
@@ -51,17 +31,7 @@ export function sortUsingsInContent(content: string): string | undefined {
 		return true;
 	});
 
-	const sorted = [...unique].sort((a, b) => {
-		const groupDiff = getUsingGroup(a) - getUsingGroup(b);
-		if (groupDiff !== 0) {
-			return groupDiff;
-		}
-		const namespaceDiff = a.namespace.localeCompare(b.namespace);
-		if (namespaceDiff !== 0) {
-			return namespaceDiff;
-		}
-		return (a.alias ?? '').localeCompare(b.alias ?? '');
-	});
+	const sorted = [...unique].sort(compareUsingDirectives);
 
 	const sortedBlock = sorted.map(u => u.fullText).join(usingBlock.eol) + usingBlock.eol;
 	const originalBlock = content.slice(usingBlock.start, usingBlock.end);

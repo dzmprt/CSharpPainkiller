@@ -122,12 +122,16 @@ suite('utilities', () => {
 		});
 
 		test('allows extraction when file has multiple types', () => {
-			assert.ok(canExtractTypeFromFile(multiTypeContent, 'Beta'));
+			assert.ok(canExtractTypeFromFile(multiTypeContent, 'Beta', 'Models'));
 		});
 
 		test('disallows extraction when file has a single type', () => {
 			const content = 'namespace MyApp;\n\npublic class OnlyOne\n{\n}';
-			assert.ok(!canExtractTypeFromFile(content, 'OnlyOne'));
+			assert.ok(!canExtractTypeFromFile(content, 'OnlyOne', 'OnlyOne'));
+		});
+
+		test('disallows extraction when file name matches type name', () => {
+			assert.ok(!canExtractTypeFromFile(multiTypeContent, 'Beta', 'Beta'));
 		});
 
 		test('finds type declaration span', () => {

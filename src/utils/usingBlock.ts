@@ -88,3 +88,59 @@ export function collectTopLevelUsingBlock(content: string): TopLevelUsingBlock |
 		eol,
 	};
 }
+
+// ============================================================================
+// Canonical sort order — shared by the "Sort Usings" command and the
+// unsorted-usings diagnostic, so both always agree on what "sorted" means.
+// ============================================================================
+
+/**
+ * Determines the sort group for a using directive:
+ * 0 = global usings, 1 = `System.*` namespace usings, 2 = other namespace usings,
+ * 3 = static usings, 4 = alias usings.
+ */
+export function getUsingSortGroup(usingDirective: TopLevelUsingDirective): number {
+	if (usingDirective.isGlobal) {
+		return 0;
+	}
+	if (usingDirective.kind === 'namespace' && usingDirective.namespace.startsWith('System')) {
+		return 1;
+	}
+	if (usingDirective.kind === 'namespace') {
+		return 2;
+	}
+	if (usingDirective.kind === 'static') {
+		return 3;
+	}
+	return 4;
+}
+
+/**
+ * Compares two using directives using the canonical CSharp Painkiller sort order:
+ * group (global → `System.*` → other namespaces → static → alias), then alphabetically
+ * by namespace, then by alias.
+ */
+export function compareUsingDirectives(a: TopLevelUsingDirective, b: TopLevelUsingDirective): number {
+	const groupDiff = getUsingSortGroup(a) - getUsingSortGroup(b);
+	if (groupDiff !== 0) {
+		return groupDiff;
+	}
+	const namespaceDiff = a.namespace.localeCompare(b.namespace);
+	if (namespaceDiff !== 0) {
+		return namespaceDiff;
+	}
+	return (a.alias ?? '').localeCompare(b.alias ?? '');
+}
+
+/**
+ * Returns true if the given using directives are already in canonical sorted order
+ * (this only checks ordering, not deduplication).
+ */
+export function isUsingOrderSorted(directives: TopLevelUsingDirective[]): boolean {
+	for (let i = 1; i < directives.length; i++) {
+		if (compareUsingDirectives(directives[i - 1], directives[i]) > 0) {
+			return false;
+		}
+	}
+	return true;
+}

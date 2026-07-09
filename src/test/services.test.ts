@@ -2,6 +2,9 @@ import * as assert from 'assert';
 import { sortUsingsInContent } from '../services/sortUsings.js';
 import { removeUnusedUsingsFromContent } from '../services/removeUnusedUsings.js';
 import { extractPublicMembers } from '../services/extractInterface.js';
+import { collectTopLevelUsingBlock, isUsingOrderSorted } from '../utils/usingBlock.js';
+import { collectPackageVulnerabilities, collectProjectPackages, compareVersions } from '../services/nugetCommands.js';
+import { isAutomaticPackageCheckEnabled, parsePackageReferences, updatePackageReferenceVersionInCsproj } from '../decoration/csprojProjectsTreeProvider.js';
 import {
 	parsePublicProperties,
 	generateEfCoreEntityTypeConfiguration,
@@ -74,6 +77,209 @@ suite('services', () => {
 			assert.ok(sorted);
 			assert.ok(sorted!.includes('    using Nested;'));
 			assert.ok(sorted!.includes('public class Book { }'));
+		});
+	});
+
+	suite('isUsingOrderSorted', () => {
+		test('treats System.* group before other namespaces as sorted (regression)', () => {
+			// Reported bug: this is correctly sorted (System.* first, then alphabetical),
+			// but the diagnostic used to flag it because it compared the whole list
+			// alphabetically without accounting for the System.* group.
+			const content = [
+				'using System.Reflection;',
+				'using Books.Application.Behaviors;',
+				'using FluentValidation;',
+				'using Microsoft.Extensions.DependencyInjection;',
+				'using MitMediator;',
+				'namespace MyApp;',
+			].join('\n');
+
+			const usingBlock = collectTopLevelUsingBlock(content);
+			assert.ok(usingBlock);
+			assert.strictEqual(isUsingOrderSorted(usingBlock!.directives), true);
+		});
+
+		test('detects usings that are actually unsorted', () => {
+			const content = [
+				'using System;',
+				'using Microsoft.Extensions.DependencyInjection;',
+				'using Books.Application.Behaviors;',
+				'namespace MyApp;',
+			].join('\n');
+
+			const usingBlock = collectTopLevelUsingBlock(content);
+			assert.ok(usingBlock);
+			assert.strictEqual(isUsingOrderSorted(usingBlock!.directives), false);
+		});
+
+		test('same-sorted content matches sortUsingsInContent output (no changes needed)', () => {
+			const content = [
+				'using System.Reflection;',
+				'using Books.Application.Behaviors;',
+				'using FluentValidation;',
+				'using Microsoft.Extensions.DependencyInjection;',
+				'using MitMediator;',
+				'namespace MyApp;',
+			].join('\n');
+
+			assert.strictEqual(sortUsingsInContent(content), undefined);
+		});
+	});
+
+	suite('compareVersions', () => {
+		test('compares numeric segments, not strings (10 > 9)', () => {
+			assert.ok(compareVersions('10.0.0', '9.0.0') > 0);
+		});
+
+		test('treats a release as greater than a prerelease of the same core version', () => {
+			assert.ok(compareVersions('1.0.0', '1.0.0-beta') > 0);
+			assert.ok(compareVersions('1.0.0-beta', '1.0.0') < 0);
+		});
+
+		test('handles missing patch/minor segments', () => {
+			assert.ok(compareVersions('2.0', '1.9.9') > 0);
+			assert.strictEqual(compareVersions('1.0', '1.0.0'), 0);
+		});
+
+		test('returns 0 for equal versions', () => {
+			assert.strictEqual(compareVersions('3.1.4', '3.1.4'), 0);
+		});
+	});
+
+	suite('collectPackageVulnerabilities', () => {
+		test('includes vulnerabilities from transitive packages', () => {
+			const vulnerabilities = collectPackageVulnerabilities({
+				projects: [{
+					frameworks: [{
+						topLevelPackages: [{
+							id: 'Direct.Package',
+							resolvedVersion: '1.2.3',
+							vulnerabilities: [{ severity: 'High', advisoryUrl: 'https://example.test/direct' }],
+						}],
+						transitivePackages: [{
+							id: 'Transitive.Package',
+							resolvedVersion: '4.5.6',
+							vulnerabilities: [{ severity: 'Critical', advisoryUrl: 'https://example.test/transitive' }],
+						}],
+					}],
+				}],
+			});
+
+			assert.deepStrictEqual(vulnerabilities, [
+				{
+					id: 'Direct.Package',
+					version: '1.2.3',
+					severity: 'High',
+					advisoryUrl: 'https://example.test/direct',
+				},
+				{
+					id: 'Transitive.Package',
+					version: '4.5.6',
+					severity: 'Critical',
+					advisoryUrl: 'https://example.test/transitive',
+				},
+			]);
+		});
+	});
+
+	suite('collectProjectPackages', () => {
+		test('includes resolved transitive packages', () => {
+			const packages = collectProjectPackages({
+				projects: [{
+					frameworks: [{
+						topLevelPackages: [{
+							id: 'Direct.Package',
+							requestedVersion: '1.0.0',
+							resolvedVersion: '1.0.1',
+						}],
+						transitivePackages: [{
+							id: 'Nested.Package',
+							resolvedVersion: '2.3.4',
+						}],
+					}],
+				}],
+			});
+
+			assert.deepStrictEqual(packages.get('direct.package'), {
+				id: 'Direct.Package',
+				requestedVersion: '1.0.0',
+				resolvedVersion: '1.0.1',
+			});
+			assert.deepStrictEqual(packages.get('nested.package'), {
+				id: 'Nested.Package',
+				requestedVersion: undefined,
+				resolvedVersion: '2.3.4',
+			});
+		});
+	});
+
+	suite('parsePackageReferences', () => {
+		test('reads self-closing PackageReference version attributes', () => {
+			const packages = parsePackageReferences('<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />');
+
+			assert.deepStrictEqual(packages, [{ name: 'Newtonsoft.Json', version: '13.0.3' }]);
+		});
+
+		test('reads nested PackageReference Version elements', () => {
+			const packages = parsePackageReferences([
+				'<PackageReference Include="Serilog">',
+				'  <Version>3.1.1</Version>',
+				'</PackageReference>',
+			].join('\n'));
+
+			assert.deepStrictEqual(packages, [{ name: 'Serilog', version: '3.1.1' }]);
+		});
+
+		test('keeps PackageReference entries without local versions', () => {
+			const packages = parsePackageReferences([
+				'<PackageReference Include="Humanizer.Core" />',
+				'<PackageReference Include="xunit">',
+				'  <PrivateAssets>all</PrivateAssets>',
+				'</PackageReference>',
+			].join('\n'));
+
+			assert.deepStrictEqual(packages, [
+				{ name: 'Humanizer.Core', version: undefined },
+				{ name: 'xunit', version: undefined },
+			]);
+		});
+	});
+
+	suite('updatePackageReferenceVersionInCsproj', () => {
+		test('updates nested PackageReference Version elements without adding a conflicting attribute', () => {
+			const content = [
+				'<Project>',
+				'  <ItemGroup>',
+				'    <PackageReference Include="Serilog">',
+				'      <Version>3.1.1</Version>',
+				'    </PackageReference>',
+				'  </ItemGroup>',
+				'</Project>',
+			].join('\n');
+
+			const updated = updatePackageReferenceVersionInCsproj(content, 'Serilog', '4.0.0');
+
+			assert.ok(updated.includes('<Version>4.0.0</Version>'));
+			assert.ok(!updated.includes('Include="Serilog" Version="4.0.0"'));
+		});
+
+		test('updates self-closing PackageReference version attributes', () => {
+			const content = '<PackageReference Include="Newtonsoft.Json" Version="13.0.1" />';
+
+			assert.strictEqual(
+				updatePackageReferenceVersionInCsproj(content, 'Newtonsoft.Json', '13.0.3'),
+				'<PackageReference Include="Newtonsoft.Json" Version="13.0.3" />',
+			);
+		});
+	});
+
+	suite('isAutomaticPackageCheckEnabled', () => {
+		test('defaults to enabled', () => {
+			assert.strictEqual(isAutomaticPackageCheckEnabled({ get: () => undefined }), true);
+		});
+
+		test('can be disabled from settings', () => {
+			assert.strictEqual(isAutomaticPackageCheckEnabled({ get: () => false }), false);
 		});
 	});
 

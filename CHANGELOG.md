@@ -4,6 +4,28 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.8]
+
+### Added
+
+- **C# Analyze Solution** — run a one-off, cancellable workspace scan and choose which analyzers to run for that scan
+- **Diagnostics for open files** — real-time diagnostics for open `.cs` files, controlled by the `csharppainkiller.diagnostics.*` settings
+- **Duplicate type diagnostics** — warn when the same type name is declared in more than one file within the same project
+- **NuGet package update checks** — Solution Structure can check installed packages for newer stable versions, update one package, or update all outdated packages in a project
+- **NuGet dependency display** — installed packages can show their declared dependencies in the Solution Structure tree when NuGet metadata is available
+- **NuGet vulnerability display** — Solution Structure shows known vulnerable packages for a solution and can open the advisory link when NuGet provides one
+
+### Changed
+
+- **Solution Structure NuGet checks** — package update and vulnerability checks run automatically in the background when the Solution Structure view opens, and manual checks now report partial/offline failures instead of treating them as up to date
+- **Solution Structure project labels** — project nodes now include the configured C# language version when it is present in the project file
+- **Sort Usings** — the command and the unsorted-usings diagnostic now use the same order: global usings, `System.*`, other namespaces, static usings, then alias usings; duplicate using directives are removed by the command
+- **Extract Type to File** — the quick fix is offered only for extra types in a multi-type file, not for the type that already matches the current file name
+
+### Fixed
+
+- **Diagnostics performance** — namespace diagnostics avoid repeated full-workspace `.csproj` scans while editing open files
+
 ## [0.0.7]
 
 ### Fixed

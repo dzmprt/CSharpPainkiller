@@ -1,10 +1,12 @@
 import * as vscode from 'vscode';
 import { getTypeNameAtPosition } from '../services/generateMapTo.js';
 import { canExtractTypeFromFile } from '../services/extractTypeToFileCore.js';
+import { getFileBaseNameFromUri } from '../utils/fileUtils.js';
 
 /**
- * Offers "Extract type to file" when the cursor is on a type name and the file
- * contains more than one type declaration.
+ * Offers "Extract type to file" when the cursor is on a type name, the file
+ * contains more than one type declaration, and the file name does not match
+ * the type name.
  */
 export class ExtractTypeCodeActionProvider implements vscode.CodeActionProvider {
 	public static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
@@ -25,7 +27,7 @@ export class ExtractTypeCodeActionProvider implements vscode.CodeActionProvider 
 			return [];
 		}
 
-		if (!canExtractTypeFromFile(document.getText(), typeName)) {
+		if (!canExtractTypeFromFile(document.getText(), typeName, getFileBaseNameFromUri(document.uri))) {
 			return [];
 		}
 

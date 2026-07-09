@@ -203,9 +203,12 @@ export function findTypeDeclarationSpan(content: string, typeName: string): Type
 	return undefined;
 }
 
-export function canExtractTypeFromFile(content: string, typeName: string): boolean {
+export function canExtractTypeFromFile(content: string, typeName: string, fileBaseName: string): boolean {
 	const types = listExtractableTypes(content);
 	if (types.length <= 1) {
+		return false;
+	}
+	if (fileBaseName === typeName) {
 		return false;
 	}
 	if (!types.some(t => t.name === typeName)) {

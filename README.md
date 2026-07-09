@@ -22,6 +22,7 @@ Smart file creation, code generation, project creation, namespace management and
   - [Adjust Namespaces](#adjust-namespaces)
   - [Rename File By Type](#rename-file-by-type)
   - [Sync Type and File Name](#sync-type-and-file-name)
+  - [Diagnostics and Analyze Solution](#diagnostics-and-analyze-solution)
   - [Generate Mapping Methods](#generate-mapping-methods)
   - [Generate DTO](#generate-dto)
   - [Generate FluentValidation Validator](#generate-fluentvalidation-validator)
@@ -49,8 +50,10 @@ Explore and manage your `.sln` / `.slnx` solution from the **Solution Structure 
 
 - Create/delete solution folders and projects, manage project references
 - Add/remove NuGet packages — search across `nuget.config` sources with pre-release toggle and version picker
+- Check for NuGet package updates, update one outdated package, or update all outdated packages in a project
+- See installed package dependencies and known vulnerable packages when NuGet metadata is available
 
-> Hide with the `csharppainkiller.solutionStructure.show` setting.
+> Hide with the `csharppainkiller.solutionStructure.show` setting. Disable automatic NuGet version/dependency/vulnerability checks with `csharppainkiller.solutionStructure.autoCheckPackages`; manual checks remain available from the Solution Structure context menu.
 
 ### Create C# Types
 
@@ -76,6 +79,22 @@ Supported type kinds: `class`, `record`, `struct`, `record struct`.
 
 > Can be disabled via the `csharppainkiller.syncTypeAndFileName` setting.
 
+### Diagnostics and Analyze Solution
+
+C# Painkiller reports diagnostics for open `.cs` files and provides **C# Analyze Solution** for a one-off workspace scan with selectable analyzers.
+
+Available analyzers:
+
+- Namespace mismatch
+- File name mismatch
+- Unsorted `using` directives
+- Mixed-language identifiers
+- Duplicate type names within the same project
+
+![Analyze Solution demo](images/AnalyzeSolution.png)
+
+Open-files diagnostics are controlled by the `csharppainkiller.diagnostics.*` settings. The **C# Analyze Solution** command lets you choose analyzers for that run without changing your saved settings.
+
 ### Generate Mapping Methods
 
 Generate static `MapTo{TargetType}` / `MapFrom{TargetType}` methods for mapping between types
@@ -94,11 +113,13 @@ Generate a FluentValidation `AbstractValidator<T>` for a class, record, or struc
 
 ### Extract Type to File
 
-Move a type from a multi-type file into its own `{TypeName}.cs` file
+Move an extra type from a multi-type file into its own `{TypeName}.cs` file. The quick fix appears on extractable type names when the current file contains more than one type and the selected type is not already the file's primary type.
 
 ### Sort Usings
 
-Alphabetically sort `using` directives in a `.cs` file or across an entire folder. Right-click → **C# Refactor → C# Sort Usings**.
+Sort and deduplicate top-level `using` directives in a `.cs` file or across an entire folder. Right-click → **C# Refactor → C# Sort Usings**.
+
+Sort order: global usings, `System.*` namespaces, other namespaces, static usings, then alias usings. The unsorted-usings diagnostic uses the same order.
 
 ### Extract Interface
 
@@ -163,7 +184,14 @@ Use VS Code settings (`Ctrl+,` / `Cmd+,`) to control which feature groups are vi
 | `csharppainkiller.templates.showEfCore` | `true` | Show EF Core configuration commands |
 | `csharppainkiller.templates.showFluentValidation` | `true` | Show FluentValidation commands |
 | `csharppainkiller.solutionStructure.show` | `true` | Show the Solution Structure panel in the Explorer sidebar |
+| `csharppainkiller.solutionStructure.autoCheckPackages` | `true` | Automatically check NuGet package versions, dependencies, and known vulnerabilities when Solution Structure initializes |
 | `csharppainkiller.syncTypeAndFileName` | `true` | Automatically rename the `.cs` file when the single type inside it is renamed (on save), and rename the type when the file is renamed |
+| `csharppainkiller.diagnostics.wrongNamespace` | `true` | Warn when a file's namespace does not match its project path |
+| `csharppainkiller.diagnostics.wrongFilename` | `false` | Warn when a file name does not match its declared type name |
+| `csharppainkiller.diagnostics.unsortedUsings` | `false` | Warn when top-level `using` directives are not in C# Painkiller sort order |
+| `csharppainkiller.diagnostics.mixedLanguageIdentifiers` | `false` | Warn when identifiers mix Latin and non-Latin characters |
+| `csharppainkiller.diagnostics.duplicateTypeName` | `true` | Warn when a type name is declared in more than one file within the same project |
+| `csharppainkiller.diagnosticDebounceDelay` | `1000` | Delay in milliseconds before re-analyzing an open `.cs` file after edits |
 
 ## Issues
 

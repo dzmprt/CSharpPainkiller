@@ -653,11 +653,82 @@ export interface MediatorFileInfo {
 }
 
 /**
- * Inspects the content of a .cs file and returns mediator type information
- * if the file contains exactly one class that implements IRequest<T>, IRequest,
- * or INotification (from MediatR or MitMediator).
+ * One class/record/struct declaration header found in a file: the type name, plus the
+ * `[start, end)` range of its base-type list (from right after the name to the first
+ * `where` constraint clause or opening `{`, whichever comes first). Scoping interface
+ * lookups to this range — rather than the whole file — avoids false matches inside
+ * `where TRequest : IRequest<TResponse>` generic constraints (a very common MediatR
+ * `IPipelineBehavior<TRequest, TResponse>` pattern), which are NOT part of the base list.
+ */
+interface ClassDeclarationHeader {
+	name: string;
+	headerStart: number;
+	headerEnd: number;
+}
+
+const CLASS_DECLARATION_REGEX = /(?:public|internal|sealed)\s+(?:sealed\s+)?(?:readonly\s+)?(?:record\s+struct|record|class|struct)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+
+function findClassDeclarationHeaders(content: string): ClassDeclarationHeader[] {
+	const headers: ClassDeclarationHeader[] = [];
+	const regex = new RegExp(CLASS_DECLARATION_REGEX);
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(content)) !== null) {
+		const headerStart = match.index + match[0].length;
+		const braceIndex = content.indexOf('{', headerStart);
+		const searchEnd = braceIndex === -1 ? content.length : braceIndex;
+		const whereMatch = /\bwhere\b/.exec(content.slice(headerStart, searchEnd));
+		const headerEnd = whereMatch ? headerStart + whereMatch.index : searchEnd;
+		headers.push({ name: match[1], headerStart, headerEnd });
+	}
+	return headers;
+}
+
+/**
+ * Same balanced-bracket extraction as `extractGenericInterfaceArgument`, but only looks
+ * for `interfaceName<` within `content.slice(rangeStart, rangeEnd)` (typically a single
+ * class's base-type list from `findClassDeclarationHeaders`), not the whole file.
+ */
+function findInterfaceArgsInRange(
+	content: string,
+	interfaceName: string,
+	rangeStart: number,
+	rangeEnd: number
+): string | undefined {
+	const pattern = new RegExp(`\\b${escapeRegExp(interfaceName)}\\s*<`);
+	const match = pattern.exec(content.slice(rangeStart, rangeEnd));
+	if (!match) {
+		return undefined;
+	}
+
+	const start = rangeStart + match.index + match[0].length;
+	let depth = 1;
+	let i = start;
+	while (i < content.length && depth > 0) {
+		const ch = content[i];
+		if (ch === '<') {
+			depth++;
+		} else if (ch === '>') {
+			depth--;
+		}
+		i++;
+	}
+
+	if (depth !== 0) {
+		return undefined;
+	}
+
+	return content.slice(start, i - 1).trim();
+}
+
+/**
+ * Inspects the content of a .cs file and returns mediator type information for the
+ * first class/record/struct that implements `IRequest<T>`, `IRequest`, or
+ * `INotification` (from MediatR or MitMediator) IN ITS OWN base-type list.
  *
- * Returns null if the file doesn't look like a mediator type file.
+ * Returns null if the file doesn't look like a mediator type file. Deliberately does
+ * NOT match a type mentioned only in a `where` generic constraint clause (e.g. a
+ * `IPipelineBehavior<TRequest, TResponse> where TRequest : IRequest<TResponse>` behavior
+ * class is not itself a request).
  */
 export function detectMediatorFile(content: string): MediatorFileInfo | null {
 	// Determine library from using directives
@@ -669,31 +740,26 @@ export function detectMediatorFile(content: string): MediatorFileInfo | null {
 	}
 	const library: MediatorLibrary = hasMitMediator ? 'MitMediator' : 'MediatR';
 
-	// Extract class name — look for the first public/internal/sealed class/struct/record declaration
-	const classMatch = content.match(
-		/(?:public|internal|sealed)\s+(?:sealed\s+)?(?:readonly\s+)?(?:record\s+struct|record|class|struct)\s+([A-Za-z_][A-Za-z0-9_]*)/
-	);
-	if (!classMatch) {
-		return null;
-	}
-	const className = classMatch[1];
+	for (const header of findClassDeclarationHeaders(content)) {
+		const headerSlice = content.slice(header.headerStart, header.headerEnd);
 
-	// INotification (no generic)
-	if (/\bINotification\b(?!\s*<)/.test(content)) {
-		return { className, kind: 'notification', library, returnType: null };
-	}
+		// INotification (no generic)
+		if (/\bINotification\b(?!\s*<)/.test(headerSlice)) {
+			return { className: header.name, kind: 'notification', library, returnType: null };
+		}
 
-	// IRequest<T>
-	const rt = extractGenericInterfaceArgument(content, 'IRequest');
-	if (rt !== undefined) {
-		// Unit means void
-		const returnType = (rt === 'Unit') ? null : rt;
-		return { className, kind: 'request', library, returnType };
-	}
+		// IRequest<T>
+		const rt = findInterfaceArgsInRange(content, 'IRequest', header.headerStart, header.headerEnd);
+		if (rt !== undefined) {
+			// Unit means void
+			const returnType = (rt === 'Unit') ? null : rt;
+			return { className: header.name, kind: 'request', library, returnType };
+		}
 
-	// IRequest (void, no generic)
-	if (/\bIRequest\b(?!\s*<)/.test(content)) {
-		return { className, kind: 'request', library, returnType: null };
+		// IRequest (void, no generic)
+		if (/\bIRequest\b(?!\s*<)/.test(headerSlice)) {
+			return { className: header.name, kind: 'request', library, returnType: null };
+		}
 	}
 
 	return null;
