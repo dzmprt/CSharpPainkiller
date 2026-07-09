@@ -187,7 +187,7 @@ Use VS Code settings (`Ctrl+,` / `Cmd+,`) to control which feature groups are vi
 | `csharppainkiller.solutionStructure.autoCheckPackages` | `true` | Automatically check NuGet package versions, dependencies, and known vulnerabilities when Solution Structure initializes |
 | `csharppainkiller.syncTypeAndFileName` | `true` | Automatically rename the `.cs` file when the single type inside it is renamed (on save), and rename the type when the file is renamed |
 | `csharppainkiller.diagnostics.wrongNamespace` | `true` | Warn when a file's namespace does not match its project path |
-| `csharppainkiller.diagnostics.wrongFilename` | `false` | Warn when a file name does not match its declared type name |
+| `csharppainkiller.diagnostics.wrongFilename` | `true` | Warn when a file name does not match its declared type name |
 | `csharppainkiller.diagnostics.unsortedUsings` | `false` | Warn when top-level `using` directives are not in C# Painkiller sort order |
 | `csharppainkiller.diagnostics.mixedLanguageIdentifiers` | `false` | Warn when identifiers mix Latin and non-Latin characters |
 | `csharppainkiller.diagnostics.duplicateTypeName` | `true` | Warn when a type name is declared in more than one file within the same project |

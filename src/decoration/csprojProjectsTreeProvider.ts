@@ -488,13 +488,19 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		if (!folderGuid) {
 			return;
 		}
+		const deletePhysicalFolder = await this.shouldDeletePhysicalFolder(target.physicalBaseUri, item.node.label);
+		if (deletePhysicalFolder === undefined) {
+			return;
+		}
 		const content = await readUtf8(target.solutionUri);
 		const updated = target.solutionUri.path.endsWith('.slnx')
 			? removeSlnxFolder(content, folderGuid)
 			: removeSlnFolder(content, folderGuid);
 		await vscode.workspace.fs.writeFile(target.solutionUri, Buffer.from(updated, 'utf-8'));
 
-		await this.deletePhysicalFolderIfNeeded(target.physicalBaseUri, item.node.label);
+		if (deletePhysicalFolder) {
+			await vscode.workspace.fs.delete(target.physicalBaseUri, { recursive: true, useTrash: true });
+		}
 		this.refresh();
 	}
 
@@ -1288,14 +1294,14 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		this.refresh();
 	}
 
-	private async deletePhysicalFolderIfNeeded(folderUri: vscode.Uri, label: string): Promise<void> {
+	private async shouldDeletePhysicalFolder(folderUri: vscode.Uri, label: string): Promise<boolean | undefined> {
 		try {
 			const stat = await vscode.workspace.fs.stat(folderUri);
 			if ((stat.type & vscode.FileType.Directory) !== vscode.FileType.Directory) {
-				return;
+				return false;
 			}
 		} catch {
-			return;
+			return false;
 		}
 
 		const entries = await vscode.workspace.fs.readDirectory(folderUri);
@@ -1303,14 +1309,18 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			const answer = await vscode.window.showWarningMessage(
 				`Physical folder "${label}" is not empty. Delete it too?`,
 				{ modal: true },
-				'Delete Physical Folder'
+				'Delete Physical Folder',
+				'Keep Physical Folder'
 			);
+			if (answer === 'Keep Physical Folder') {
+				return false;
+			}
 			if (answer !== 'Delete Physical Folder') {
-				return;
+				return undefined;
 			}
 		}
 
-		await vscode.workspace.fs.delete(folderUri, { recursive: true, useTrash: true });
+		return true;
 	}
 
 	private async resolveCreateFolderTarget(item?: CsprojProjectTreeItem): Promise<CreateFolderTarget | undefined> {
@@ -1379,6 +1389,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
+		const originalContent = await readUtf8(solutionUri);
 		const result = spawnSync('dotnet', ['sln', solutionUri.fsPath, 'add', projectUri.fsPath], {
 			cwd: solutionDir,
 			timeout: 120_000,
@@ -1387,12 +1398,20 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		if (result.error || result.status !== 0) {
 			throw result.error ?? new Error(result.stderr?.toString() || 'Failed to add project to solution');
 		}
-		const updatedContent = await readUtf8(solutionUri);
+		const updatedContent = this.removeNewSlnCommentLines(originalContent, await readUtf8(solutionUri));
 		const ensured = ensureSlnFolderPath(updatedContent, getProjectSolutionFolderPath(relativeProjectPath));
 		const updated = ensured.folderGuid
 			? moveSlnProjectToFolder(ensured.content, relativeProjectPath, ensured.folderGuid)
 			: ensured.content;
 		await vscode.workspace.fs.writeFile(solutionUri, Buffer.from(updated, 'utf-8'));
+	}
+
+	private removeNewSlnCommentLines(originalContent: string, updatedContent: string): string {
+		const originalComments = new Set(originalContent.split(/\r?\n/).filter(line => /^\s*#/.test(line)));
+		return updatedContent
+			.split(/\r?\n/)
+			.filter(line => !/^\s*#/.test(line) || originalComments.has(line))
+			.join('\n');
 	}
 
 	private async buildTree(): Promise<CsprojTreeNode[]> {
@@ -2087,20 +2106,35 @@ function ensureSlnFolderPath(content: string, folderPath: string | undefined): {
 
 function removeSlnFolder(content: string, folderGuid: string): string {
 	const guid = folderGuid.toUpperCase();
+	const entries = parseSlnProjects(content);
+	const removedGuids = new Set<string>([guid]);
+	let changed = true;
+	while (changed) {
+		changed = false;
+		for (const entry of entries) {
+			if (entry.parentGuid && removedGuids.has(entry.parentGuid.toUpperCase()) && !removedGuids.has(entry.guid.toUpperCase())) {
+				removedGuids.add(entry.guid.toUpperCase());
+				changed = true;
+			}
+		}
+	}
+
 	const folderProjectRegex = new RegExp(
-		`Project\\("\\{${escapeRegExp(SOLUTION_FOLDER_TYPE_GUID.toUpperCase())}\\}"\\)\\s*=\\s*"[^"]+",\\s*"[^"]+",\\s*"\\{${escapeRegExp(guid)}\\}"\\r?\\nEndProject\\r?\\n?`,
+		'Project\\("\\{[^}]+\\}"\\)\\s*=\\s*"[^"]+",\\s*"[^"]+",\\s*"\\{([^}]+)\\}"\\r?\\nEndProject\\r?\\n?',
 		'g'
 	);
-	let updated = content.replace(folderProjectRegex, '');
+	let updated = content.replace(folderProjectRegex, (block, entryGuid: string) =>
+		removedGuids.has(entryGuid.toUpperCase()) ? '' : block
+	);
 
-	const parentGuid = findSlnParentGuid(updated, guid);
 	updated = updated.replace(
 		/GlobalSection\(NestedProjects\)\s*=\s*preSolution([\s\S]*?)EndGlobalSection/g,
 		(_section, body: string) => {
-			const lines = body.split(/\r?\n/);
-			const rewrittenLines = lines
-				.map(line => rewriteNestedProjectLine(line, guid, parentGuid))
-				.filter((line): line is string => line !== null);
+			const rewrittenLines = body.split(/\r?\n/).filter(line => {
+				const match = line.match(/\{([^}]+)\}\s*=\s*\{([^}]+)\}/);
+				return !match
+					|| (!removedGuids.has(match[1].toUpperCase()) && !removedGuids.has(match[2].toUpperCase()));
+			});
 			const meaningfulLines = rewrittenLines.filter(line => line.trim().length > 0);
 			if (meaningfulLines.length === 0) {
 				return '';
@@ -2195,19 +2229,31 @@ function removeNestedProject(content: string, childGuid: string): string {
 }
 
 function upsertNestedProject(content: string, childGuid: string, parentGuid: string): string {
-	const nestedLine = `\t\t{${childGuid.toUpperCase()}} = {${parentGuid.toUpperCase()}}\n`;
-	const nestedSection = content.match(/GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/);
+	const nestedSectionRegex = /GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/;
+	const nestedSection = content.match(nestedSectionRegex);
 	if (nestedSection?.index !== undefined) {
-		const childRegex = new RegExp(`\\t*\\s*\\{${escapeRegExp(childGuid)}\\}\\s*=\\s*\\{[^}]+\\}\\r?\\n?`, 'i');
-		let updated = content.replace(childRegex, '');
-		const updatedSection = updated.match(/GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/);
-		if (updatedSection?.index !== undefined) {
-			const insertIndex = updatedSection.index + updatedSection[0].lastIndexOf('EndGlobalSection');
-			updated = `${updated.slice(0, insertIndex)}${nestedLine}${updated.slice(insertIndex)}`;
+		const section = nestedSection[0];
+		const lineEnding = section.includes('\r\n') ? '\r\n' : '\n';
+		const mappingIndent = section.match(/^[ \t]*(?=\{[^}\r\n]+\}\s*=\s*\{[^}\r\n]+\})/m)?.[0] ?? '\t\t';
+		const childMappingRegex = new RegExp(
+			`^[ \\t]*\\{${escapeRegExp(childGuid)}\\}\\s*=\\s*\\{[^}]+\\}[ \\t]*(?:\\r?\\n|$)`,
+			'gmi',
+		);
+		const withoutChildMapping = section.replace(childMappingRegex, '');
+		const endMarker = 'EndGlobalSection';
+		const endIndex = withoutChildMapping.lastIndexOf(endMarker);
+		if (endIndex < 0) {
+			return content;
 		}
-		return updated;
+
+		const beforeEnd = withoutChildMapping.slice(0, endIndex);
+		const separator = beforeEnd.endsWith('\n') ? '' : lineEnding;
+		const nestedLine = `${mappingIndent}{${childGuid.toUpperCase()}} = {${parentGuid.toUpperCase()}}`;
+		const updatedSection = `${beforeEnd}${separator}${nestedLine}${lineEnding}${withoutChildMapping.slice(endIndex)}`;
+		return `${content.slice(0, nestedSection.index)}${updatedSection}${content.slice(nestedSection.index + section.length)}`;
 	}
 
+	const nestedLine = `\t\t{${childGuid.toUpperCase()}} = {${parentGuid.toUpperCase()}}`;
 	const endGlobalIndex = content.lastIndexOf('EndGlobal');
 	const section = [
 		'\tGlobalSection(NestedProjects) = preSolution',
@@ -2219,46 +2265,17 @@ function upsertNestedProject(content: string, childGuid: string, parentGuid: str
 		: `${content.trimEnd()}\nGlobal\n${section}\nEndGlobal\n`;
 }
 
-function findSlnParentGuid(content: string, folderGuid: string): string | undefined {
-	const nestedMatch = content.match(/GlobalSection\(NestedProjects\)\s*=\s*preSolution[\s\S]*?EndGlobalSection/);
-	if (!nestedMatch) {
-		return undefined;
-	}
-
-	const parentRegex = new RegExp(`\\{${escapeRegExp(folderGuid)}\\}\\s*=\\s*\\{([^}]+)\\}`, 'i');
-	const parentMatch = parentRegex.exec(nestedMatch[0]);
-	return parentMatch?.[1]?.toUpperCase();
-}
-
-function rewriteNestedProjectLine(line: string, folderGuid: string, parentGuid: string | undefined): string | null {
-	const match = line.match(/(\{([^}]+)\}\s*=\s*)\{([^}]+)\}/);
-	if (!match) {
-		return line;
-	}
-
-	const childGuid = match[2].toUpperCase();
-	const currentParentGuid = match[3].toUpperCase();
-	if (childGuid === folderGuid) {
-		return null;
-	}
-	if (currentParentGuid !== folderGuid) {
-		return line;
-	}
-	if (!parentGuid) {
-		return null;
-	}
-	return line.replace(/\{[^}]+\}\s*$/, `{${parentGuid}}`);
-}
-
 function addSlnxFolder(content: string, folderName: string, parentPath?: string): string {
+	let solutionFolderPath = folderName;
 	if (parentPath) {
-		const inserted = insertFolderIntoSlnxFolder(content, parentPath, folderName);
-		if (inserted !== content) {
-			return inserted;
+		const entries = parseSlnxProjects(content);
+		const parent = entries.find(entry => entry.isSolutionFolder && entry.guid === parentPath);
+		if (parent) {
+			solutionFolderPath = `${getSolutionFolderPath(parent, entries)}/${folderName}`;
 		}
 	}
 
-	const folderXml = `  <Folder Name="/${escapeXml(folderName)}/" />\n`;
+	const folderXml = `  <Folder Name="/${escapeXml(solutionFolderPath)}/" />\n`;
 	const solutionCloseIndex = content.lastIndexOf('</Solution>');
 	return solutionCloseIndex >= 0
 		? `${content.slice(0, solutionCloseIndex)}${folderXml}${content.slice(solutionCloseIndex)}`
@@ -2274,39 +2291,14 @@ function ensureSlnxFolderPath(content: string, folderPath: string | undefined): 
 	let updated = content;
 	let currentPath = '';
 	for (const segment of segments) {
-		const parentPath = currentPath || undefined;
 		currentPath = currentPath ? `${currentPath}/${segment}` : segment;
 		if (findSlnxFolderStart(updated, currentPath)) {
 			continue;
 		}
-		updated = addSlnxFolder(updated, segment, parentPath);
+		updated = addSlnxFolder(updated, currentPath);
 	}
 
 	return { content: updated, folderPath: currentPath };
-}
-
-function insertFolderIntoSlnxFolder(content: string, targetFolderPath: string, folderName: string): string {
-	const folderStart = findSlnxFolderStart(content, targetFolderPath);
-	if (!folderStart) {
-		return content;
-	}
-
-	const indent = getLineIndent(content, folderStart.index);
-	const childIndent = `${indent}  `;
-	const folderXml = `${childIndent}<Folder Name="/${escapeXml(folderName)}/" />\n`;
-
-	if (folderStart.isSelfClosing) {
-		const openTag = content.slice(folderStart.index, folderStart.end).replace(/\s*\/>$/, '>');
-		const replacement = `${openTag}\n${folderXml}${indent}</Folder>`;
-		return `${content.slice(0, folderStart.index)}${replacement}${content.slice(folderStart.end)}`;
-	}
-
-	const close = findClosingSlnxFolder(content, folderStart.index);
-	if (!close) {
-		return content;
-	}
-
-	return `${content.slice(0, close.index)}${folderXml}${content.slice(close.index)}`;
 }
 
 function addSlnxProject(content: string, relativeProjectPath: string, targetFolderPath?: string): string {
@@ -2339,13 +2331,14 @@ function insertProjectIntoSlnxFolder(content: string, targetFolderPath: string, 
 		return content;
 	}
 
-	const indent = getLineIndent(content, folderStart.index);
-	const childIndent = `${indent}  `;
-	const indentedProjectXml = projectXml.replace(/^  /, childIndent);
+	const folderIndent = getLineIndent(content, folderStart.index);
+	const projectIndent = `${folderIndent}  `;
+	const projectLine = projectXml.trim();
+	const indentedProjectXml = `${projectIndent}${projectLine}\n`;
 
 	if (folderStart.isSelfClosing) {
 		const openTag = content.slice(folderStart.index, folderStart.end).replace(/\s*\/>$/, '>');
-		const replacement = `${openTag}\n${indentedProjectXml}${indent}</Folder>`;
+		const replacement = `${openTag.trim()}\n${indentedProjectXml}${folderIndent}</Folder>`;
 		return `${content.slice(0, folderStart.index)}${replacement}${content.slice(folderStart.end)}`;
 	}
 
@@ -2354,7 +2347,8 @@ function insertProjectIntoSlnxFolder(content: string, targetFolderPath: string, 
 		return content;
 	}
 
-	return `${content.slice(0, close.index)}${indentedProjectXml}${content.slice(close.index)}`;
+	const closeLineStart = content.lastIndexOf('\n', close.index - 1) + 1;
+	return `${content.slice(0, closeLineStart)}${indentedProjectXml}${folderIndent}${content.slice(close.index)}`;
 }
 
 function removeSlnxProject(content: string, projectPath: string): string {
@@ -2369,6 +2363,50 @@ function removeSlnxFolder(content: string, folderPath: string): string {
 	const normalizedFolderPath = normalizeSolutionFolderPath(folderPath);
 	if (!normalizedFolderPath) {
 		return content;
+	}
+
+	const folderRegex = /<\s*(\/?)\s*Folder\b([^>]*?)(\/?)>/gi;
+	const folderStack: Array<{ path: string; start: number }> = [];
+	const removals: Array<{ start: number; end: number }> = [];
+	let match: RegExpExecArray | null;
+
+	while ((match = folderRegex.exec(content)) !== null) {
+		const isClosing = match[1] === '/';
+		if (isClosing) {
+			const folder = folderStack.pop();
+			if (folder && isSolutionFolderDescendant(folder.path, normalizedFolderPath)) {
+				removals.push({ start: folder.start, end: findLineEnd(content, match.index + match[0].length) });
+			}
+			continue;
+		}
+
+		const attrs = parseAttributes(match[2]);
+		const value = attrs.get('Path') ?? attrs.get('Name');
+		if (!value) {
+			continue;
+		}
+		const isSelfClosing = match[3] === '/' || /\/\s*$/.test(match[2]);
+		const folderPath = normalizeSolutionFolderPath(
+			attrs.has('Path') ? value : [...folderStack.map(folder => folder.path), value].join('/')
+		);
+		if (isSelfClosing) {
+			if (isSolutionFolderDescendant(folderPath, normalizedFolderPath)) {
+				const lineStart = content.lastIndexOf('\n', match.index - 1) + 1;
+				removals.push({ start: lineStart, end: findLineEnd(content, match.index + match[0].length) });
+			}
+			continue;
+		}
+
+		folderStack.push({ path: folderPath, start: content.lastIndexOf('\n', match.index - 1) + 1 });
+	}
+
+	if (removals.length > 0) {
+		const distinctRemovals = removals
+			.filter((removal, index, all) => all.findIndex(candidate => candidate.start === removal.start && candidate.end === removal.end) === index)
+			.filter((removal, _, all) => !all.some(candidate => candidate !== removal && candidate.start <= removal.start && candidate.end >= removal.end));
+		return removeExtraBlankLines(distinctRemovals
+			.sort((a, b) => b.start - a.start)
+			.reduce((updated, removal) => `${updated.slice(0, removal.start)}${updated.slice(removal.end)}`, content));
 	}
 
 	const folderStart = findSlnxFolderStart(content, normalizedFolderPath);
@@ -2393,6 +2431,10 @@ function removeSlnxFolder(content: string, folderPath: string): string {
 		return `${content.slice(0, lineStart)}${content.slice(closeLineEnd)}`;
 	}
 	return removeExtraBlankLines(`${content.slice(0, lineStart)}${innerContent}${content.slice(closeLineEnd)}`);
+}
+
+function isSolutionFolderDescendant(folderPath: string, parentPath: string): boolean {
+	return folderPath === parentPath || folderPath.startsWith(`${parentPath}/`);
 }
 
 function findSlnxFolderStart(content: string, normalizedFolderPath: string): { index: number; end: number; isSelfClosing: boolean } | undefined {

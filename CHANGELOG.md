@@ -4,6 +4,16 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.9]
+
+### Changed
+
+- **Solution Structure folder deletion** — deleting a solution folder now asks whether its non-empty physical folder should also be removed, with the option to keep it
+- **Wrong filename diagnostics** — enabled by default for open C# files
+
+### Fixed
+- **Solution Structure `.sln/.slnx` management** — fixed nested solution folders
+
 ## [0.0.8]
 
 ### Added
