@@ -4,7 +4,15 @@ import { removeUnusedUsingsFromContent } from '../services/removeUnusedUsings.js
 import { extractPublicMembers } from '../services/extractInterface.js';
 import { collectTopLevelUsingBlock, isUsingOrderSorted } from '../utils/usingBlock.js';
 import { collectPackageVulnerabilities, collectProjectPackages, compareVersions } from '../services/nugetCommands.js';
-import { isAutomaticPackageCheckEnabled, parsePackageReferences, updatePackageReferenceVersionInCsproj } from '../decoration/csprojProjectsTreeProvider.js';
+import {
+	addPackageReferenceToCsproj,
+	addPackageVersionToProps,
+	getCentralPackageVersion,
+	isAutomaticPackageCheckEnabled,
+	parsePackageReferences,
+	removePackageVersionFromProps,
+	updatePackageReferenceVersionInCsproj,
+} from '../decoration/csprojProjectsTreeProvider.js';
 import {
 	parsePublicProperties,
 	generateEfCoreEntityTypeConfiguration,
@@ -14,6 +22,12 @@ import {
 	generateEmptyController,
 } from '../services/templates/aspnet.js';
 import { generateFluentValidatorContent } from '../services/generateFluentValidator.js';
+import {
+	buildDirectoryPackagesProps,
+	createMigrationPlan,
+	parseVersionedPackageReferences,
+	removePackageVersions,
+} from '../services/migrateToCentralPackageManagement.js';
 import {
 	capitalize,
 	toPascalCase,
@@ -242,6 +256,140 @@ suite('services', () => {
 				{ name: 'Humanizer.Core', version: undefined },
 				{ name: 'xunit', version: undefined },
 			]);
+		});
+	});
+
+	suite('central package management migration', () => {
+		test('parses attribute and child PackageReference versions', () => {
+			assert.deepStrictEqual(
+				parseVersionedPackageReferences([
+					'<PackageReference Include="Serilog" Version="3.1.1" />',
+					'<PackageReference Include="Moq">',
+					'  <Version>4.20.0</Version>',
+					'</PackageReference>',
+					'<PackageReference Include="NoVersion" />',
+				].join('\n')),
+				[
+					{ name: 'Serilog', version: '3.1.1' },
+					{ name: 'Moq', version: '4.20.0' },
+				],
+			);
+		});
+
+		test('removes local versions while preserving other metadata', () => {
+			const updated = removePackageVersions([
+				'<PackageReference Include="Serilog" Version="3.1.1" />',
+				'<PackageReference Include="Moq">',
+				'  <Version>4.20.0</Version>',
+				'  <PrivateAssets>all</PrivateAssets>',
+				'</PackageReference>',
+			].join('\n'), new Set(['Serilog', 'Moq']));
+
+			assert.ok(!updated.includes('Version="3.1.1"'));
+			assert.ok(!updated.includes('<Version>4.20.0</Version>'));
+			assert.ok(updated.includes('<PrivateAssets>all</PrivateAssets>'));
+		});
+
+		test('creates Directory.Packages.props and project updates', () => {
+			const plan = createMigrationPlan(new Map([
+				['A.csproj', '<Project><PackageReference Include="Serilog" Version="3.1.1" /></Project>'],
+			]));
+			const props = buildDirectoryPackagesProps(undefined, plan.centralVersions).content!;
+
+			assert.strictEqual(plan.conflicts.length, 0);
+			assert.ok(props.includes('<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>'));
+			assert.ok(props.includes('Include="Serilog" Version="3.1.1"'));
+			const updatedProject = plan.projectUpdates.get('A.csproj')!;
+			assert.ok(updatedProject.includes('<PackageReference Include="Serilog"'));
+			assert.ok(!updatedProject.includes('Version="3.1.1"'));
+		});
+
+		test('reports conflicting versions before producing updates', () => {
+			const plan = createMigrationPlan(new Map([
+				['A.csproj', '<PackageReference Include="Serilog" Version="3.1.1" />'],
+				['B.csproj', '<PackageReference Include="Serilog" Version="4.0.0" />'],
+			]));
+
+			assert.strictEqual(plan.projectUpdates.size, 0);
+			assert.ok(plan.conflicts.some(conflict => conflict.includes('Serilog')));
+		});
+
+		test('enables existing central management and preserves existing entries', () => {
+			const existingProps = [
+				'<Project>',
+				'  <PropertyGroup><ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally></PropertyGroup>',
+				'  <ItemGroup><PackageVersion Include="Moq" Version="4.20.0" /></ItemGroup>',
+				'</Project>',
+			].join('\n');
+			const plan = createMigrationPlan(
+				new Map([
+					['A.csproj', '<PackageReference Include="Serilog" Version="3.1.1" />'],
+				]),
+				existingProps,
+			);
+			const props = buildDirectoryPackagesProps(existingProps, plan.centralVersions).content!;
+
+			assert.strictEqual(plan.conflicts.length, 0);
+			assert.ok(props.includes('<ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>'));
+			assert.ok(props.includes('Include="Moq" Version="4.20.0"'));
+			assert.ok(props.includes('Include="Serilog" Version="3.1.1"'));
+			assert.ok(!plan.projectUpdates.get('A.csproj')!.includes('Version="3.1.1"'));
+		});
+	});
+
+	suite('central package management when adding packages', () => {
+		test('reads attribute and nested central versions', () => {
+			const content = [
+				'<Project><ItemGroup>',
+				'  <PackageVersion Include="Serilog" Version="3.1.1" />',
+				'  <PackageVersion Include="Moq"><Version>4.20.0</Version></PackageVersion>',
+				'</ItemGroup></Project>',
+			].join('\n');
+
+			assert.strictEqual(getCentralPackageVersion(content, 'Serilog'), '3.1.1');
+			assert.strictEqual(getCentralPackageVersion(content, 'Moq'), '4.20.0');
+			assert.strictEqual(getCentralPackageVersion(content, 'Missing'), undefined);
+		});
+
+		test('adds a missing central version and omits the project version', () => {
+			const props = '<Project>\n  <ItemGroup>\n  </ItemGroup>\n</Project>\n';
+			const updatedProps = addPackageVersionToProps(props, 'FluentValidation', '11.3.0');
+			const updatedProject = addPackageReferenceToCsproj('<Project>\n</Project>\n', 'FluentValidation');
+
+			assert.ok(updatedProps.includes('Include="FluentValidation" Version="11.3.0"'));
+			assert.ok(updatedProject.includes('<PackageReference Include="FluentValidation" />'));
+		});
+
+		test('omits the project version for a matching central version', () => {
+			const project = addPackageReferenceToCsproj('<Project>\n</Project>\n', 'Serilog');
+
+			assert.ok(project.includes('<PackageReference Include="Serilog" />'));
+		});
+
+		test('keeps the project version for a conflicting central version', () => {
+			const project = addPackageReferenceToCsproj('<Project>\n</Project>\n', 'Serilog', '4.0.0');
+
+			assert.ok(project.includes('<PackageReference Include="Serilog" Version="4.0.0" />'));
+		});
+
+		test('removes an unused central package version while preserving other packages', () => {
+			const props = [
+				'<Project><ItemGroup>',
+				'  <PackageVersion Include="Serilog" Version="3.1.1" />',
+				'  <PackageVersion Include="Moq"><Version>4.20.0</Version></PackageVersion>',
+				'</ItemGroup></Project>',
+			].join('\n');
+
+			const updated = removePackageVersionFromProps(props, 'Serilog');
+
+			assert.ok(!updated.includes('Include="Serilog"'));
+			assert.ok(updated.includes('Include="Moq"'));
+		});
+
+		test('removes nested central package versions case-insensitively', () => {
+			const props = '<Project><ItemGroup>\n  <PackageVersion Include="SERILOG"><Version>3.1.1</Version></PackageVersion>\n</ItemGroup></Project>';
+
+			assert.ok(!removePackageVersionFromProps(props, 'Serilog').includes('PackageVersion'));
 		});
 	});
 

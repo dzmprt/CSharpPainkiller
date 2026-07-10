@@ -45,9 +45,8 @@ function removeFromIndex(index: NameIndex, projectKey: string, name: string, fil
  * (same type name declared in more than one file of the same project).
  *
  * Built once at startup via a full workspace scan, then kept fresh via a `**\/*.cs`
- * file watcher (for files not currently open) AND via `updateFileContent()` (called
- * from the diagnostics pipeline whenever an open file is (re-)analyzed, so unsaved
- * edits are reflected immediately without waiting for a save).
+ * file watcher (for files not currently open) and via `updateFileContent()` during
+ * an explicit solution analysis, so unsaved edits are reflected in that scan.
  */
 export class ProjectTypeIndex {
 	private static instance: ProjectTypeIndex | null = null;

@@ -9,8 +9,10 @@ type CsprojTreeNode =
 	| ProjectNode
 	| ReferenceGroupNode
 	| PackageGroupNode
+	| CentralPackageGroupNode
 	| ProjectReferenceNode
 	| PackageReferenceNode
+	| CentralPackageReferenceNode
 	| PackageDependencyNode
 	| ExcludedProjectsNode
 	| ExcludedProjectNode
@@ -71,6 +73,15 @@ interface PackageGroupNode {
 	children: PackageReferenceNode[];
 }
 
+interface CentralPackageGroupNode {
+	kind: 'centralPackageGroup';
+	label: string;
+	solutionUri: vscode.Uri;
+	centralPropsUri: vscode.Uri;
+	representativeCsprojUri?: vscode.Uri;
+	children: CentralPackageReferenceNode[];
+}
+
 interface ProjectReferenceNode {
 	kind: 'projectReference';
 	label: string;
@@ -90,6 +101,16 @@ interface PackageReferenceNode {
 	/** Transitive dependencies declared by the installed version, if any (read-only display). */
 	dependencies?: PackageDependencyNode[];
 	project: ProjectNode;
+}
+
+interface CentralPackageReferenceNode {
+	kind: 'centralPackageReference';
+	label: string;
+	version: string;
+	latestVersion?: string;
+	centralPropsUri: vscode.Uri;
+	solutionUri: vscode.Uri;
+	representativeCsprojUri?: vscode.Uri;
 }
 
 interface PackageDependencyNode {
@@ -212,6 +233,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	/** Latest known available version per package, keyed by `csprojUri::packageId (lowercase)`. */
 	private readonly packageUpdateCache = new Map<string, string>();
 
+	/** Latest available version per central package, keyed by props file and package id. */
+	private readonly centralPackageUpdateCache = new Map<string, string>();
+
 	/** Installed/resolved package version per package, including central package management projects. */
 	private readonly packageVersionCache = new Map<string, string>();
 
@@ -266,6 +290,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		return `${csprojUri.toString()}::${packageId.toLowerCase()}`;
 	}
 
+	private centralPackageCacheKey(centralPropsUri: vscode.Uri, packageId: string): string {
+		return `${centralPropsUri.toString()}::${packageId.toLowerCase()}`;
+	}
+
 	getTreeItem(element: CsprojProjectTreeItem): vscode.TreeItem {
 		return element;
 	}
@@ -274,6 +302,15 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const node = element.node;
 		if (node.kind === 'referenceGroup' || node.kind === 'packageGroup') {
 			return this.createTreeItem(node.project);
+		}
+		if (node.kind === 'centralPackageReference') {
+			return this.createTreeItem({
+				kind: 'centralPackageGroup',
+				label: 'Central Packages',
+				solutionUri: node.solutionUri,
+				centralPropsUri: node.centralPropsUri,
+				children: [],
+			});
 		}
 		if (node.kind === 'packageReference') {
 			return this.createTreeItem({ kind: 'packageGroup', label: 'Packages', project: node.project, children: [] });
@@ -824,11 +861,32 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 
 		const content = await readUtf8(project.csprojUri);
-		const updated = addPackageReferenceToCsproj(content, result.id, result.version);
+		const centralPackageVersionsUri = await findCentralPackageVersionsFile(pathModule.dirname(project.csprojUri.fsPath));
+		let includeProjectVersion = true;
+		let installedVersion = result.version;
+		if (centralPackageVersionsUri) {
+			const centralContent = await readUtf8(centralPackageVersionsUri);
+			const centralVersion = getCentralPackageVersion(centralContent, result.id);
+			if (!centralVersion) {
+				const updatedCentralContent = addPackageVersionToProps(centralContent, result.id, result.version);
+				if (updatedCentralContent !== centralContent) {
+					await vscode.workspace.fs.writeFile(centralPackageVersionsUri, Buffer.from(updatedCentralContent, 'utf-8'));
+				}
+				includeProjectVersion = false;
+			} else {
+				includeProjectVersion = compareVersions(centralVersion, result.version) !== 0;
+				if (!includeProjectVersion) {
+					installedVersion = centralVersion;
+				}
+			}
+		}
+
+		const updated = addPackageReferenceToCsproj(content, result.id, includeProjectVersion ? result.version : undefined);
 		await vscode.workspace.fs.writeFile(project.csprojUri, Buffer.from(updated, 'utf-8'));
-		this.packageUpdateCache.delete(this.packageCacheKey(project.csprojUri, result.id));
-		this.packageVersionCache.delete(this.packageCacheKey(project.csprojUri, result.id));
-		this.packageDependencyCache.delete(this.packageCacheKey(project.csprojUri, result.id));
+		const packageCacheKey = this.packageCacheKey(project.csprojUri, result.id);
+		this.packageUpdateCache.delete(packageCacheKey);
+		this.packageVersionCache.set(packageCacheKey, installedVersion);
+		this.packageDependencyCache.delete(packageCacheKey);
 		this.packageVulnerabilityCache.delete(project.csprojUri.toString());
 		this.refresh();
 
@@ -836,7 +894,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		// available and whether it has known vulnerabilities, so the tree reflects both
 		// without requiring a separate manual "Check for Package Updates" run.
 		void Promise.all([
-			this.refreshPackageInfo(project.csprojUri, result.id, result.version),
+			this.refreshPackageInfo(project.csprojUri, result.id, installedVersion),
 			this.refreshProjectVulnerabilities(project.csprojUri),
 		]).then(() => this.refresh());
 	}
@@ -845,6 +903,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	 * Replaces an outdated package's `Version` with its latest available version.
 	 */
 	async updatePackageReference(item?: CsprojProjectTreeItem): Promise<void> {
+		if (item?.node.kind === 'centralPackageReference') {
+			await this.updateCentralPackageReference(item.node);
+			return;
+		}
 		if (!item || item.node.kind !== 'packageReference' || !item.node.latestVersion) {
 			vscode.window.showErrorMessage('CSharp Painkiller: Select an outdated package to update.');
 			return;
@@ -857,8 +919,11 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
-		this.packageUpdateCache.delete(this.packageCacheKey(project.csprojUri, packageId));
+		const packageCacheKey = this.packageCacheKey(project.csprojUri, packageId);
+		this.packageUpdateCache.delete(packageCacheKey);
+		this.packageVersionCache.set(packageCacheKey, latestVersion);
 		this.packageVulnerabilityCache.delete(project.csprojUri.toString());
+		await this.cacheCentralPackageVersionForProjects(project, packageId, latestVersion);
 		await this.refreshAndRevealPackageGroup(project);
 		vscode.window.showInformationMessage(`CSharp Painkiller: Updated "${packageId}" to ${latestVersion}.`);
 
@@ -874,6 +939,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	 * applies all pending updates instead of a single package.
 	 */
 	async updateAllPackageReferences(item?: CsprojProjectTreeItem): Promise<void> {
+		if (item?.node.kind === 'centralPackageGroup') {
+			await this.updateAllCentralPackageReferences(item.node);
+			return;
+		}
 		if (!item || item.node.kind !== 'packageGroup') {
 			vscode.window.showErrorMessage('CSharp Painkiller: Select a project\'s Packages group to update all packages.');
 			return;
@@ -902,6 +971,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		for (const pkg of updatedPackages) {
 			this.packageUpdateCache.delete(this.packageCacheKey(project.csprojUri, pkg.packageId));
 			this.packageVersionCache.set(this.packageCacheKey(project.csprojUri, pkg.packageId), pkg.version);
+			await this.cacheCentralPackageVersionForProjects(project, pkg.packageId, pkg.version);
 		}
 		this.packageVulnerabilityCache.delete(project.csprojUri.toString());
 		await this.refreshAndRevealPackageGroup(project);
@@ -912,6 +982,89 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		void Promise.all(
 			updatedPackages.map(pkg => this.refreshPackageInfo(project.csprojUri, pkg.packageId, pkg.version)),
 		).then(() => this.refreshAndRevealPackageGroup(project));
+	}
+
+	private async updateCentralPackageReference(node: CentralPackageReferenceNode): Promise<void> {
+		if (!node.latestVersion) {
+			vscode.window.showErrorMessage('CSharp Painkiller: Select an outdated central package to update.');
+			return;
+		}
+
+		const content = await readUtf8(node.centralPropsUri);
+		const updated = updatePackageVersionInProps(content, node.label, node.latestVersion);
+		if (updated === content) {
+			vscode.window.showErrorMessage(`CSharp Painkiller: Could not locate "${node.label}" in Directory.Packages.props.`);
+			return;
+		}
+
+		await vscode.workspace.fs.writeFile(node.centralPropsUri, Buffer.from(updated, 'utf-8'));
+		const key = this.centralPackageCacheKey(node.centralPropsUri, node.label);
+		this.centralPackageUpdateCache.delete(key);
+		await this.cacheCentralPackageVersionForProjectsByProps(node.centralPropsUri, node.label, node.latestVersion);
+		this.refresh();
+		vscode.window.showInformationMessage(`CSharp Painkiller: Updated central package "${node.label}" to ${node.latestVersion}.`);
+	}
+
+	private async updateAllCentralPackageReferences(node: CentralPackageGroupNode): Promise<void> {
+		const outdated = node.children.filter(packageNode => packageNode.latestVersion && packageNode.latestVersion !== packageNode.version);
+		if (outdated.length === 0) {
+			vscode.window.showInformationMessage('CSharp Painkiller: All central packages are up to date.');
+			return;
+		}
+
+		let content = await readUtf8(node.centralPropsUri);
+		const updatedPackages: { packageId: string; version: string }[] = [];
+		for (const packageNode of outdated) {
+			const updated = updatePackageVersionInProps(content, packageNode.label, packageNode.latestVersion!);
+			if (updated !== content) {
+				content = updated;
+				updatedPackages.push({ packageId: packageNode.label, version: packageNode.latestVersion! });
+			}
+		}
+
+		if (updatedPackages.length === 0) {
+			vscode.window.showErrorMessage('CSharp Painkiller: Could not update the central package versions.');
+			return;
+		}
+
+		await vscode.workspace.fs.writeFile(node.centralPropsUri, Buffer.from(content, 'utf-8'));
+		for (const packageNode of updatedPackages) {
+			this.centralPackageUpdateCache.delete(this.centralPackageCacheKey(node.centralPropsUri, packageNode.packageId));
+			await this.cacheCentralPackageVersionForProjectsByProps(node.centralPropsUri, packageNode.packageId, packageNode.version);
+		}
+		this.refresh();
+		vscode.window.showInformationMessage(`CSharp Painkiller: Updated ${updatedPackages.length} central package(s).`);
+	}
+
+	private async checkCentralPackageUpdatesForGroup(node: CentralPackageGroupNode): Promise<void> {
+		if (!node.representativeCsprojUri) {
+			vscode.window.showWarningMessage('CSharp Painkiller: No project is available to check central package sources.');
+			return;
+		}
+
+		await this.checkCentralPackageUpdates(node.centralPropsUri, node.representativeCsprojUri);
+		this.refresh();
+	}
+
+	private async checkCentralPackageUpdates(
+		centralPropsUri: vscode.Uri,
+		representativeCsprojUri: vscode.Uri,
+	): Promise<void> {
+		const content = await readUtf8(centralPropsUri);
+		const packages = parsePackageVersions(content);
+		await runWithConcurrencyLimit(packages, PACKAGE_CHECK_CONCURRENCY, async packageVersion => {
+			const key = this.centralPackageCacheKey(centralPropsUri, packageVersion.name);
+			try {
+				const latest = await getLatestPackageVersion(representativeCsprojUri.fsPath, packageVersion.name);
+				if (latest && compareVersions(latest, packageVersion.version) > 0) {
+					this.centralPackageUpdateCache.set(key, latest);
+				} else {
+					this.centralPackageUpdateCache.delete(key);
+				}
+			} catch {
+				// Leave the previous result intact when sources are unavailable.
+			}
+		});
 	}
 
 	/**
@@ -983,6 +1136,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	 * each — shown in the tree as "current → latest" plus an expandable dependency list.
 	 */
 	async checkPackageUpdates(item?: CsprojProjectTreeItem): Promise<void> {
+		if (item?.node.kind === 'centralPackageGroup') {
+			await this.checkCentralPackageUpdatesForGroup(item.node);
+			return;
+		}
 		const project = item?.node.kind === 'packageGroup'
 			? item.node.project
 			: item?.node.kind === 'project'
@@ -1134,6 +1291,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 						// Skip unreadable project files.
 					}
 				}
+				await this.checkAllCentralPackageUpdates(csprojFiles);
 
 				if (packageCount === 0) {
 					return { failedCount: 0, packageCount: 0 };
@@ -1212,7 +1370,6 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return { failedCount, packageCount };
 		},
 		);
-
 		this.refresh();
 
 		if (checkResult.failedCount > 0) {
@@ -1222,6 +1379,30 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 					: `CSharp Painkiller: Could not check ${checkResult.failedCount} of ${checkResult.packageCount} package(s) for updates (no configured source could be reached).`,
 			);
 		}
+	}
+
+
+	private async checkAllCentralPackageUpdates(csprojFiles: vscode.Uri[]): Promise<void> {
+		const propsFiles = await vscode.workspace.findFiles('**/Directory.Packages.props', '{**/bin/**,**/obj/**}');
+		await Promise.all(propsFiles.map(async centralPropsUri => {
+			const representative = await this.findCentralPackageRepresentativeFromFiles(centralPropsUri, csprojFiles);
+			if (representative) {
+				await this.checkCentralPackageUpdates(centralPropsUri, representative);
+			}
+		}));
+	}
+
+	private async findCentralPackageRepresentativeFromFiles(
+		centralPropsUri: vscode.Uri,
+		csprojFiles: vscode.Uri[],
+	): Promise<vscode.Uri | undefined> {
+		for (const csprojUri of csprojFiles) {
+			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(csprojUri.fsPath));
+			if (projectCentralPropsUri && normalizePath(projectCentralPropsUri.fsPath) === normalizePath(centralPropsUri.fsPath)) {
+				return csprojUri;
+			}
+		}
+		return undefined;
 	}
 
 	async removePackageReference(item?: CsprojProjectTreeItem): Promise<void> {
@@ -1247,6 +1428,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		this.packageVersionCache.delete(key);
 		this.packageDependencyCache.delete(key);
 		this.packageVulnerabilityCache.delete(item.node.project.csprojUri.toString());
+		await this.removeUnusedCentralPackageVersion(item.node.project, item.node.label);
 		await this.refreshAndRevealPackageGroup(item.node.project);
 	}
 
@@ -1270,6 +1452,66 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			this.createTreeItem({ kind: 'packageGroup', label: 'Packages', project, children: [] }),
 			{ expand: true, focus: false, select: false },
 		).then(undefined, err => console.warn('CSharp Painkiller: could not restore Packages tree expansion', err));
+	}
+
+	private async cacheCentralPackageVersionForProjects(
+		updatedProject: ProjectNode,
+		packageId: string,
+		version: string,
+	): Promise<void> {
+		const centralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(updatedProject.csprojUri.fsPath));
+		if (!centralPropsUri) {
+			return;
+		}
+		await this.cacheCentralPackageVersionForProjectsByProps(centralPropsUri, packageId, version);
+	}
+
+	private async cacheCentralPackageVersionForProjectsByProps(
+		centralPropsUri: vscode.Uri,
+		packageId: string,
+		version: string,
+	): Promise<void> {
+
+		const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+		await Promise.all(projectUris.map(async projectUri => {
+			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(projectUri.fsPath));
+			if (!projectCentralPropsUri || normalizePath(projectCentralPropsUri.fsPath) !== normalizePath(centralPropsUri.fsPath)) {
+				return;
+			}
+
+			const content = await readUtf8(projectUri);
+			const packageReference = parsePackageReferences(content).find(reference => reference.name.toLowerCase() === packageId.toLowerCase());
+			if (packageReference && !packageReference.version) {
+				this.packageVersionCache.set(this.packageCacheKey(projectUri, packageId), version);
+			}
+		}));
+	}
+
+	private async removeUnusedCentralPackageVersion(project: ProjectNode, packageId: string): Promise<void> {
+		const centralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(project.csprojUri.fsPath));
+		if (!centralPropsUri) {
+			return;
+		}
+
+		const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+		const packageReferences = await Promise.all(projectUris.map(async projectUri => {
+			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(projectUri.fsPath));
+			if (!projectCentralPropsUri || normalizePath(projectCentralPropsUri.fsPath) !== normalizePath(centralPropsUri.fsPath)) {
+				return false;
+			}
+
+			const content = await readUtf8(projectUri);
+			return parsePackageReferences(content).some(reference => reference.name.toLowerCase() === packageId.toLowerCase());
+		}));
+		if (packageReferences.some(Boolean)) {
+			return;
+		}
+
+		const content = await readUtf8(centralPropsUri);
+		const updated = removePackageVersionFromProps(content, packageId);
+		if (updated !== content) {
+			await vscode.workspace.fs.writeFile(centralPropsUri, Buffer.from(updated, 'utf-8'));
+		}
 	}
 
 
@@ -1445,6 +1687,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			? parseSlnxProjects(content)
 			: parseSlnProjects(content);
 		const children = await this.createSolutionChildren(entries, solutionUri, solutionDir, projectByPath, usedProjectPaths);
+		const centralPackages = await this.createCentralPackageGroup(solutionUri, solutionDir, entries, projectByPath);
+		if (centralPackages) {
+			children.push(centralPackages);
+		}
 		const vulnerablePackages = this.createVulnerablePackagesNode(solutionUri, solutionDir, entries);
 		if (vulnerablePackages.children.length > 0) {
 			children.push(vulnerablePackages);
@@ -1464,6 +1710,57 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			},
 			children,
 		};
+	}
+
+	private async createCentralPackageGroup(
+		solutionUri: vscode.Uri,
+		solutionDir: string,
+		entries: SlnProjectEntry[],
+		projectByPath: Map<string, vscode.Uri>,
+	): Promise<CentralPackageGroupNode | undefined> {
+		const centralPropsUri = await findCentralPackageVersionsFile(solutionDir);
+		if (!centralPropsUri) {
+			return undefined;
+		}
+
+		const content = await readUtf8(centralPropsUri);
+		const representativeCsprojUri = await this.findCentralPackageRepresentativeProject(entries, solutionDir, projectByPath);
+		const children = parsePackageVersions(content).map(packageVersion => {
+			const key = this.centralPackageCacheKey(centralPropsUri, packageVersion.name);
+			return {
+				kind: 'centralPackageReference' as const,
+				label: packageVersion.name,
+				version: packageVersion.version,
+				latestVersion: this.centralPackageUpdateCache.get(key),
+				centralPropsUri,
+				solutionUri,
+				representativeCsprojUri,
+			};
+		});
+
+		return {
+			kind: 'centralPackageGroup',
+			label: 'Central Packages',
+			solutionUri,
+			centralPropsUri,
+			representativeCsprojUri,
+			children,
+		};
+	}
+
+	private async findCentralPackageRepresentativeProject(
+		entries: SlnProjectEntry[],
+		solutionDir: string,
+		projectByPath: Map<string, vscode.Uri>,
+	): Promise<vscode.Uri | undefined> {
+		for (const entry of entries.filter(item => !item.isSolutionFolder)) {
+			const absolutePath = normalizePath(pathModule.resolve(solutionDir, entry.projectPath));
+			const projectUri = projectByPath.get(absolutePath);
+			if (projectUri) {
+				return projectUri;
+			}
+		}
+		return undefined;
 	}
 
 	private createVulnerablePackagesNode(solutionUri: vscode.Uri, solutionDir: string, entries: SlnProjectEntry[]): VulnerablePackagesNode {
@@ -1749,19 +2046,21 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 			return;
 		}
 
-		if (node.kind === 'referenceGroup' || node.kind === 'packageGroup') {
+		if (node.kind === 'referenceGroup' || node.kind === 'packageGroup' || node.kind === 'centralPackageGroup') {
 			const hasOutdatedPackage = node.kind === 'packageGroup'
+				&& node.children.some(pkg => pkg.latestVersion && pkg.latestVersion !== pkg.version);
+			const hasOutdatedCentralPackage = node.kind === 'centralPackageGroup'
 				&& node.children.some(pkg => pkg.latestVersion && pkg.latestVersion !== pkg.version);
 			const hasBrokenProjectReference = node.kind === 'referenceGroup'
 				&& node.children.some(reference => !reference.existsOnDisk || !reference.includedInSolution);
 			this.contextValue = hasBrokenProjectReference
 				? 'csharppainkiller.referenceGroup.missing'
-				: hasOutdatedPackage
-				? 'csharppainkiller.packageGroup.outdated'
+				: hasOutdatedPackage || hasOutdatedCentralPackage
+				? `csharppainkiller.${node.kind}.outdated`
 				: `csharppainkiller.${node.kind}`;
 			this.iconPath = hasBrokenProjectReference
 				? new vscode.ThemeIcon('warning', new vscode.ThemeColor('problemsWarningIcon.foreground'))
-				: hasOutdatedPackage
+				: hasOutdatedPackage || hasOutdatedCentralPackage
 				? new vscode.ThemeIcon('package', new vscode.ThemeColor('problemsWarningIcon.foreground'))
 				: new vscode.ThemeIcon(node.kind === 'referenceGroup' ? 'references' : 'package');
 			if (hasBrokenProjectReference) {
@@ -1769,6 +2068,9 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 			}
 			if (hasOutdatedPackage) {
 				this.tooltip = 'One or more packages have updates available.';
+			}
+			if (hasOutdatedCentralPackage) {
+				this.tooltip = 'One or more central packages have updates available.';
 			}
 			return;
 		}
@@ -1802,6 +2104,21 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 				hasUpdate ? `Latest available: ${node.latestVersion}` : undefined,
 				depCount > 0 ? `Depends on ${depCount} package${depCount === 1 ? '' : 's'}` : undefined,
 			].filter((line): line is string => Boolean(line)).join('\n');
+			this.iconPath = hasUpdate
+				? new vscode.ThemeIcon('package', new vscode.ThemeColor('problemsWarningIcon.foreground'))
+				: new vscode.ThemeIcon('package');
+			return;
+		}
+
+		if (node.kind === 'centralPackageReference') {
+			const hasUpdate = Boolean(node.latestVersion && node.latestVersion !== node.version);
+			this.contextValue = hasUpdate
+				? 'csharppainkiller.centralPackageReference.outdated'
+				: 'csharppainkiller.centralPackageReference';
+			this.description = hasUpdate ? `${node.version}  →  ${node.latestVersion}` : node.version;
+			this.tooltip = hasUpdate
+				? `Central version: ${node.version}\nLatest available: ${node.latestVersion}`
+				: `Central version: ${node.version}`;
 			this.iconPath = hasUpdate
 				? new vscode.ThemeIcon('package', new vscode.ThemeColor('problemsWarningIcon.foreground'))
 				: new vscode.ThemeIcon('package');
@@ -1883,7 +2200,7 @@ function getCollapsibleState(node: CsprojTreeNode): vscode.TreeItemCollapsibleSt
 	if (node.kind === 'project' && !node.existsOnDisk) {
 		return vscode.TreeItemCollapsibleState.None;
 	}
-	if (node.kind === 'project' || node.kind === 'referenceGroup' || node.kind === 'packageGroup' || node.kind === 'excludedProjects' || node.kind === 'vulnerablePackages') {
+	if (node.kind === 'project' || node.kind === 'referenceGroup' || node.kind === 'packageGroup' || node.kind === 'centralPackageGroup' || node.kind === 'excludedProjects' || node.kind === 'vulnerablePackages') {
 		return vscode.TreeItemCollapsibleState.Collapsed;
 	}
 	if (node.kind === 'packageReference') {
@@ -1896,7 +2213,7 @@ function getCollapsibleState(node: CsprojTreeNode): vscode.TreeItemCollapsibleSt
 			? vscode.TreeItemCollapsibleState.Collapsed
 			: vscode.TreeItemCollapsibleState.None;
 	}
-	if (node.kind === 'projectReference' || node.kind === 'excludedProject' || node.kind === 'vulnerablePackage') {
+	if (node.kind === 'projectReference' || node.kind === 'centralPackageReference' || node.kind === 'excludedProject' || node.kind === 'vulnerablePackage') {
 		return vscode.TreeItemCollapsibleState.None;
 	}
 	return vscode.TreeItemCollapsibleState.Expanded;
@@ -2727,12 +3044,70 @@ export function parsePackageReferences(content: string): { name: string; version
 	return packages;
 }
 
-function addPackageReferenceToCsproj(content: string, packageId: string, version: string): string {
-	const referenceXml = `  <ItemGroup>\n    <PackageReference Include="${escapeXml(packageId)}" Version="${escapeXml(version)}" />\n  </ItemGroup>\n`;
+export function addPackageReferenceToCsproj(content: string, packageId: string, version?: string): string {
+	const versionAttribute = version ? ` Version="${escapeXml(version)}"` : '';
+	const referenceXml = `  <ItemGroup>\n    <PackageReference Include="${escapeXml(packageId)}"${versionAttribute} />\n  </ItemGroup>\n`;
 	const projectCloseIndex = content.lastIndexOf('</Project>');
 	return projectCloseIndex >= 0
 		? `${content.slice(0, projectCloseIndex)}${referenceXml}${content.slice(projectCloseIndex)}`
 		: `${content.trimEnd()}\n${referenceXml}`;
+}
+
+function parsePackageVersions(content: string): { name: string; version: string }[] {
+	const packages: { name: string; version: string }[] = [];
+	const regex = /<PackageVersion\b([^>]*?)(?:\/>|>([\s\S]*?)<\/PackageVersion>)/gi;
+	let match: RegExpExecArray | null;
+	while ((match = regex.exec(content)) !== null) {
+		const attributes = parseAttributes(match[1]);
+		const name = attributes.get('Include') ?? attributes.get('Update');
+		const version = attributes.get('Version') ?? match[2]?.match(/<Version>\s*([^<]+?)\s*<\/Version>/i)?.[1]?.trim();
+		if (name && version) {
+			packages.push({ name, version });
+		}
+	}
+	return packages;
+}
+
+export function getCentralPackageVersion(content: string, packageId: string): string | undefined {
+	const escapedId = escapeRegExp(packageId);
+	const regex = new RegExp(`<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*)>([\\s\\S]*?)<\\/PackageVersion>|<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\5[^>]*)\\/>`, 'i');
+	const match = content.match(regex);
+	if (!match) {
+		return undefined;
+	}
+
+	const attributes = match[1] ?? match[4] ?? '';
+	const attributeVersion = attributes.match(/\bVersion\s*=\s*(['"])(.*?)\1/i)?.[2]?.trim();
+	if (attributeVersion) {
+		return attributeVersion;
+	}
+
+	return match[3]?.match(/<Version>\s*([^<]+?)\s*<\/Version>/i)?.[1]?.trim();
+}
+
+export function addPackageVersionToProps(content: string, packageId: string, version: string): string {
+	const packageVersionXml = `    <PackageVersion Include="${escapeXml(packageId)}" Version="${escapeXml(version)}" />\n`;
+	const itemGroupMatch = content.match(/<ItemGroup(?:\s[^>]*)?>[\s\S]*?<\/ItemGroup>/i);
+	if (itemGroupMatch && itemGroupMatch.index !== undefined) {
+		const closeIndex = content.indexOf('</ItemGroup>', itemGroupMatch.index);
+		return `${content.slice(0, closeIndex)}${packageVersionXml}${content.slice(closeIndex)}`;
+	}
+
+	const projectCloseIndex = content.lastIndexOf('</Project>');
+	const itemGroupXml = `  <ItemGroup>\n${packageVersionXml}  </ItemGroup>\n`;
+	return projectCloseIndex >= 0
+		? `${content.slice(0, projectCloseIndex)}${itemGroupXml}${content.slice(projectCloseIndex)}`
+		: `${content.trimEnd()}\n${itemGroupXml}`;
+}
+
+export function removePackageVersionFromProps(content: string, packageId: string): string {
+	const escapedId = escapeRegExp(packageId);
+	const packageVersionRegex = new RegExp(
+		`^[ \t]*<PackageVersion\\b[^>]*\\b(?:Include|Update)=(['"])${escapedId}\\1[^>]*/>[ \t]*\\r?\\n?` +
+		`|^[ \t]*<PackageVersion\\b[^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*>[\\s\\S]*?<\\/PackageVersion>[ \t]*\\r?\\n?`,
+		'gmi',
+	);
+	return content.replace(packageVersionRegex, '');
 }
 
 function removePackageReferenceFromCsproj(content: string, packageId: string): string {
@@ -2914,6 +3289,9 @@ function getNodeId(node: CsprojTreeNode): string {
 	if (node.kind === 'referenceGroup' || node.kind === 'packageGroup') {
 		return `${node.kind}:${node.project.csprojUri.toString()}`;
 	}
+	if (node.kind === 'centralPackageGroup') {
+		return `${node.kind}:${node.centralPropsUri.toString()}`;
+	}
 	if ('children' in node) {
 		return `${node.kind}:${node.label}:${node.children.map(getNodeId).join('|')}`;
 	}
@@ -2925,6 +3303,9 @@ function getNodeId(node: CsprojTreeNode): string {
 	}
 	if (node.kind === 'packageReference') {
 		return `packageReference:${node.project.csprojUri.toString()}:${node.label}:${node.version ?? ''}`;
+	}
+	if (node.kind === 'centralPackageReference') {
+		return `centralPackageReference:${node.centralPropsUri.toString()}:${node.label}:${node.version}`;
 	}
 	if (node.kind === 'packageDependency') {
 		return `packageDependency:${node.project.csprojUri.toString()}:${node.parentPackageId}:${node.label}:${node.version ?? ''}`;

@@ -45,7 +45,7 @@ export async function runDiagnosticsInBatches(
 		const batch = files.slice(i, i + size);
 
 		// Use static import — avoids repeated dynamic import() overhead.
-		await Promise.all(batch.map(uri => runDiagnosticsForUri(uri, collection, options?.overrides)));
+		await Promise.all(batch.map(uri => runDiagnosticsForUri(uri, collection, options?.overrides, true)));
 
 		processed += batch.length;
 		options?.onProgress?.(processed, files.length);

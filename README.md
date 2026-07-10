@@ -52,6 +52,7 @@ Explore and manage your `.sln` / `.slnx` solution from the **Solution Structure 
 - Add/remove NuGet packages — search across `nuget.config` sources with pre-release toggle and version picker
 - Check for NuGet package updates, update one outdated package, or update all outdated packages in a project
 - See installed package dependencies and known vulnerable packages when NuGet metadata is available
+- Central package management for `Directory.Packages.props`. Migrate all versioned `PackageReference` entries under a solution to `Directory.Packages.props` from the solution root folder or `.sln` / `.slnx` context menu
 
 > Hide with the `csharppainkiller.solutionStructure.show` setting. Disable automatic NuGet version/dependency/vulnerability checks with `csharppainkiller.solutionStructure.autoCheckPackages`; manual checks remain available from the Solution Structure context menu.
 
@@ -190,7 +191,6 @@ Use VS Code settings (`Ctrl+,` / `Cmd+,`) to control which feature groups are vi
 | `csharppainkiller.diagnostics.wrongFilename` | `true` | Warn when a file name does not match its declared type name |
 | `csharppainkiller.diagnostics.unsortedUsings` | `false` | Warn when top-level `using` directives are not in C# Painkiller sort order |
 | `csharppainkiller.diagnostics.mixedLanguageIdentifiers` | `false` | Warn when identifiers mix Latin and non-Latin characters |
-| `csharppainkiller.diagnostics.duplicateTypeName` | `true` | Warn when a type name is declared in more than one file within the same project |
 | `csharppainkiller.diagnosticDebounceDelay` | `1000` | Delay in milliseconds before re-analyzing an open `.cs` file after edits |
 
 ## Issues

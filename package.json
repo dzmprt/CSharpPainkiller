@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -272,6 +272,11 @@
         "icon": "$(link-external)"
       },
       {
+        "command": "csharppainkiller.projects.migrateToCentralPackageManagement",
+        "title": "Migrate to Directory.Packages.props",
+        "icon": "$(package)"
+      },
+      {
         "command": "csharppainkiller.efcore.cmd.addMigration",
         "title": "Add Migration"
       },
@@ -444,6 +449,16 @@
       ],
       "explorer/context": [
         {
+          "command": "csharppainkiller.projects.migrateToCentralPackageManagement",
+          "when": "explorerResourceIsFolder",
+          "group": "2_csharp@11"
+        },
+        {
+          "command": "csharppainkiller.projects.migrateToCentralPackageManagement",
+          "when": "resourceExtname == .sln || resourceExtname == .slnx",
+          "group": "2_csharp@11"
+        },
+        {
           "when": "explorerResourceIsFolder",
           "submenu": "csharppainkiller.create",
           "group": "2_csharp@1"
@@ -578,13 +593,28 @@
           "group": "inline@2"
         },
         {
+          "command": "csharppainkiller.projects.checkPackageUpdates",
+          "when": "view == csharppainkiller.projects && viewItem =~ /^csharppainkiller\\.centralPackageGroup/",
+          "group": "inline@2"
+        },
+        {
           "command": "csharppainkiller.projects.updateAllPackageReferences",
           "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.packageGroup.outdated",
           "group": "inline@3"
         },
         {
+          "command": "csharppainkiller.projects.updateAllPackageReferences",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.centralPackageGroup.outdated",
+          "group": "inline@3"
+        },
+        {
           "command": "csharppainkiller.projects.updatePackageReference",
           "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.packageReference.outdated",
+          "group": "inline@1"
+        },
+        {
+          "command": "csharppainkiller.projects.updatePackageReference",
+          "when": "view == csharppainkiller.projects && viewItem == csharppainkiller.centralPackageReference.outdated",
           "group": "inline@1"
         },
         {
@@ -871,11 +901,6 @@
           "type": "boolean",
           "default": false,
           "markdownDescription": "Warn when identifiers mix non-Latin and Latin characters. Only checked for files currently open in an editor."
-        },
-        "csharppainkiller.diagnostics.duplicateTypeName": {
-          "type": "boolean",
-          "default": true,
-          "markdownDescription": "Warn when a type name is declared in more than one file within the same project. Only checked for files currently open in an editor."
         },
         "csharppainkiller.diagnosticDebounceDelay": {
           "type": "number",

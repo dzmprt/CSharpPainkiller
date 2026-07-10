@@ -4,6 +4,17 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.10]
+
+### Added
+
+- **Central package management migration** — migrate versioned `PackageReference` entries from all projects under a solution to a root `Directory.Packages.props` file from a solution root folder or `.sln` / `.slnx` context menu
+- **Central package management support in Solution Structure** — display central package versions and use the existing package update, removal, dependency, and vulnerability workflows with `Directory.Packages.props`
+
+### Changed
+
+- **Duplicate type diagnostics setting** — removed the `csharppainkiller.diagnostics.duplicateTypeName` setting; duplicate type analysis remains available to the workspace analyzer
+
 ## [0.0.9]
 
 ### Changed

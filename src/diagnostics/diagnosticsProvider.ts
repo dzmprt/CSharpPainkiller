@@ -128,7 +128,8 @@ export interface AnalyzerSelection {
 function createAnalysisContext(
 	uri: vscode.Uri,
 	content: string,
-	overrides?: AnalyzerSelection
+	overrides?: AnalyzerSelection,
+	isWorkspaceAnalysis = false
 ): AnalysisContext {
 	return {
 		uri,
@@ -138,7 +139,7 @@ function createAnalysisContext(
 		filenameEnabled: overrides ? overrides.wrongFilename : isAnalyzerEnabled('wrongFilename'),
 		unsortedUsingsEnabled: overrides ? overrides.unsortedUsings : isAnalyzerEnabled('unsortedUsings'),
 		mixedLanguageEnabled: overrides ? overrides.mixedLanguageIdentifiers : isAnalyzerEnabled('mixedLanguageIdentifiers'),
-		duplicateTypeNameEnabled: overrides ? overrides.duplicateTypeName : isAnalyzerEnabled('duplicateTypeName'),
+		duplicateTypeNameEnabled: isWorkspaceAnalysis && (overrides ? overrides.duplicateTypeName : isAnalyzerEnabled('duplicateTypeName')),
 	};
 }
 
@@ -171,7 +172,8 @@ export async function runDiagnosticsForDocument(
 export async function runDiagnosticsForUri(
 	uri: vscode.Uri,
 	collection: vscode.DiagnosticCollection,
-	overrides?: AnalyzerSelection
+	overrides?: AnalyzerSelection,
+	isWorkspaceAnalysis = false
 ): Promise<void> {
 	if (!uri.path.endsWith('.cs')) {
 		return;
@@ -181,7 +183,7 @@ export async function runDiagnosticsForUri(
 	}
 
 	const timer = performance.now();
-	await analyzeCsFile(uri, collection, overrides);
+	await analyzeCsFile(uri, collection, overrides, isWorkspaceAnalysis);
 	logTiming('analyzeCsFile (URI)', performance.now() - timer);
 }
 
@@ -271,7 +273,8 @@ async function analyzeCsFileFromDocument(
 async function analyzeCsFile(
 	uri: vscode.Uri,
 	collection: vscode.DiagnosticCollection,
-	overrides?: AnalyzerSelection
+	overrides?: AnalyzerSelection,
+	isWorkspaceAnalysis = false
 ): Promise<void> {
 	// Skip excluded paths (bin, obj)
 	if (isPathExcluded(uri.path)) {
@@ -290,7 +293,7 @@ async function analyzeCsFile(
 		return;
 	}
 
-	await runUnifiedAnalysis(uri, content, collection, overrides);
+	await runUnifiedAnalysis(uri, content, collection, overrides, isWorkspaceAnalysis);
 }
 
 // ============================================================================
@@ -309,10 +312,11 @@ async function runUnifiedAnalysis(
 	uri: vscode.Uri,
 	content: string,
 	collection: vscode.DiagnosticCollection,
-	overrides?: AnalyzerSelection
+	overrides?: AnalyzerSelection,
+	isWorkspaceAnalysis = false
 ): Promise<void> {
 	// ── Create unified analysis context (Optimization #1) — also reads enabled-analyzer settings ──
-	const ctx = createAnalysisContext(uri, content, overrides);
+	const ctx = createAnalysisContext(uri, content, overrides, isWorkspaceAnalysis);
 
 	// ── Compute cache key from BOTH content and enabled-analyzer flags (Optimization #4) ──
 	// Including the flags ensures toggling a `csharppainkiller.diagnostics.*` setting invalidates
@@ -333,7 +337,7 @@ async function runUnifiedAnalysis(
 	// running the duplicate-type-name analyzer that depends on it, so unsaved edits are
 	// reflected without waiting for a save + file-watcher event. Cheap (sync, no I/O) —
 	// only runs on a cache miss, i.e. only when this file's content actually changed.
-	if (ctx.duplicateTypeNameEnabled) {
+	if (isWorkspaceAnalysis && ctx.duplicateTypeNameEnabled) {
 		const projectTypeIndex = ProjectTypeIndex.getInstance();
 		await projectTypeIndex.waitUntilInitialized();
 		projectTypeIndex.updateFileContent(uri, content);

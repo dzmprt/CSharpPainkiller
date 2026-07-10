@@ -229,7 +229,10 @@ export async function getLatestPackageVersion(
 ): Promise<string | undefined> {
 	if (!preRelease) {
 		try {
-			return (await getProjectPackageUpdates(csprojFsPath)).get(packageId.toLowerCase())?.latestVersion;
+			const update = (await getProjectPackageUpdates(csprojFsPath)).get(packageId.toLowerCase());
+			if (update?.latestVersion) {
+				return update.latestVersion;
+			}
 		} catch {
 			// Fall back to direct source probing below for older SDKs or unsupported output.
 		}
@@ -612,6 +615,41 @@ const PRERELEASE_ON_BUTTON: vscode.QuickInputButton = {
 	tooltip: 'Hide pre-release packages',
 };
 
+async function getCentralPackageVersions(csprojFsPath: string): Promise<Map<string, string>> {
+	const versions = new Map<string, string>();
+	let directory = pathModule.dirname(csprojFsPath);
+	const visited = new Set<string>();
+
+	while (directory && !visited.has(directory)) {
+		visited.add(directory);
+		const propsUri = vscode.Uri.file(pathModule.join(directory, 'Directory.Packages.props'));
+		try {
+			const content = Buffer.from(await vscode.workspace.fs.readFile(propsUri)).toString('utf-8');
+			const regex = /<PackageVersion\b([^>]*?)(?:\/>|>([\s\S]*?)<\/PackageVersion>)/gi;
+			let match: RegExpExecArray | null;
+			while ((match = regex.exec(content)) !== null) {
+				const include = match[1].match(/\b(?:Include|Update)\s*=\s*(['"])(.*?)\1/i)?.[2]?.trim();
+				const version = match[1].match(/\bVersion\s*=\s*(['"])(.*?)\1/i)?.[2]?.trim()
+					?? match[2]?.match(/<Version>\s*([^<]+?)\s*<\/Version>/i)?.[1]?.trim();
+				if (include && version) {
+					versions.set(include.toLowerCase(), version);
+				}
+			}
+			return versions;
+		} catch {
+			// Walk up to the next parent project directory.
+		}
+
+		const parent = pathModule.dirname(directory);
+		if (parent === directory) {
+			break;
+		}
+		directory = parent;
+	}
+
+	return versions;
+}
+
 // ============================================================================
 // Package search picker
 // ============================================================================
@@ -620,6 +658,7 @@ export async function showAddPackagePicker(
 	csprojFsPath: string,
 ): Promise<{ id: string; version: string } | undefined> {
 	const sources = await getNugetSources(csprojFsPath);
+	const centralPackageVersions = await getCentralPackageVersions(csprojFsPath);
 
 	let selectedSource: NugetSource;
 	if (sources.length === 1) {
@@ -635,11 +674,12 @@ export async function showAddPackagePicker(
 		selectedSource = sourcePick.source;
 	}
 
-	return showPackageSearchPicker(selectedSource);
+	return showPackageSearchPicker(selectedSource, centralPackageVersions);
 }
 
 function showPackageSearchPicker(
 	source: NugetSource,
+	centralPackageVersions: ReadonlyMap<string, string>,
 ): Promise<{ id: string; version: string } | undefined> {
 	return new Promise(resolve => {
 		let preRelease = false;
@@ -671,7 +711,7 @@ function showPackageSearchPicker(
 					}
 					qp.items = packages.map(pkg => ({
 						label: pkg.id,
-						description: pkg.version,
+						description: centralPackageVersions.get(pkg.id.toLowerCase()) ?? pkg.version,
 						detail: pkg.description,
 						packageId: pkg.id,
 					}));
@@ -718,12 +758,13 @@ function showPackageSearchPicker(
 				return;
 			}
 			const packageId = selected.packageId;
-			const latestVersion = selected.description;
+			const centralVersion = centralPackageVersions.get(packageId.toLowerCase());
+			const latestVersion = centralVersion ?? selected.description;
 			accepted = true;
 			clearTimeout(debounceTimer);
 			qp.dispose();
 
-			void showVersionPicker(source, packageId, preRelease, latestVersion)
+			void showVersionPicker(source, packageId, preRelease, latestVersion, centralVersion)
 				.then(version => resolve(version ? { id: packageId, version } : undefined));
 		});
 
@@ -748,6 +789,7 @@ function showVersionPicker(
 	packageId: string,
 	initialPreRelease: boolean,
 	latestVersion?: string,
+	centralVersion?: string,
 ): Promise<string | undefined> {
 	return new Promise(resolve => {
 		let preRelease = initialPreRelease;
@@ -755,14 +797,20 @@ function showVersionPicker(
 		const qp = vscode.window.createQuickPick<vscode.QuickPickItem>();
 		qp.placeholder = 'Select a version';
 		qp.title = `Select version for ${packageId}`;
-		qp.buttons = [preRelease ? PRERELEASE_ON_BUTTON : PRERELEASE_OFF_BUTTON];
+		qp.buttons = centralVersion ? [] : [preRelease ? PRERELEASE_ON_BUTTON : PRERELEASE_OFF_BUTTON];
 		qp.busy = true;
 
-		if (latestVersion) {
+		if (centralVersion) {
+			qp.items = [{ label: centralVersion, description: '(Directory.Packages.props)' }];
+		} else if (latestVersion) {
 			qp.items = [{ label: latestVersion, description: '(latest stable)' }];
 		}
 
 		const loadVersions = () => {
+			if (centralVersion) {
+				qp.busy = false;
+				return;
+			}
 			qp.busy = true;
 			getPackageVersions(source.url, packageId, preRelease)
 				.then(versions => {

@@ -58,6 +58,7 @@ import { runDiagnosticsForDocument, runDiagnosticsForOpenEditors, clearDiagnosti
 import { scheduleDiagnosticsForDocumentChange, clearDebounceForDocument } from './diagnostics/scheduler.js';
 import { CSharpDiagnosticsCodeActionProvider } from './diagnostics/codeActionProvider.js';
 import { analyzeSolutionCommand } from './services/analyzeSolution.js';
+import { migrateSolutionToCentralPackageManagement } from './services/migrateToCentralPackageManagement.js';
 
 /**
  * List of all "Create" commands for C# types.
@@ -167,6 +168,9 @@ export async function activate(context: vscode.ExtensionContext) {
 		}),
 		vscode.commands.registerCommand('csharppainkiller.projects.openPackageVulnerability', async (item) => {
 			await projectsTreeProvider.openPackageVulnerability(item ?? projectsTreeView.selection[0]);
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.migrateToCentralPackageManagement', async (uri?: vscode.Uri) => {
+			await migrateSolutionToCentralPackageManagement(uri);
 		})
 	);
 	console.log('File decoration provider registered');
