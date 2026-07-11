@@ -1042,16 +1042,26 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
-		await this.checkCentralPackageUpdates(node.centralPropsUri, node.representativeCsprojUri);
+		await vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: 'Checking central package updates',
+				cancellable: false,
+			},
+			async progress => this.checkCentralPackageUpdates(node.centralPropsUri, node.representativeCsprojUri!, progress),
+		);
 		this.refresh();
 	}
 
 	private async checkCentralPackageUpdates(
 		centralPropsUri: vscode.Uri,
 		representativeCsprojUri: vscode.Uri,
+		progress?: vscode.Progress<{ message?: string; increment?: number }>,
 	): Promise<void> {
 		const content = await readUtf8(centralPropsUri);
 		const packages = parsePackageVersions(content);
+		progress?.report({ message: `Checking 0/${packages.length}` });
+		let done = 0;
 		await runWithConcurrencyLimit(packages, PACKAGE_CHECK_CONCURRENCY, async packageVersion => {
 			const key = this.centralPackageCacheKey(centralPropsUri, packageVersion.name);
 			try {
@@ -1064,6 +1074,8 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			} catch {
 				// Leave the previous result intact when sources are unavailable.
 			}
+			done++;
+			progress?.report({ increment: (1 / packages.length) * 100, message: `Checking ${done}/${packages.length}` });
 		});
 	}
 

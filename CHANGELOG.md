@@ -4,6 +4,19 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.11]
+
+### Changed
+
+- **EF Core configuration generation** — generate one-to-many, one-to-one, and many-to-many relationships with explicit or shadow foreign keys and detected inverse navigation properties
+- **Mapping and DTO generation** — improve MapTo/MapFrom generation with static or instance/constructor modes, compatible scalar and collection conversions, accessor-aware property matching, and constructor/property matching; generated DTOs now use `init` properties and constructor mapping
+- **Generated type resolution** — resolve types for mapper, CQRS, EF CRUD, and FluentValidation generators within the current project and its referenced projects instead of unrelated workspace projects
+- **Solution Structure package checks** — show progress while checking central package versions
+
+### Fixed
+
+- **Mapper constructor selection** — use a target constructor when it has a single matching source property instead of generating an invalid object initializer for get-only properties
+
 ## [0.0.10]
 
 ### Added

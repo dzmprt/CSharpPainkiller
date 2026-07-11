@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { deriveNamespaceFromFolder } from '../namespace/compute.js';
-import { findTypeInWorkspace, findHandlerForMediator } from '../utils/typeSearch.js';
+import { findTypeInWorkspaceWithOptions, findHandlerForMediator } from '../utils/typeSearch.js';
 import { detectMediatorFile } from '../utils/contentParser.js';
 import { getParentFolder } from '../utils/fileUtils.js';
 import {
@@ -80,7 +80,7 @@ const MITMEDIATOR_CONFIG: CqrsTemplateConfig = {
 // Shared return type resolution — used by CQRS commands
 // ============================================================================
 
-async function resolveReturnType(returnTypeInput: string): Promise<{
+async function resolveReturnType(returnTypeInput: string, contextUri: vscode.Uri): Promise<{
 	returnType: string | null;
 	innerTypeName: string | null;
 	returnedType: import('../utils/typeSearch.js').FoundType | null;
@@ -96,10 +96,10 @@ async function resolveReturnType(returnTypeInput: string): Promise<{
 		return { returnType, innerTypeName, returnedType: null };
 	}
 
-	let foundType: Awaited<ReturnType<typeof findTypeInWorkspace>> = undefined;
+	let foundType: Awaited<ReturnType<typeof findTypeInWorkspaceWithOptions>> = undefined;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${innerTypeName}'…` },
-		async () => { foundType = await findTypeInWorkspace(innerTypeName); }
+		async () => { foundType = await findTypeInWorkspaceWithOptions(innerTypeName, { contextUri }); }
 	);
 
 	return { returnType, innerTypeName, returnedType: foundType ?? null };
@@ -218,7 +218,7 @@ export async function goToHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
 	let found: Awaited<ReturnType<typeof findHandlerForMediator>>;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for handler of '${info.className}'…` },
-		async () => { found = await findHandlerForMediator(info.className, info.kind); }
+		async () => { found = await findHandlerForMediator(info.className, info.kind, { contextUri: uri }); }
 	);
 
 	if (!found!) {
@@ -277,7 +277,7 @@ export async function generateHandlerForFile(fileUri?: vscode.Uri): Promise<void
 	if (info.kind === 'request' && info.returnType) {
 		const { innerTypeName } = parseCqrsReturnType(info.returnType);
 		if (innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit') {
-			returnedType = await findTypeInWorkspace(innerTypeName) ?? undefined;
+			returnedType = await findTypeInWorkspaceWithOptions(innerTypeName, { contextUri: folder }) ?? undefined;
 		}
 	}
 
@@ -336,7 +336,7 @@ export async function createEfCrudController(folderUri?: vscode.Uri): Promise<vo
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for class '${entityName}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(entityName);
+			const found = await findTypeInWorkspaceWithOptions(entityName, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(`Class '${entityName}' not found in the workspace. The controller was not created.`);
 				return;
@@ -372,7 +372,7 @@ export async function createEfCrudMinimalApi(folderUri?: vscode.Uri): Promise<vo
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for class '${entityName}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(entityName);
+			const found = await findTypeInWorkspaceWithOptions(entityName, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(`Class '${entityName}' not found in the workspace. The Minimal API was not created.`);
 				return;
@@ -406,7 +406,7 @@ export async function createMediatRRequest(folderUri?: vscode.Uri): Promise<void
 	const returnTypeInput = await promptOptional('Return Type (leave empty for void)', 'Author  or  List<Author>  or  Author[]');
 	if (returnTypeInput === undefined) { return; }
 
-	const resolved = await resolveReturnType(returnTypeInput);
+	const resolved = await resolveReturnType(returnTypeInput, folder);
 	if (resolved === null) { return; }
 	const { returnType, innerTypeName, returnedType } = resolved;
 
@@ -438,7 +438,7 @@ export async function createMediatRHandler(folderUri?: vscode.Uri): Promise<void
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${requestInput}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(requestInput);
+			const found = await findTypeInWorkspaceWithOptions(requestInput, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(`Type '${requestInput}' not found in the workspace. The Handler was not created.`);
 				return;
@@ -455,7 +455,7 @@ export async function createMediatRHandler(folderUri?: vscode.Uri): Promise<void
 			if (returnType) {
 				const { innerTypeName } = parseCqrsReturnType(returnType);
 				if (innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit') {
-					returnedType = await findTypeInWorkspace(innerTypeName);
+					returnedType = await findTypeInWorkspaceWithOptions(innerTypeName, { contextUri: folder });
 				}
 			}
 
@@ -490,7 +490,7 @@ export async function createMitMediatorRequest(folderUri?: vscode.Uri): Promise<
 	const returnTypeInput = await promptOptional('Return Type (leave empty for void)', 'Author  or  List<Author>  or  Author[]');
 	if (returnTypeInput === undefined) { return; }
 
-	const resolved = await resolveReturnType(returnTypeInput);
+	const resolved = await resolveReturnType(returnTypeInput, folder);
 	if (resolved === null) { return; }
 	const { returnType, innerTypeName, returnedType } = resolved;
 
@@ -522,7 +522,7 @@ export async function createMitMediatorHandler(folderUri?: vscode.Uri): Promise<
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${requestInput}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(requestInput);
+			const found = await findTypeInWorkspaceWithOptions(requestInput, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(`Type '${requestInput}' not found in the workspace. The Handler was not created.`);
 				return;
@@ -538,7 +538,7 @@ export async function createMitMediatorHandler(folderUri?: vscode.Uri): Promise<
 			if (returnType) {
 				const { innerTypeName } = parseCqrsReturnType(returnType);
 				if (innerTypeName && !isBuiltinType(innerTypeName) && innerTypeName !== 'Unit') {
-					returnedType = await findTypeInWorkspace(innerTypeName);
+					returnedType = await findTypeInWorkspaceWithOptions(innerTypeName, { contextUri: folder });
 				}
 			}
 
@@ -578,7 +578,7 @@ export async function createMediatRNotificationHandler(folderUri?: vscode.Uri): 
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for '${notificationName}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(notificationName);
+			const found = await findTypeInWorkspaceWithOptions(notificationName, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(`Type '${notificationName}' not found. The handler was not created.`);
 				return;
@@ -624,7 +624,7 @@ export async function createMitMediatorNotificationHandler(folderUri?: vscode.Ur
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for '${notificationName}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(notificationName);
+			const found = await findTypeInWorkspaceWithOptions(notificationName, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(`Type '${notificationName}' not found. The handler was not created.`);
 				return;

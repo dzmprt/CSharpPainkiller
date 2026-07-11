@@ -1,11 +1,14 @@
 import * as vscode from 'vscode';
 import { deriveNamespaceFromFolder } from '../namespace/compute.js';
-import { findTypeInWorkspace } from '../utils/typeSearch.js';
+import { findTypeInWorkspaceWithOptions } from '../utils/typeSearch.js';
 import { getParentFolder } from '../utils/fileUtils.js';
 import { extractTypesFromContent } from '../utils/contentParser.js';
 import {
 	parsePublicProperties,
 	generateEfCoreEntityTypeConfiguration,
+	getNavigationTargetType,
+	type ParsedProperty,
+	type RelatedPropertiesByType,
 } from './templates/efcore.js';
 
 // ============================================================================
@@ -63,6 +66,50 @@ async function readProperties(fileUri: vscode.Uri): Promise<ReturnType<typeof pa
 	}
 }
 
+async function readRelatedProperties(
+	properties: ParsedProperty[],
+	currentEntityName: string
+): Promise<RelatedPropertiesByType> {
+	const relatedTypes = new Set<string>();
+	for (const property of properties) {
+		const relatedType = getNavigationTargetType(property);
+		if (relatedType) {
+			relatedTypes.add(relatedType);
+		}
+	}
+
+	const entries = await Promise.all([...relatedTypes].map(async relatedType => {
+		const candidates = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+		let fallback: ParsedProperty[] | undefined;
+		for (const fileUri of candidates) {
+			const fileProperties = await readProperties(fileUri);
+			if (!fileProperties.some(property => getNavigationTargetType(property) === currentEntityName)) {
+				continue;
+			}
+
+			let fileContent: string;
+			try {
+				const buf = await vscode.workspace.fs.readFile(fileUri);
+				fileContent = Buffer.from(buf).toString('utf-8');
+			} catch {
+				continue;
+			}
+			const declaresRelatedType = extractTypesFromContent(fileContent).types.some(type => type.name === relatedType);
+			if (!declaresRelatedType) {
+				continue;
+			}
+
+			fallback ??= fileProperties;
+			const inverseCount = fileProperties.filter(property => getNavigationTargetType(property) === currentEntityName).length;
+			if (inverseCount === 1) {
+				return [relatedType, fileProperties] as const;
+			}
+		}
+		return fallback ? [relatedType, fallback] as const : undefined;
+	}));
+	return Object.fromEntries(entries.filter((entry): entry is readonly [string, ParsedProperty[]] => entry !== undefined));
+}
+
 // ============================================================================
 // EF Core commands
 // ============================================================================
@@ -90,7 +137,7 @@ export async function createEfCoreConfigurationFromFolder(folderUri?: vscode.Uri
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for class '${entityName}'…` },
 		async () => {
-			const found = await findTypeInWorkspace(entityName);
+			const found = await findTypeInWorkspaceWithOptions(entityName, { contextUri: folder });
 			if (!found) {
 				vscode.window.showErrorMessage(
 					`Class '${entityName}' not found in the workspace. The configuration was not created.`
@@ -99,8 +146,9 @@ export async function createEfCoreConfigurationFromFolder(folderUri?: vscode.Uri
 			}
 
 			const properties = await readProperties(found.fileUri);
+			const relatedProperties = await readRelatedProperties(properties, entityName);
 			const namespace = await deriveNamespaceFromFolder(folder);
-			const content = generateEfCoreEntityTypeConfiguration(found, properties, namespace);
+			const content = generateEfCoreEntityTypeConfiguration(found, properties, namespace, relatedProperties);
 			await writeAndOpen(folder, `${entityName}Configuration.cs`, content);
 		}
 	);
@@ -152,11 +200,12 @@ export async function createEfCoreConfigurationFromFile(fileUri?: vscode.Uri): P
 	const entityNamespace = publicClass.namespace ?? extraction.oldNamespace ?? '';
 
 	const properties = parsePublicProperties(fileContent);
+	const relatedProperties = await readRelatedProperties(properties, entityName);
 	const folder = getParentFolder(uri);
 	const namespace = await deriveNamespaceFromFolder(folder);
 
 	const found = { name: entityName, namespace: entityNamespace, fileUri: uri };
-	const content = generateEfCoreEntityTypeConfiguration(found, properties, namespace);
+	const content = generateEfCoreEntityTypeConfiguration(found, properties, namespace, relatedProperties);
 	await writeAndOpen(folder, `${entityName}Configuration.cs`, content);
 }
 
@@ -177,6 +226,10 @@ async function findAllCsprojs(): Promise<vscode.Uri[]> {
 function getCsprojParentDir(csprojUri: vscode.Uri): vscode.Uri {
 	const dirPath = csprojUri.path.replace(/\/[^/]*$/, '');
 	return vscode.Uri.parse(dirPath);
+}
+
+function shellEscapeArgument(argument: string): string {
+	return `'${argument.replace(/'/g, `'\\''`)}'`;
 }
 
 /**
@@ -287,13 +340,48 @@ async function isEfCoreProject(projectFolder: vscode.Uri): Promise<boolean> {
 }
 
 /**
+ * Lets the user choose the startup project used by EF Core design-time commands.
+ * A single project is used automatically to keep the common case silent.
+ */
+async function selectStartupProject(projectFolder: vscode.Uri): Promise<vscode.Uri | null | undefined> {
+	const csprojs = await findAllCsprojs();
+	if (csprojs.length <= 1) {
+		return csprojs[0];
+	}
+
+	const normalizedTargetFolder = '/' + projectFolder.path.replace(/^\/+/, '');
+	const items = csprojs
+		.map(csprojUri => {
+			const projectPath = '/' + csprojUri.path.replace(/^\/+/, '');
+			const projectFolderPath = projectPath.replace(/\/[^/]*$/, '');
+			const relativePath = vscode.workspace.asRelativePath(csprojUri, false);
+			const isTarget = projectFolderPath === normalizedTargetFolder;
+			const projectName = csprojUri.path.split('/').pop() ?? projectPath;
+			return {
+				label: isTarget ? `${projectName} (target project)` : projectName,
+				description: relativePath,
+				projectUri: csprojUri,
+			};
+		})
+		.sort((a, b) => a.description.localeCompare(b.description));
+
+	const selected = await vscode.window.showQuickPick(items, {
+		title: 'EF Core Startup Project',
+		placeHolder: 'Select the project used to run EF Core at design time',
+		matchOnDescription: true,
+	});
+
+	return selected ? selected.projectUri : null;
+}
+
+/**
  * Runs a dotnet ef command in the project folder. */
 async function runEfCoreCommand(
 	command: string,
 	projectFolder: vscode.Uri,
 	additionalArgs: string[] = []
 ): Promise<void> {
-	const args = [command, ...additionalArgs];
+	const args = [...command.split(/\s+/), ...additionalArgs];
 
 	// Find the .csproj file in the project folder
 	const csprojs = await getCsprojsInFolder(projectFolder);
@@ -304,21 +392,15 @@ async function runEfCoreCommand(
 	}
 
 	const csprojPath = '/' + csprojs[0].path.replace(/^\/+/, '');
-	const fullArgs = [...args, `-p "${csprojPath}"`];
+	const fullArgs = [...args, '-p', csprojPath];
 
-	// If a startup project is needed (e.g., for migrations), also pass -s
-	const normalizedFolder = '/' + projectFolder.path.replace(/^\/+/, '');
-
-	const allCsprojs = await findAllCsprojs();
-	const startupCandidates = allCsprojs.filter((csprojUri) => {
-		const csprojDir = '/' + csprojUri.path.replace(/\/[^/]*$/, '').replace(/^\/+/, '');
-		const csprojParent = csprojDir.substring(0, csprojDir.lastIndexOf('/'));
-		return csprojParent === normalizedFolder && '/' + csprojUri.path.replace(/^\/+/, '') !== csprojPath;
-	});
-
-	if (startupCandidates.length > 0) {
-		const startupPath = '/' + startupCandidates[0].path.replace(/^\/+/, '');
-		fullArgs.push(`-s ${startupPath}`);
+	const startupProject = await selectStartupProject(projectFolder);
+	if (startupProject === null) {
+		return;
+	}
+	if (startupProject) {
+		const startupPath = '/' + startupProject.path.replace(/^\/+/, '');
+		fullArgs.push('-s', startupPath);
 	}
 
 	// Ensure cwd is always a directory — strip .csproj suffix if present (belt & suspenders)
@@ -333,10 +415,10 @@ async function runEfCoreCommand(
 	});
 
 	terminal.show();
-	const dotnetCommand = `dotnet ${fullArgs.join(' ')}`;
+	const dotnetCommand = `dotnet ${fullArgs.map(shellEscapeArgument).join(' ')}`;
 	terminal.sendText(dotnetCommand);
 
-	vscode.window.showInformationMessage(`Entity Framework CMD: Running "dotnet ${fullArgs.join(' ')}" in terminal.`);
+	vscode.window.showInformationMessage(`Entity Framework CMD: Running "${dotnetCommand}" in terminal.`);
 }
 
 /**
@@ -382,6 +464,24 @@ export async function efCoreScriptMigration(projectFolder?: vscode.Uri): Promise
 				return; // cancelled or failed
 			}
 
+			const csprojs = await getCsprojsInFolder(folder);
+			if (csprojs.length === 0) {
+				vscode.window.showErrorMessage('Entity Framework CMD: No .csproj file found in the selected folder.');
+				return;
+			}
+
+			const startupProject = await selectStartupProject(folder);
+			if (startupProject === null) {
+				return;
+			}
+
+			const projectPath = '/' + csprojs[0].path.replace(/^\/+/, '');
+			const projectArgs = ['-p', projectPath];
+			if (startupProject) {
+				const startupPath = '/' + startupProject.path.replace(/^\/+/, '');
+				projectArgs.push('-s', startupPath);
+			}
+
 			// Check output mode: file vs console
 			const outputMode = await vscode.window.showQuickPick(
 				[
@@ -409,7 +509,7 @@ export async function efCoreScriptMigration(projectFolder?: vscode.Uri): Promise
 				}
 
 				const fullArgs = ['ef', 'migrations', 'script'];
-				fullArgs.push(...args, '-o', fileName.trim());
+				fullArgs.push(...args, ...projectArgs, '-o', fileName.trim());
 
 				const terminal = vscode.window.createTerminal({
 					name: `EF Core Script — ${fileName.trim()}`,
@@ -417,7 +517,7 @@ export async function efCoreScriptMigration(projectFolder?: vscode.Uri): Promise
 				});
 
 				terminal.show();
-				const escapedArgs = fullArgs.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ');
+				const escapedArgs = fullArgs.map(shellEscapeArgument).join(' ');
 				terminal.sendText(`dotnet ${escapedArgs}`);
 
 				vscode.window.showInformationMessage(
@@ -425,7 +525,7 @@ export async function efCoreScriptMigration(projectFolder?: vscode.Uri): Promise
 				);
 			} else {
 				const fullArgs = ['ef', 'migrations', 'script'];
-				fullArgs.push(...args);
+				fullArgs.push(...args, ...projectArgs);
 
 				const terminal = vscode.window.createTerminal({
 					name: `EF Core Script — ${fullArgs.join(' ')}`,
@@ -433,7 +533,7 @@ export async function efCoreScriptMigration(projectFolder?: vscode.Uri): Promise
 				});
 
 				terminal.show();
-				const escapedArgs = fullArgs.map(a => (a.includes(' ') ? `"${a}"` : a)).join(' ');
+				const escapedArgs = fullArgs.map(shellEscapeArgument).join(' ');
 				terminal.sendText(`dotnet ${escapedArgs}`);
 
 				vscode.window.showInformationMessage('Entity Framework CMD: Migration script output shown in terminal.');

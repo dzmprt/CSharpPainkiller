@@ -534,6 +534,180 @@ suite('services', () => {
 			assert.ok(content.includes('.IsRequired()'));
 			assert.ok(content.includes('.HasMaxLength(256)'));
 		});
+
+		test('generates one-to-many relationship with an explicit foreign key', () => {
+			const entity = { name: 'Book', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class Book', '{',
+				'    public int Id { get; set; }',
+				'    public int AuthorId { get; set; }',
+				'    public Author Author { get; set; }',
+				'}',
+			].join('\n'));
+			const relatedProps = parsePublicProperties([
+				'public class Author', '{',
+				'    public ICollection<Book> Books { get; set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Infrastructure', {
+				Author: relatedProps,
+			});
+			assert.ok(content.includes('builder.HasOne(e => e.Author)'));
+			assert.ok(content.includes('.WithMany(e => e.Books)'));
+			assert.ok(content.includes('.HasForeignKey(e => e.AuthorId)'));
+			assert.ok(!content.includes('builder.Property(e => e.Author)'));
+		});
+
+		test('generates one-to-many relationship with a shadow foreign key', () => {
+			const entity = { name: 'ProductPhoto', namespace: 'LTRS.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class ProductPhoto', '{',
+				'    public Guid ProductPhotoId { get; private set; }',
+				'    public byte[] PngFile { get; private set; }',
+				'    public Product Product { get; private set; }',
+				'}',
+			].join('\n'));
+			const productProps = parsePublicProperties([
+				'public class Product', '{',
+				'    public ICollection<ProductPhoto> Photos { get; private set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Infrastructure', {
+				Product: productProps,
+			});
+			assert.ok(content.includes('builder.HasOne(e => e.Product)'));
+			assert.ok(content.includes('.WithMany(e => e.Photos)'));
+			assert.ok(content.includes('.HasForeignKey("ProductId")'));
+			assert.ok(content.includes('.IsRequired();'));
+			assert.ok(content.includes('builder.Property(e => e.PngFile)'));
+			assert.ok(!content.includes('builder.HasMany(e => e.PngFile)'));
+			assert.ok(!content.includes('builder.Property(e => e.Product)'));
+		});
+
+		test('generates a many-to-many relationship for collection navigation', () => {
+			const entity = { name: 'Book', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class Book', '{',
+				'    public int Id { get; set; }',
+				'    public ICollection<Tag> Tags { get; set; }',
+				'}',
+			].join('\n'));
+			const tagProps = parsePublicProperties([
+				'public class Tag', '{',
+				'    public Book[] Posts { get; set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Infrastructure', {
+				Tag: tagProps,
+			});
+			assert.ok(content.includes('builder.HasMany(e => e.Tags)'));
+			assert.ok(content.includes('.WithMany(e => e.Posts);'));
+			assert.ok(!content.includes('builder.Property(e => e.Tags)'));
+		});
+
+		test('generates one-to-one FK on the related dependent entity', () => {
+			const entity = { name: 'Product', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class Product', '{',
+				'    public Guid ProductId { get; set; }',
+				'    public ProductDetails? Details { get; set; }',
+				'}',
+			].join('\n'));
+			const detailsProps = parsePublicProperties([
+				'public class ProductDetails', '{',
+				'    public Guid ProductId { get; set; }',
+				'    public Product Product { get; set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Domain', {
+				ProductDetails: detailsProps,
+			});
+			assert.ok(content.includes('.WithOne(e => e.Product)'));
+			assert.ok(content.includes('.HasForeignKey<ProductDetails>(e => e.ProductId);'));
+			assert.ok(!content.includes('.HasForeignKey("DetailsId")'));
+		});
+
+		test('uses one-to-many cardinality when inverse references are ambiguous', () => {
+			const entity = { name: 'Department', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class Department', '{',
+				'    public Employee[] Employees { get; set; }',
+				'}',
+			].join('\n'));
+			const employeeProps = parsePublicProperties([
+				'public class Employee', '{',
+				'    public Department Department { get; set; }',
+				'    public Department? BackupDepartment { get; set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Domain', {
+				Employee: employeeProps,
+			});
+			assert.ok(content.includes('.WithOne();'));
+			assert.ok(!content.includes('.WithMany();'));
+
+			const employeeEntity = { name: 'Employee', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const employeeContent = generateEfCoreEntityTypeConfiguration(employeeEntity, employeeProps, 'MyApp.Domain', {
+				Department: props,
+			});
+			assert.ok(employeeContent.includes('.HasForeignKey("DepartmentId")'));
+			assert.ok(employeeContent.includes('.HasForeignKey("BackupDepartmentId")'));
+			assert.ok(!employeeContent.includes('__RELATIONSHIP_FOREIGN_KEY_REQUIRED__'));
+		});
+
+		test('emits a key placeholder when the key convention cannot identify a key', () => {
+			const entity = { name: 'LegacyEntity', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class LegacyEntity', '{',
+				'    public Guid LegacyIdentifier { get; set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Domain');
+			assert.ok(content.includes('builder.HasKey(e => ...);'));
+		});
+
+		test('configures the inverse reference navigation as the collection foreign key', () => {
+			const entity = { name: 'Product', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class Product', '{',
+				'    public ProductPhoto[] Photos { get; set; }',
+				'}',
+			].join('\n'));
+			const productPhotoProps = parsePublicProperties([
+				'public class ProductPhoto', '{',
+				'    public Product Product { get; set; }',
+				'}',
+			].join('\n'));
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Infrastructure', {
+				ProductPhoto: productPhotoProps,
+			});
+			assert.ok(content.includes('builder.HasMany(e => e.Photos)'));
+			assert.ok(content.includes('.WithOne(e => e.Product)'));
+			assert.ok(content.includes('.HasForeignKey("ProductId");'));
+
+			const explicitProductPhotoProps = parsePublicProperties([
+				'public class ProductPhoto', '{',
+				'    public Guid ProductId { get; set; }',
+				'    public Product Product { get; set; }',
+				'}',
+			].join('\n'));
+			const explicitContent = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Infrastructure', {
+				ProductPhoto: explicitProductPhotoProps,
+			});
+			assert.ok(explicitContent.includes('.HasForeignKey(e => e.ProductId);'));
+		});
+
+		test('recognizes virtual collection navigation properties', () => {
+			const entity = { name: 'Book', namespace: 'MyApp.Domain', fileUri: undefined as never };
+			const props = parsePublicProperties([
+				'public class Book', '{',
+				'    public virtual ICollection<Tag> Tags { get; set; }',
+				'}',
+			].join('\n'));
+			assert.strictEqual(props[0].type, 'ICollection<Tag>');
+			const content = generateEfCoreEntityTypeConfiguration(entity, props, 'MyApp.Infrastructure');
+			assert.ok(content.includes('builder.HasMany(e => e.Tags)'));
+		});
 	});
 
 	suite('aspnet templates', () => {

@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import { extractFileNamespace } from '../utils/contentParser.js';
 import { coerceTypeName } from '../utils/sharedUtilities.js';
 import { detectPrimaryTypeName, parseTypeFields } from './generateMapTo.js';
-import { findTypeInWorkspace } from '../utils/typeSearch.js';
+import { findTypeInWorkspaceWithOptions } from '../utils/typeSearch.js';
 import { type ParsedProperty } from './templates/efcore.js';
 
 const PRIMITIVE_TYPES = new Set([
@@ -84,7 +84,7 @@ function collectReferencedTypes(properties: ParsedProperty[]): Set<string> {
 	return types;
 }
 
-async function resolveEnumTypes(content: string, properties: ParsedProperty[]): Promise<Set<string>> {
+async function resolveEnumTypes(content: string, properties: ParsedProperty[], contextUri: vscode.Uri): Promise<Set<string>> {
 	const enumTypes = collectEnumNamesFromContent(content);
 
 	for (const typeName of collectReferencedTypes(properties)) {
@@ -92,7 +92,7 @@ async function resolveEnumTypes(content: string, properties: ParsedProperty[]): 
 			continue;
 		}
 
-		const found = await findTypeInWorkspace(typeName);
+		const found = await findTypeInWorkspaceWithOptions(typeName, { contextUri });
 		if (!found) {
 			continue;
 		}
@@ -255,7 +255,7 @@ export async function generateFluentValidatorForDocument(
 	}
 
 	const namespace = extractFileNamespace(content);
-	const enumTypes = await resolveEnumTypes(content, properties);
+	const enumTypes = await resolveEnumTypes(content, properties, document.uri);
 	const validatorContent = generateFluentValidatorContent(
 		resolvedType,
 		properties,

@@ -352,7 +352,7 @@ export async function createCqrsRequestAndHandler(
 		return;
 	}
 
-	const resolved = await resolveReturnType(returnTypeInput);
+	const resolved = await resolveReturnType(returnTypeInput, folder);
 	if (resolved === null) {
 		return;
 	}
@@ -472,7 +472,7 @@ interface ResolvedReturnType {
 	returnedType: { name: string; namespace: string; fileUri: vscode.Uri } | null;
 }
 
-async function resolveReturnType(returnTypeInput: string): Promise<ResolvedReturnType | null> {
+async function resolveReturnType(returnTypeInput: string, contextUri: vscode.Uri): Promise<ResolvedReturnType | null> {
 	if (!returnTypeInput) {
 		return { returnType: null, innerTypeName: null, returnedType: null };
 	}
@@ -483,10 +483,12 @@ async function resolveReturnType(returnTypeInput: string): Promise<ResolvedRetur
 		return { returnType, innerTypeName, returnedType: null };
 	}
 
-	let foundType: Awaited<ReturnType<typeof import('./typeSearch.js').findTypeInWorkspace>> = undefined;
+	let foundType: Awaited<ReturnType<typeof import('./typeSearch.js').findTypeInWorkspaceWithOptions>> = undefined;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for type '${innerTypeName}'…` },
-		async () => { foundType = await import('./typeSearch.js').then(m => m.findTypeInWorkspace(innerTypeName)); }
+		async () => {
+			foundType = await import('./typeSearch.js').then(m => m.findTypeInWorkspaceWithOptions(innerTypeName, { contextUri }));
+		}
 	);
 
 	return {

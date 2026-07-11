@@ -12,7 +12,8 @@ import {
 function buildDtoProperties(fields: FieldInfo[], eol: string): string {
 	const i1 = '    ';
 	return fields
-		.map(f => `${i1}public ${f.typeName} ${f.name} { get; set; }`)
+		.filter(f => f.canRead !== false)
+		.map(f => `${i1}public ${f.typeName} ${f.name} { get; init; }`)
 		.join(eol);
 }
 
@@ -49,7 +50,7 @@ function buildDtoContent(
 
 /**
  * Generates a DTO class with matching public properties and a
- * `MapFrom{SourceType}` static factory method inside the DTO.
+ * constructor that maps from the source type.
  */
 export async function generateDtoForDocument(
 	document: vscode.TextDocument,

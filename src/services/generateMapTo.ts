@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { extractFileNamespace } from '../utils/contentParser.js';
 import { coerceTypeName } from '../utils/sharedUtilities.js';
-import { findTypeInWorkspace } from '../utils/typeSearch.js';
+import { findTypeInWorkspaceWithOptions } from '../utils/typeSearch.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -11,7 +11,18 @@ import { findTypeInWorkspace } from '../utils/typeSearch.js';
 export interface FieldInfo {
 	name: string;
 	typeName: string;
+	canRead?: boolean;
+	canWrite?: boolean;
 }
+
+export interface ConstructorInfo {
+	parameters: FieldInfo[];
+}
+
+export type ParsedFields = FieldInfo[] & { constructors?: ConstructorInfo[] };
+
+export type MapToMode = 'static' | 'instance';
+export type MapFromMode = 'static' | 'constructor';
 
 // ---------------------------------------------------------------------------
 // C# type compatibility helpers
@@ -375,7 +386,15 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 		if (/^(class|struct|record|enum|interface|delegate|event|void|operator)$/.test(rawType)) { continue; }
 		if (/^(if|else|return|new|this|base|var|null|true|false)$/.test(name)) { continue; }
 
-		results.push({ name, typeName: rawType });
+		const accessors = m[0].match(/\{([^}]*)\}/)?.[1] ?? '';
+		const getter = accessors.match(/(?:^|\s)(?:(public|private|protected|internal)\s+)?get\s*[;{]/);
+		const setter = accessors.match(/(?:^|\s)(?:(public|private|protected|internal)\s+)?(?:set|init)\s*[;{]/);
+		results.push({
+			name,
+			typeName: rawType,
+			canRead: !getter || !getter[1] || getter[1] === 'public',
+			canWrite: !!setter && (!setter[1] || setter[1] === 'public'),
+		});
 	}
 
 	// Primary constructor parameters for records
@@ -391,10 +410,28 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 			const name    = pm[2].trim();
 			if (!rawType || /^(class|struct|record|enum|interface)$/.test(rawType)) { continue; }
 			if (!results.some(r => r.name === name)) {
-				results.push({ name, typeName: rawType });
+				results.push({ name, typeName: rawType, canRead: true, canWrite: false });
 			}
 		}
 	}
+
+	const constructors: ConstructorInfo[] = [];
+	const ctorRegex = new RegExp(`\\bpublic\\s+${escapeRe(typeName)}\\s*\\(([^)]*)\\)`, 'g');
+	let ctorMatch: RegExpExecArray | null;
+	while ((ctorMatch = ctorRegex.exec(stripped)) !== null) {
+		const parameters: FieldInfo[] = [];
+		const paramRegex = /([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*[^,)]+)?(?:,|$)/g;
+		let paramMatch: RegExpExecArray | null;
+		while ((paramMatch = paramRegex.exec(ctorMatch[1])) !== null) {
+			const parameterType = paramMatch[1].trim();
+			if (parameterType) {
+				parameters.push({ name: paramMatch[2].trim(), typeName: parameterType });
+			}
+		}
+		constructors.push({ parameters });
+	}
+
+	(results as ParsedFields).constructors = constructors;
 
 	return results;
 }
@@ -416,8 +453,10 @@ function buildAssignmentLines(
 
 	const lines: string[] = [];
 	for (const sf of sourceFields) {
+		if (sf.canRead === false) { continue; }
 		const tf = targetMap.get(sf.name.toLowerCase());
 		if (!tf) { continue; }
+		if (tf.canWrite === false) { continue; }
 		const conv = buildConversion(`${sourcePrefix}${sf.name}`, sf.typeName, tf.typeName);
 		if (conv === null) { continue; }
 		lines.push(`${innerIndent}    ${tf.name} = ${conv},`);
@@ -431,19 +470,113 @@ function buildAssignmentLines(
 	return lines;
 }
 
+function defaultConstructorArgument(typeName: string): string {
+	const compactType = typeName.replace(/\s+/g, '');
+	const collection = detectCollection(normaliseType(typeName), compactType);
+	if (collection) {
+		const elementType = collection.elemOrig;
+		return collection.kind === 'array' ? `Array.Empty<${elementType}>()` : `new List<${elementType}>()`;
+	}
+	if (typeName.trim().endsWith('?') || /^(string|object|[A-Z_][\w.]*)$/.test(typeName.trim())) {
+		return 'null';
+	}
+	return 'default';
+}
+
+function buildConstructorExpression(
+	targetTypeName: string,
+	sourceFields: FieldInfo[],
+	targetFields: FieldInfo[],
+	indent: string,
+	sourcePrefix = 'source.',
+	argumentIndent = indent
+): string[] | undefined {
+	const constructors = (targetFields as ParsedFields).constructors ?? [];
+	if (targetFields.length === 0 || targetFields.some(field => field.canWrite !== false)) { return undefined; }
+
+	const sourceMap = new Map(sourceFields.filter(field => field.canRead !== false).map(field => [field.name.toLowerCase(), field]));
+	let best: ConstructorInfo | undefined;
+	let bestMatches = 0;
+	for (const constructor of constructors) {
+		const matches = constructor.parameters.filter(parameter => sourceMap.has(parameter.name.toLowerCase())).length;
+		if (matches > bestMatches) {
+			best = constructor;
+			bestMatches = matches;
+		}
+	}
+	if (!best) { return undefined; }
+
+	const targetMap = new Map(targetFields.map(field => [field.name.toLowerCase(), field]));
+	const args = best.parameters.map(parameter => {
+		const sourceField = sourceMap.get(parameter.name.toLowerCase());
+		const targetField = targetMap.get(parameter.name.toLowerCase());
+		if (sourceField && targetField) {
+			return buildConversion(`${sourcePrefix}${sourceField.name}`, sourceField.typeName, parameter.typeName)
+				?? defaultConstructorArgument(parameter.typeName);
+		}
+		return defaultConstructorArgument(parameter.typeName);
+	});
+	return [
+		`${indent}return new ${targetTypeName}(`,
+		...args.map((arg, index) => `${argumentIndent}${arg}${index === args.length - 1 ? '' : ','}`),
+		`${indent});`,
+	];
+}
+
+function buildConstructorArguments(
+	sourceFields: FieldInfo[],
+	targetFields: FieldInfo[],
+	sourcePrefix: string
+): string[] | undefined {
+	const constructors = (targetFields as ParsedFields).constructors ?? [];
+	if (targetFields.length === 0 || targetFields.some(field => field.canWrite !== false)) { return undefined; }
+
+	const sourceMap = new Map(sourceFields.filter(field => field.canRead !== false).map(field => [field.name.toLowerCase(), field]));
+	let best: ConstructorInfo | undefined;
+	let bestMatches = 0;
+	for (const constructor of constructors) {
+		const matches = constructor.parameters.filter(parameter => sourceMap.has(parameter.name.toLowerCase())).length;
+		if (matches > bestMatches) {
+			best = constructor;
+			bestMatches = matches;
+		}
+	}
+	if (!best) { return undefined; }
+
+	const targetMap = new Map(targetFields.map(field => [field.name.toLowerCase(), field]));
+	return best.parameters.map(parameter => {
+		const sourceField = sourceMap.get(parameter.name.toLowerCase());
+		const targetField = targetMap.get(parameter.name.toLowerCase());
+		if (sourceField && targetField) {
+			return buildConversion(`${sourcePrefix}${sourceField.name}`, sourceField.typeName, parameter.typeName)
+				?? defaultConstructorArgument(parameter.typeName);
+		}
+		return defaultConstructorArgument(parameter.typeName);
+	});
+}
+
 export function buildMapToMethod(
 	sourceTypeName: string,
 	targetTypeName: string,
 	sourceFields: FieldInfo[],
 	targetFields: FieldInfo[],
-	eol: string
+	eol: string,
+	mode: MapToMode = 'static'
 ): string {
 	const i1 = '    ';
 	const i2 = '        ';
 	const methodName = `MapTo${targetTypeName}`;
-	const assignments = buildAssignmentLines(sourceFields, targetFields, 'source.', i2);
+	const sourcePrefix = mode === 'instance' ? 'this.' : 'source.';
+	const signature = mode === 'instance'
+		? `${i1}public ${targetTypeName} ${methodName}()`
+		: `${i1}public static ${targetTypeName} ${methodName}(${sourceTypeName} source)`;
+	const constructor = buildConstructorExpression(targetTypeName, sourceFields, targetFields, i2, sourcePrefix, i2 + i1);
+	if (constructor) {
+		return [signature, `${i1}{`, ...constructor, `${i1}}`].join(eol);
+	}
+	const assignments = buildAssignmentLines(sourceFields, targetFields, sourcePrefix, i2 + i1);
 	return [
-		`${i1}public static ${targetTypeName} ${methodName}(${sourceTypeName} source)`,
+		signature,
 		`${i1}{`,
 		`${i2}return new ${targetTypeName}`,
 		`${i2}{`,
@@ -458,11 +591,36 @@ export function buildMapFromMethod(
 	targetTypeName: string,
 	sourceFields: FieldInfo[],
 	targetFields: FieldInfo[],
-	eol: string
+	eol: string,
+	mode: MapFromMode = 'static'
 ): string {
 	const i1 = '    ';
 	const i2 = '        ';
 	const methodName = `MapFrom${targetTypeName}`;
+	const constructor = buildConstructorExpression(sourceTypeName, targetFields, sourceFields, i2);
+	if (mode === 'constructor') {
+		const constructorArgs = buildConstructorArguments(targetFields, sourceFields, 'source.');
+		if (constructorArgs) {
+			return [
+				`${i1}public ${sourceTypeName}(${targetTypeName} source) : this(`,
+				...constructorArgs.map((arg, index) => `${i2}${arg}${index === constructorArgs.length - 1 ? '' : ','}`),
+				`${i1})`,
+				`${i1}{`,
+				`${i1}}`,
+			].join(eol);
+		}
+		const assignments = buildAssignmentLines(targetFields, sourceFields, 'source.', i1)
+			.map(line => line.endsWith(',') ? line.slice(0, -1) + ';' : line + ';');
+		return [
+			`${i1}public ${sourceTypeName}(${targetTypeName} source)`,
+			`${i1}{`,
+			...assignments,
+			`${i1}}`,
+		].join(eol);
+	}
+	if (constructor) {
+		return [`${i1}public static ${sourceTypeName} ${methodName}(${targetTypeName} source)`, `${i1}{`, ...constructor, `${i1}}`].join(eol);
+	}
 	// MapFrom builds sourceType from targetType — target fields are the inputs
 	const assignments = buildAssignmentLines(targetFields, sourceFields, 'source.', i2);
 	return [
@@ -477,7 +635,7 @@ export function buildMapFromMethod(
 }
 
 /**
- * Builds `MapFrom{SourceType}` inside a DTO that maps from the source entity.
+ * Builds a DTO constructor that maps from the source entity.
  */
 export function buildDtoMapFromMethod(
 	dtoTypeName: string,
@@ -487,16 +645,15 @@ export function buildDtoMapFromMethod(
 	eol: string
 ): string {
 	const i1 = '    ';
-	const i2 = '        ';
-	const methodName = `MapFrom${sourceTypeName}`;
-	const assignments = buildAssignmentLines(sourceFields, dtoFields, 'source.', i2);
+	const writableDtoFields = dtoFields
+		.filter(field => field.canRead !== false)
+		.map(field => ({ ...field, canWrite: true }));
+	const assignments = buildAssignmentLines(sourceFields, writableDtoFields, 'source.', i1)
+		.map(line => line.endsWith(',') ? line.slice(0, -1) + ';' : line + ';');
 	return [
-		`${i1}public static ${dtoTypeName} ${methodName}(${sourceTypeName} source)`,
+		`${i1}public ${dtoTypeName}(${sourceTypeName} source)`,
 		`${i1}{`,
-		`${i2}return new ${dtoTypeName}`,
-		`${i2}{`,
 		...assignments,
-		`${i2}};`,
 		`${i1}}`,
 	].join(eol);
 }
@@ -544,7 +701,7 @@ async function resolveMappingContext(
 	const targetTypeName = input.trim();
 
 	// 3. Find target type in workspace
-	const foundType = await findTypeInWorkspace(targetTypeName);
+	const foundType = await findTypeInWorkspaceWithOptions(targetTypeName, { contextUri: document.uri });
 	if (!foundType) {
 		vscode.window.showErrorMessage(
 			`CSharp Painkiller: Type "${targetTypeName}" not found in the workspace.`
@@ -598,10 +755,16 @@ async function resolveMappingContext(
  */
 export async function generateMapToForDocument(
 	document: vscode.TextDocument,
-	sourceTypeName?: string
+	sourceTypeName?: string,
+	mode?: MapToMode
 ): Promise<void> {
 	const ctx = await resolveMappingContext(document, sourceTypeName);
 	if (!ctx) { return; }
+	const selectedMode = mode ?? (await vscode.window.showQuickPick([
+		{ label: 'Static method', value: 'static' as const },
+		{ label: 'Instance method', value: 'instance' as const },
+	], { placeHolder: 'Choose MapTo generation style' }))?.value;
+	if (!selectedMode) { return; }
 
 	const { sourceTypeName: srcName, targetTypeName, sourceFields, targetFields, targetNamespace, eol, insertionPosition } = ctx;
 
@@ -614,7 +777,7 @@ export async function generateMapToForDocument(
 		return;
 	}
 
-	const methodText = buildMapToMethod(srcName, targetTypeName, sourceFields, targetFields, eol);
+	const methodText = buildMapToMethod(srcName, targetTypeName, sourceFields, targetFields, eol, selectedMode);
 	await applyMethodInsert(document, insertionPosition, methodText, targetNamespace, eol);
 
 	vscode.window.showInformationMessage(
@@ -628,10 +791,16 @@ export async function generateMapToForDocument(
  */
 export async function generateMapFromForDocument(
 	document: vscode.TextDocument,
-	sourceTypeName?: string
+	sourceTypeName?: string,
+	mode?: MapFromMode
 ): Promise<void> {
 	const ctx = await resolveMappingContext(document, sourceTypeName);
 	if (!ctx) { return; }
+	const selectedMode = mode ?? (await vscode.window.showQuickPick([
+		{ label: 'Static method', value: 'static' as const },
+		{ label: 'Constructor', value: 'constructor' as const },
+	], { placeHolder: 'Choose MapFrom generation style' }))?.value;
+	if (!selectedMode) { return; }
 
 	const { sourceTypeName: srcName, targetTypeName, sourceFields, targetFields, targetNamespace, eol, insertionPosition } = ctx;
 
@@ -644,7 +813,7 @@ export async function generateMapFromForDocument(
 		return;
 	}
 
-	const methodText = buildMapFromMethod(srcName, targetTypeName, sourceFields, targetFields, eol);
+	const methodText = buildMapFromMethod(srcName, targetTypeName, sourceFields, targetFields, eol, selectedMode);
 	await applyMethodInsert(document, insertionPosition, methodText, targetNamespace, eol);
 
 	vscode.window.showInformationMessage(
@@ -685,7 +854,11 @@ async function applyMethodInsert(
 	// Method goes on its own line(s) before the closing brace.
 	// insertionPosition is column 0 of the `}` line, so appending eol after
 	// the method leaves the `}` on the next line as expected.
-	edit.insert(document.uri, insertionPosition, methodText + eol);
+	const previousLine = insertionPosition.line > 0
+		? document.lineAt(insertionPosition.line - 1).text
+		: '';
+	const separator = previousLine.trim() ? eol : '';
+	edit.insert(document.uri, insertionPosition, separator + methodText + eol);
 
 	await vscode.workspace.applyEdit(edit);
 
@@ -715,7 +888,7 @@ export function detectPrimaryTypeName(content: string): string | undefined {
 	return stripped.match(/\b(?:class|struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)/)?.[1];
 }
 
-export function parseTypeFields(content: string, typeName: string): FieldInfo[] {
+export function parseTypeFields(content: string, typeName: string): ParsedFields {
 	const body = extractTypeBody(content, typeName);
 	if (body === undefined) { return []; }
 	return extractFields(body, content, typeName);
