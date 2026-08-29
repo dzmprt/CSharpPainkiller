@@ -37,7 +37,7 @@ export async function findTypeInWorkspaceWithOptions(
 	typeName: string,
 	options?: SearchOptions
 ): Promise<FoundType | undefined> {
-	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 	const searchBuckets = await buildSearchBuckets(files, options?.contextUri);
 
 	for (const bucket of searchBuckets) {
@@ -80,7 +80,7 @@ export async function findHandlerForMediator(
 	kind: 'request' | 'notification',
 	options?: SearchOptions
 ): Promise<FoundType | undefined> {
-	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 	const searchBuckets = await buildSearchBuckets(files, options?.contextUri);
 
 	// Build a pattern that matches IRequestHandler<ClassName or INotificationHandler<ClassName
@@ -164,7 +164,7 @@ async function buildSearchBuckets(
 }
 
 async function loadProjectMap(): Promise<Map<string, vscode.Uri>> {
-	const csprojUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+	const csprojUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 	const projectMap = new Map<string, vscode.Uri>();
 	for (const uri of csprojUris) {
 		projectMap.set(normalizeFsPath(pathModule.dirname(uri.fsPath)), uri);

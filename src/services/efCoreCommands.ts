@@ -79,7 +79,7 @@ async function readRelatedProperties(
 	}
 
 	const entries = await Promise.all([...relatedTypes].map(async relatedType => {
-		const candidates = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+		const candidates = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		let fallback: ParsedProperty[] | undefined;
 		for (const fileUri of candidates) {
 			const fileProperties = await readProperties(fileUri);
@@ -213,7 +213,7 @@ export async function createEfCoreConfigurationFromFile(fileUri?: vscode.Uri): P
 // EF Core CLI commands
 // ============================================================================
 
-const EXCLUSION = '{**/bin/**,**/obj/**}';
+const EXCLUSION = '{**/bin/**,**/obj/**,**/.dotnet/**}';
 
 /**
  * Finds all .csproj files in the workspace. */

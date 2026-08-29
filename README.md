@@ -18,6 +18,7 @@ Smart file creation, code generation, project creation, namespace management and
 
 - [Features](#features)
   - [Solution Structure](#solution-structure)
+  - [Migrate to .slnx](#migrate-to-slnx)
   - [Create C# Types](#create-c-types)
   - [Adjust Namespaces](#adjust-namespaces)
   - [Rename File By Type](#rename-file-by-type)
@@ -54,7 +55,15 @@ Explore and manage your `.sln` / `.slnx` solution from the **Solution Structure 
 - See installed package dependencies and known vulnerable packages when NuGet metadata is available
 - Central package management for `Directory.Packages.props`. Migrate all versioned `PackageReference` entries under a solution to `Directory.Packages.props` from the solution root folder or `.sln` / `.slnx` context menu
 
+When deleting a project, the extension asks separately whether to remove its physical project folder. Deleting a solution folder also prompts about deleting its physical folder when applicable.
+
 > Hide with the `csharppainkiller.solutionStructure.show` setting. Disable automatic NuGet version/dependency/vulnerability checks with `csharppainkiller.solutionStructure.autoCheckPackages`; manual checks remain available from the Solution Structure context menu.
+
+### Migrate to .slnx
+
+Convert a `.sln` solution to the modern `.slnx` format. Right-click a `.sln` file in the Explorer → **CSharp Painkiller: Migrate to .slnx**.
+
+After migration, the extension asks whether to delete the original `.sln` file. Migration does not overwrite an existing `.slnx` file.
 
 ### Create C# Types
 
@@ -76,7 +85,7 @@ Rename `.cs` files to match the C# type they contain. Right-click a file or fold
 
 When you change the `.cs` file name, the name of the object in the file changes and vice versa.
 
-Supported type kinds: `class`, `record`, `struct`, `record struct`.
+Supported type kinds: `class`, `record`, `record class`, `struct`, `record struct`.
 
 > Can be disabled via the `csharppainkiller.syncTypeAndFileName` setting.
 
@@ -94,13 +103,13 @@ Available analyzers:
 
 ![Analyze Solution demo](images/AnalyzeSolution.png)
 
-Open-files diagnostics are controlled by the `csharppainkiller.diagnostics.*` settings. The **C# Analyze Solution** command lets you choose analyzers for that run without changing your saved settings.
+Open-files diagnostics are controlled by the `csharppainkiller.diagnostics.*` settings. The **C# Analyze Solution** command lets you choose analyzers for that run without changing your saved settings. Files under `.dotnet` directories are excluded from both open-file and solution-wide analysis.
 
 ### Generate Mapping Methods
 
-Generate static `MapTo{TargetType}` / `MapFrom{TargetType}` methods for mapping between types
+Generate static `MapTo{TargetType}` / `MapFrom{TargetType}` methods for mapping between types.
 
-The extension prompts for the target type, maps matching public properties, and inserts the method at the end of the source type.
+The extension prompts for the target type, maps matching public properties or positional record primary-constructor fields.
 
 ![Generate Mapping demo](images/GenerateMappingDemo.gif)
 

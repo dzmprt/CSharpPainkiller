@@ -403,7 +403,7 @@ async function fileExists(uri: vscode.Uri): Promise<boolean> {
 }
 
 async function isInsideExistingProject(folderUri: vscode.Uri): Promise<boolean> {
-  const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+  const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
   const selectedPath = pathModule.normalize(folderUri.fsPath);
 
   return csprojFiles.some(csprojUri => {

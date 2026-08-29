@@ -160,6 +160,12 @@ suite('contentParser', () => {
 			const result = getPublicTypeName(content);
 			assert.deepStrictEqual(result, { name: 'Visible', type: 'class' });
 		});
+
+		test('identifies public record class with a primary constructor', () => {
+			const content = 'namespace MyApp;\n\npublic record class TestRequest(string Field1, int Field2, int[] Field3);';
+			const result = getPublicTypeName(content);
+			assert.deepStrictEqual(result, { name: 'TestRequest', type: 'record' });
+		});
 	});
 
 	suite('getTypeNameForFileDiagnostic', () => {
@@ -189,6 +195,12 @@ suite('contentParser', () => {
 			assert.ok(result !== null && result !== 'ambiguous');
 			assert.strictEqual(result.name, 'Vector3');
 			assert.strictEqual(result.type, 'record struct');
+		});
+
+		test('correctly identifies public record class for filename diagnostic', () => {
+			const content = 'namespace MyApp;\n\npublic record class TestRequest(string Field1, int Field2, int[] Field3);';
+			const result = getTypeNameForFileDiagnostic(content);
+			assert.deepStrictEqual(result, { name: 'TestRequest', type: 'record' });
 		});
 	});
 

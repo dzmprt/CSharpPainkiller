@@ -16,7 +16,7 @@ interface FileNameSyncResult {
 }
 
 const CSHARP_IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
-const DECLARATION_REGEX = /\b(?:(?:public|internal|private|protected)\s+)?(?:(?:static|sealed|abstract|partial|readonly)\s+)*(?:(record)\s+(struct)\s+|(class|record|struct)\s+)([A-Za-z_][A-Za-z0-9_]*)/g;
+const DECLARATION_REGEX = /\b(?:(?:public|internal|private|protected)\s+)?(?:(?:static|sealed|abstract|partial|readonly)\s+)*(?:(record)\s+(struct|class)\s+|(class|record|struct)\s+)([A-Za-z_][A-Za-z0-9_]*)/g;
 
 function maskNonCode(content: string): string {
 	const chars = content.split('');
@@ -134,8 +134,8 @@ export function getSingleRenamableType(content: string): RenamableTypeDeclaratio
 	while ((match = DECLARATION_REGEX.exec(codeOnlyContent)) !== null) {
 		const name = match[4];
 		const nameStart = match.index + match[0].lastIndexOf(name);
-		const kind = match[1] === 'record' && match[2] === 'struct'
-			? 'record struct'
+		const kind = match[1] === 'record'
+			? match[2] === 'struct' ? 'record struct' : 'record'
 			: match[3] as RenamableTypeKind;
 
 		matches.push({

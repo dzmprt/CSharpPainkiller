@@ -24,6 +24,14 @@ suite('syncTypeAndFileName', () => {
 			assert.strictEqual(result?.kind, 'record struct');
 		});
 
+		test('finds the name in a record class declaration', () => {
+			const content = 'namespace MyApp;\n\npublic record class UserDto { }';
+			const result = getSingleRenamableType(content);
+			assert.strictEqual(result?.name, 'UserDto');
+			assert.strictEqual(result?.kind, 'record');
+			assert.strictEqual(result?.nameStart, content.indexOf('UserDto'));
+		});
+
 		test('returns null when multiple renamable types exist', () => {
 			const content = [
 				'namespace MyApp;',

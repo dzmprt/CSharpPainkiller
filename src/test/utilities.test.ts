@@ -24,6 +24,11 @@ suite('utilities', () => {
 			assert.ok(!isPathExcluded('/workspace/MyApp/src/Book.cs'));
 		});
 
+		test('isPathExcluded detects .dotnet folders', () => {
+			assert.ok(isPathExcluded('/workspace/MyApp/.dotnet/tools/Book.cs'));
+			assert.ok(!isPathExcluded('/workspace/MyApp/dotnet/Book.cs'));
+		});
+
 		test('findProjectRootForPath returns deepest matching csproj directory', () => {
 			const csprojs = [
 				{ dirPath: '/workspace/MyApp' },

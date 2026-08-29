@@ -167,7 +167,7 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 	const matches: { name: string; type: CType }[] = [];
 
 	if (visibility === 'public') {
-		// Match public [extra-mods] [readonly] record struct first (most specific)
+		// Match public [extra-mods] [readonly] record struct/class first (most specific)
 		const recordStructRegex = new RegExp(
 			`public\\s+${EXTRA_MODS}(?:readonly\\s+)?record\\s+struct\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
 		);
@@ -175,10 +175,16 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 		while ((match = recordStructRegex.exec(content)) !== null) {
 			matches.push({ name: match[1], type: 'record struct' });
 		}
+		const recordClassRegex = new RegExp(
+			`public\\s+${EXTRA_MODS}record\\s+class\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+		);
+		while ((match = recordClassRegex.exec(content)) !== null) {
+			matches.push({ name: match[1], type: 'record' });
+		}
 
 		// Match other public types (class, record, struct, enum, interface)
 		const typeRegex = new RegExp(
-			`public\\s+${EXTRA_MODS}(?:(class|record(?!\\s+struct\\b)|struct|enum|interface))\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+			`public\\s+${EXTRA_MODS}(?:(class|record(?!\\s+(?:struct|class)\\b)|struct|enum|interface))\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
 		);
 		while ((match = typeRegex.exec(content)) !== null) {
 			matches.push({ name: match[2], type: match[1] as CType });
@@ -193,10 +199,16 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 		while ((match = internalRecordStructRegex.exec(content)) !== null) {
 			matches.push({ name: match[1], type: 'record struct' });
 		}
+		const internalRecordClassRegex = new RegExp(
+			`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}record\\s+class\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+		);
+		while ((match = internalRecordClassRegex.exec(content)) !== null) {
+			matches.push({ name: match[1], type: 'record' });
+		}
 
 		// Search for other internal types (class, record, struct, enum, interface)
 		const internalRegex = new RegExp(
-			`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}(class|record(?!\\s+struct\\b)|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
+			`(?<![a-zA-Z_])internal\\s+${EXTRA_MODS}(class|record(?!\\s+(?:struct|class)\\b)|struct|enum|interface)\\s+([A-Za-z_][A-Za-z0-9_]*)`, 'g'
 		);
 		while ((match = internalRegex.exec(content)) !== null) {
 			matches.push({ name: match[2], type: match[1] as CType });
@@ -204,7 +216,7 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 
 		// If no internal types found, search for types without any access modifier
 		if (matches.length === 0) {
-			// Handle [readonly] record struct as a single compound type first
+			// Handle [readonly] record struct/class as a single compound type first
 			const noModRecordStructRegex = /(?<![a-zA-Z_])(?:readonly\s+)?record\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)/g;
 			while ((match = noModRecordStructRegex.exec(content)) !== null) {
 				const lineStart = content.lastIndexOf('\n', match.index - 1) + 1;
@@ -212,6 +224,14 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 				// Skip if an access modifier precedes it
 				if (!/^(public|internal|private|protected)\b/.test(linePrefix)) {
 					matches.push({ name: match[1], type: 'record struct' });
+				}
+			}
+			const noModRecordClassRegex = /(?<![a-zA-Z_])record\s+class\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+			while ((match = noModRecordClassRegex.exec(content)) !== null) {
+				const lineStart = content.lastIndexOf('\n', match.index - 1) + 1;
+				const linePrefix = content.substring(lineStart, match.index).trim();
+				if (!/^(public|internal|private|protected)\b/.test(linePrefix)) {
+					matches.push({ name: match[1], type: 'record' });
 				}
 			}
 
@@ -227,7 +247,7 @@ export function searchTypesByVisibility(content: string, visibility: 'public' | 
 					// Skip if preceded by modifiers like static, abstract, sealed, partial, readonly
 					const hasModifier = /^(static|abstract|sealed|partial|readonly)\s/.test(linePrefix);
 					// Skip "struct" when the preceding word on the same line is "record" (already a record struct)
-					if (typeKeyword === 'struct' && /\brecord\s*$/.test(linePrefix)) {
+					if ((typeKeyword === 'struct' || typeKeyword === 'class') && /\brecord\s*$/.test(linePrefix)) {
 						continue;
 					}
 					if (!hasModifier) {

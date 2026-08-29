@@ -39,6 +39,20 @@ suite('generateMapTo', () => {
 			assert.strictEqual(detectPrimaryTypeName(sampleClass), 'Author');
 		});
 
+		test('detects record struct name', () => {
+			assert.strictEqual(
+				detectPrimaryTypeName('public record struct TestRequest(string Name, int Field2, int[] Field3);'),
+				'TestRequest'
+			);
+		});
+
+		test('detects record class name', () => {
+			assert.strictEqual(
+				detectPrimaryTypeName('public record class TestRequest { public string Name { get; init; } }'),
+				'TestRequest'
+			);
+		});
+
 		test('returns undefined when no type found', () => {
 			assert.strictEqual(detectPrimaryTypeName('namespace MyApp;'), undefined);
 		});
@@ -64,9 +78,56 @@ suite('generateMapTo', () => {
 			assert.strictEqual(fields[1].canRead, true);
 			assert.strictEqual(fields[1].canWrite, false);
 		});
+
+		test('parses record struct primary constructor parameters', () => {
+			const fields = parseTypeFields(
+				'public record struct TestRequest(string Name, int Field2, int[] Field3);',
+				'TestRequest'
+			);
+			assert.deepStrictEqual(fields.map(field => [field.name, field.typeName]), [
+				['Name', 'string'],
+				['Field2', 'int'],
+				['Field3', 'int[]'],
+			]);
+		});
+
+		test('parses properties from a record class body', () => {
+			const fields = parseTypeFields(
+				'public record class TestRequest { public string Name { get; init; } }',
+				'TestRequest'
+			);
+			assert.deepStrictEqual(fields.map(field => [field.name, field.typeName]), [['Name', 'string']]);
+		});
+
+		test('parses init properties with an initializer', () => {
+			const fields = parseTypeFields([
+				'public class RequestDto',
+				'{',
+				'    public string Name { get; init; } = null!;',
+				'}',
+			].join('\n'), 'RequestDto');
+			assert.deepStrictEqual(fields.map(field => [field.name, field.typeName]), [['Name', 'string']]);
+		});
 	});
 
 	suite('buildMapToMethod', () => {
+		test('maps all record struct primary constructor fields to a DTO', () => {
+			const sourceFields = parseTypeFields(
+				'public record struct TestRequest(string Name, int Field2, int[] Field3);',
+				'TestRequest'
+			);
+			const targetFields = [
+				{ name: 'Name', typeName: 'string' },
+				{ name: 'Field2', typeName: 'int' },
+				{ name: 'Field3', typeName: 'int[]' },
+			];
+			const method = buildMapToMethod('TestRequest', 'TestRequestDto', sourceFields, targetFields, '\n');
+			assert.ok(method.includes('public static TestRequestDto MapToTestRequestDto(TestRequest source)'));
+			assert.ok(method.includes('Name = source.Name'));
+			assert.ok(method.includes('Field2 = source.Field2'));
+			assert.ok(method.includes('Field3 = source.Field3'));
+		});
+
 		test('generates mapping method with matching fields', () => {
 			const sourceFields = parseTypeFields(sampleClass, 'Author');
 			const targetFields = [
@@ -149,6 +210,27 @@ suite('generateMapTo', () => {
 	});
 
 	suite('buildMapFromMethod', () => {
+		test('maps initialized init properties to a record struct constructor', () => {
+			const sourceFields = parseTypeFields(
+				'public record struct TestRequest(string Name, int Field2, int[] Field3);',
+				'TestRequest'
+			);
+			const targetFields = parseTypeFields([
+				'public class RequestDto',
+				'{',
+				'    public string Name { get; init; } = null!;',
+				'    public int Field2 { get; init; } = 0;',
+				'    public int[] Field3 { get; init; } = null!;',
+				'}',
+			].join('\n'), 'RequestDto');
+			const method = buildMapFromMethod('TestRequest', 'RequestDto', sourceFields, targetFields, '\n');
+			assert.ok(method.includes('new TestRequest('));
+			assert.ok(method.includes('source.Name'));
+			assert.ok(method.includes('source.Field2'));
+			assert.ok(method.includes('source.Field3'));
+			assert.strictEqual(sourceFields.constructors?.length, 1);
+		});
+
 		test('generates reverse mapping method', () => {
 			const sourceFields = parseTypeFields(sampleClass, 'Author');
 			const targetFields = [
@@ -203,6 +285,23 @@ suite('generateMapTo', () => {
 	});
 
 	suite('buildDtoMapFromMethod', () => {
+		test('maps record struct primary constructor fields to DTO properties', () => {
+			const sourceFields = parseTypeFields(
+				'public record struct TestRequest(string Name, int Field2, int[] Field3);',
+				'TestRequest'
+			);
+			const dtoFields = [
+				{ name: 'Name', typeName: 'string' },
+				{ name: 'Field2', typeName: 'int' },
+				{ name: 'Field3', typeName: 'int[]' },
+			];
+			const method = buildDtoMapFromMethod('TestRequestDto', 'TestRequest', dtoFields, sourceFields, '\n');
+			assert.ok(method.includes('public TestRequestDto(TestRequest source)'));
+			assert.ok(method.includes('Name = source.Name;'));
+			assert.ok(method.includes('Field2 = source.Field2;'));
+			assert.ok(method.includes('Field3 = source.Field3;'));
+		});
+
 		test('generates a DTO constructor with mapped properties', () => {
 			const sourceFields = parseTypeFields(sampleClass, 'Author');
 			const dtoFields = [

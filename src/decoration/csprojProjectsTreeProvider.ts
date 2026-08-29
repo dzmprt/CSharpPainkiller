@@ -595,7 +595,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const includedPaths = new Set((solutionUri.path.endsWith('.slnx') ? parseSlnxProjects(content) : parseSlnProjects(content))
 			.filter(entry => !entry.isSolutionFolder)
 			.map(entry => normalizePath(pathModule.resolve(solutionDir, entry.projectPath))));
-		const candidates = (await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}'))
+		const candidates = (await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}'))
 			.filter(uri => !includedPaths.has(normalizePath(uri.fsPath)));
 
 		if (candidates.length === 0) {
@@ -626,7 +626,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 
 		const answer = await vscode.window.showWarningMessage(
-			`Delete project "${item.node.label}" from the solution and delete all files in its folder?`,
+			`Delete project "${item.node.label}" from the solution?`,
 			{ modal: true },
 			'Delete Project'
 		);
@@ -634,8 +634,15 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
+		const deletePhysicalFolder = await this.shouldDeletePhysicalFolder(item.node.folderUri, item.node.label, true);
+		if (deletePhysicalFolder === undefined) {
+			return;
+		}
+
 		await this.removeProjectFromSolution(item.node.solutionUri, item.node.projectPath);
-		await vscode.workspace.fs.delete(item.node.folderUri, { recursive: true, useTrash: true });
+		if (deletePhysicalFolder) {
+			await vscode.workspace.fs.delete(item.node.folderUri, { recursive: true, useTrash: true });
+		}
 		this.refresh();
 	}
 
@@ -659,7 +666,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			)
 		);
 
-		const allProjects = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+		const allProjects = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 
 		// Step 1: exclude self and already-referenced projects
 		const candidates = allProjects.filter(uri =>
@@ -772,7 +779,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				return;
 			}
 
-			const projectFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+			const projectFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 			await vscode.workspace.fs.createDirectory(targetPhysicalBaseUri);
 			await vscode.workspace.fs.rename(sourceProject.folderUri, targetProjectFolderUri, { overwrite: false });
 			await this.updateProjectReferencesAfterPhysicalMove(projectFiles, sourceProject.csprojUri, targetProjectUri);
@@ -811,7 +818,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return false;
 		}
 
-		const projectFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+		const projectFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		for (const projectFile of projectFiles) {
 			const projectDir = normalizePath(pathModule.dirname(projectFile.fsPath));
 			if (projectDir === sourceFolderPath) {
@@ -1284,7 +1291,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			},
 			async progress => {
 				progress.report({ message: 'Finding projects...' });
-				const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+						const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 				const projectTasks: { csprojUri: vscode.Uri; packages: { packageId: string; version?: string }[] }[] = [];
 				let packageCount = 0;
 
@@ -1395,7 +1402,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 
 
 	private async checkAllCentralPackageUpdates(csprojFiles: vscode.Uri[]): Promise<void> {
-		const propsFiles = await vscode.workspace.findFiles('**/Directory.Packages.props', '{**/bin/**,**/obj/**}');
+		const propsFiles = await vscode.workspace.findFiles('**/Directory.Packages.props', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		await Promise.all(propsFiles.map(async centralPropsUri => {
 			const representative = await this.findCentralPackageRepresentativeFromFiles(centralPropsUri, csprojFiles);
 			if (representative) {
@@ -1484,7 +1491,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		version: string,
 	): Promise<void> {
 
-		const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+			const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		await Promise.all(projectUris.map(async projectUri => {
 			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(projectUri.fsPath));
 			if (!projectCentralPropsUri || normalizePath(projectCentralPropsUri.fsPath) !== normalizePath(centralPropsUri.fsPath)) {
@@ -1505,7 +1512,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
-		const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+			const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		const packageReferences = await Promise.all(projectUris.map(async projectUri => {
 			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(projectUri.fsPath));
 			if (!projectCentralPropsUri || normalizePath(projectCentralPropsUri.fsPath) !== normalizePath(centralPropsUri.fsPath)) {
@@ -1548,7 +1555,11 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		this.refresh();
 	}
 
-	private async shouldDeletePhysicalFolder(folderUri: vscode.Uri, label: string): Promise<boolean | undefined> {
+	private async shouldDeletePhysicalFolder(
+		folderUri: vscode.Uri,
+		label: string,
+		alwaysPrompt = false
+	): Promise<boolean | undefined> {
 		try {
 			const stat = await vscode.workspace.fs.stat(folderUri);
 			if ((stat.type & vscode.FileType.Directory) !== vscode.FileType.Directory) {
@@ -1559,9 +1570,11 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 
 		const entries = await vscode.workspace.fs.readDirectory(folderUri);
-		if (entries.length > 0) {
+		if (alwaysPrompt || entries.length > 0) {
 			const answer = await vscode.window.showWarningMessage(
-				`Physical folder "${label}" is not empty. Delete it too?`,
+				alwaysPrompt
+					? `Delete physical folder "${label}" too?`
+					: `Physical folder "${label}" is not empty. Delete it too?`,
 				{ modal: true },
 				'Delete Physical Folder',
 				'Keep Physical Folder'
@@ -1582,7 +1595,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return item.createFolderTarget;
 		}
 
-		const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**}');
+			const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		if (solutionFiles.length === 0) {
 			vscode.window.showErrorMessage('CSharp Painkiller: No .sln or .slnx file found.');
 			return undefined;
@@ -1669,9 +1682,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	}
 
 	private async buildTree(): Promise<CsprojTreeNode[]> {
-		const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}');
+			const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		const projectByPath = new Map(csprojFiles.map(uri => [normalizePath(uri.fsPath), uri]));
-		const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**}');
+			const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 
 		if (solutionFiles.length === 0) {
 			return [];
@@ -1811,7 +1824,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const includedPaths = new Set(entries
 			.filter(entry => !entry.isSolutionFolder)
 			.map(entry => normalizePath(pathModule.resolve(solutionDir, entry.projectPath))));
-		const excludedProjects = (await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**}'))
+		const excludedProjects = (await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}'))
 			.filter(uri => !includedPaths.has(normalizePath(uri.fsPath)))
 			.map(uri => ({
 				kind: 'excludedProject' as const,

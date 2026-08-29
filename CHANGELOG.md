@@ -4,6 +4,19 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.12]
+
+### Added
+
+- **Solution migration to `.slnx`** — migrate a `.sln` solution to the modern `.slnx` format from the solution file context menu; an existing `.slnx` file is preserved
+
+### Changed
+
+- **Mapping and DTO generation** — support positional `record` and `record struct` declarations, including their primary-constructor fields, and `init`-only properties with initializers
+- **Type and file name synchronization** — recognize `record class` declarations
+- **Solution Structure project deletion** — removing a project from a solution now asks separately whether its physical project folder should also be deleted
+- **Workspace scanning** — exclude `.dotnet` directories from C# file and project discovery, open-file diagnostics, and solution-wide analysis
+
 ## [0.0.11]
 
 ### Changed

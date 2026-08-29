@@ -218,7 +218,7 @@ export async function goToHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
 	let found: Awaited<ReturnType<typeof findHandlerForMediator>>;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for handler of '${info.className}'…` },
-		async () => { found = await findHandlerForMediator(info.className, info.kind, { contextUri: uri }); }
+		async () => { found = await findHandlerForMediator(info.className, info.kind); }
 	);
 
 	if (!found!) {

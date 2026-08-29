@@ -3,7 +3,7 @@
   "displayName": "C# Painkiller",
   "publisher": "DzmitryPratsko",
   "description": "Smart file creation, code generation, project creation, namespace management and more for C#",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "engines": {
     "vscode": "^1.92.0"
   },
@@ -83,6 +83,11 @@
       {
         "command": "csharppainkiller.analyzeSolution",
         "title": "C# Analyze Solution",
+        "category": "CSharp Painkiller"
+      },
+      {
+        "command": "csharppainkiller.projects.migrateToSlnx",
+        "title": "Migrate to .slnx",
         "category": "CSharp Painkiller"
       },
       {
@@ -457,6 +462,11 @@
           "command": "csharppainkiller.projects.migrateToCentralPackageManagement",
           "when": "resourceExtname == .sln || resourceExtname == .slnx",
           "group": "2_csharp@11"
+        },
+        {
+          "command": "csharppainkiller.projects.migrateToSlnx",
+          "when": "resourceExtname == .sln",
+          "group": "2_csharp@12"
         },
         {
           "when": "explorerResourceIsFolder",

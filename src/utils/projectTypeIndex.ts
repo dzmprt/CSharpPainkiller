@@ -84,7 +84,7 @@ export class ProjectTypeIndex {
 	}
 
 	private async initializeCore(context: vscode.ExtensionContext): Promise<void> {
-		const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+		const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		await Promise.all(files.map(uri => this.refreshFromDisk(uri)));
 
 		this.watcher = vscode.workspace.createFileSystemWatcher('**/*.cs');

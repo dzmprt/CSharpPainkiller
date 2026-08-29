@@ -157,7 +157,7 @@ export async function runDiagnosticsForDocument(
 	if (document.languageId !== 'csharp' && !document.uri.path.endsWith('.cs')) {
 		return;
 	}
-	if (document.uri.scheme !== 'file') {
+	if (document.uri.scheme !== 'file' || isPathExcluded(document.uri.path)) {
 		return;
 	}
 
@@ -178,7 +178,7 @@ export async function runDiagnosticsForUri(
 	if (!uri.path.endsWith('.cs')) {
 		return;
 	}
-	if (uri.scheme !== 'file') {
+	if (uri.scheme !== 'file' || isPathExcluded(uri.path)) {
 		return;
 	}
 
@@ -194,7 +194,7 @@ export async function runDiagnosticsForOpenEditors(
 	collection: vscode.DiagnosticCollection
 ): Promise<void> {
 	const promises = vscode.workspace.textDocuments
-		.filter(doc => doc.uri.scheme === 'file' && doc.uri.path.endsWith('.cs'))
+		.filter(doc => doc.uri.scheme === 'file' && doc.uri.path.endsWith('.cs') && !isPathExcluded(doc.uri.path))
 		.map(doc => analyzeCsFile(doc.uri, collection));
 	await Promise.all(promises);
 }
@@ -228,7 +228,7 @@ export async function runDiagnosticsForWorkspace(
 	collection: vscode.DiagnosticCollection,
 	options?: WorkspaceAnalysisOptions
 ): Promise<WorkspaceAnalysisResult> {
-	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**}');
+	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 	const { processed, cancelled } = await runDiagnosticsInBatches(collection, files, {
 		overrides: options?.overrides,
 		token: options?.token,

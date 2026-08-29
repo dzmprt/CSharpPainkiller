@@ -47,7 +47,7 @@ export class CsprojCache {
 
 	/** Refresh csproj list from workspace. */
 	private async refreshCsprojs(): Promise<void> {
-		const exclusionPattern = '{**/bin/**,**/obj/**}';
+		const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
 		try {
 			const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', exclusionPattern);
 			this.csprojs = csprojFiles.map(uri => ({

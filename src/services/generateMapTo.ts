@@ -357,7 +357,7 @@ function extractTypeBody(content: string, typeName: string): string | undefined 
 	const escaped  = escapeRe(typeName);
 
 	const typeRegex = new RegExp(
-		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record)\\s+${escaped}(?:\\s*<[^>]*>)?\\s*(?::[^{]*)?\\{`,
+		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record(?:\\s+(?:struct|class))?)\\s+${escaped}(?:\\s*<[^>]*>)?(?:\\s*\\([^)]*\\))?\\s*(?::[^{]*)?\\{`,
 		'g'
 	);
 
@@ -376,7 +376,7 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 	const results: FieldInfo[] = [];
 
 	const propRegex =
-		/\bpublic\s+(?:required\s+)?(?:readonly\s+)?(?:static\s+)?(?:override\s+)?(?:virtual\s+)?(?:new\s+)?([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{[^}]*\}|;)/g;
+		/\bpublic\s+(?:required\s+)?(?:readonly\s+)?(?:static\s+)?(?:override\s+)?(?:virtual\s+)?(?:new\s+)?([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{[^}]*\}(?:\s*=\s*[^;{}]*)?|(?:\s*=\s*[^;{}]*)?;)/g;
 
 	let m: RegExpExecArray | null;
 	while ((m = propRegex.exec(typeBody)) !== null) {
@@ -400,7 +400,7 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 	// Primary constructor parameters for records
 	const stripped     = stripComments(rawContent);
 	const escaped      = escapeRe(typeName);
-	const recordCtorRe = new RegExp(`\\brecord\\b(?:\\s+struct)?\\s+${escaped}\\s*\\(([^)]*)\\)`, 'm');
+	const recordCtorRe = new RegExp(`\\brecord\\b(?:\\s+(?:struct|class))?\\s+${escaped}\\s*\\(([^)]*)\\)`, 'm');
 	const recordMatch  = recordCtorRe.exec(stripped);
 	if (recordMatch) {
 		const paramRegex = /([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*[^,)]+)?(?:,|$)/g;
@@ -423,6 +423,18 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 		const paramRegex = /([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*[^,)]+)?(?:,|$)/g;
 		let paramMatch: RegExpExecArray | null;
 		while ((paramMatch = paramRegex.exec(ctorMatch[1])) !== null) {
+			const parameterType = paramMatch[1].trim();
+			if (parameterType) {
+				parameters.push({ name: paramMatch[2].trim(), typeName: parameterType });
+			}
+		}
+		constructors.push({ parameters });
+	}
+	if (recordMatch) {
+		const parameters: FieldInfo[] = [];
+		const paramRegex = /([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*[^,)]+)?(?:,|$)/g;
+		let paramMatch: RegExpExecArray | null;
+		while ((paramMatch = paramRegex.exec(recordMatch[1])) !== null) {
 			const parameterType = paramMatch[1].trim();
 			if (parameterType) {
 				parameters.push({ name: paramMatch[2].trim(), typeName: parameterType });
@@ -842,6 +854,8 @@ async function applyMethodInsert(
 	const content = document.getText();
 	const fileNs  = extractFileNamespace(content) ?? '';
 	const edit    = new vscode.WorkspaceEdit();
+	const insertionOffset = document.offsetAt(insertionPosition);
+	const isBodylessDeclaration = document.getText().charAt(insertionOffset) === ';';
 
 	// Using directive
 	if (targetNamespace && targetNamespace !== fileNs) {
@@ -851,14 +865,22 @@ async function applyMethodInsert(
 		}
 	}
 
-	// Method goes on its own line(s) before the closing brace.
+	if (isBodylessDeclaration) {
+		edit.replace(
+			document.uri,
+			new vscode.Range(insertionPosition, document.positionAt(insertionOffset + 1)),
+			`{${eol}${methodText}${eol}}`
+		);
+	} else {
+		// Method goes on its own line(s) before the closing brace.
 	// insertionPosition is column 0 of the `}` line, so appending eol after
 	// the method leaves the `}` on the next line as expected.
-	const previousLine = insertionPosition.line > 0
-		? document.lineAt(insertionPosition.line - 1).text
-		: '';
-	const separator = previousLine.trim() ? eol : '';
-	edit.insert(document.uri, insertionPosition, separator + methodText + eol);
+		const previousLine = insertionPosition.line > 0
+			? document.lineAt(insertionPosition.line - 1).text
+			: '';
+		const separator = previousLine.trim() ? eol : '';
+		edit.insert(document.uri, insertionPosition, separator + methodText + eol);
+	}
 
 	await vscode.workspace.applyEdit(edit);
 
@@ -882,16 +904,15 @@ function escapeRe(s: string): string {
 export function detectPrimaryTypeName(content: string): string | undefined {
 	const stripped = stripComments(content);
 	const publicMatch = stripped.match(
-		/\bpublic\s+(?:(?:static|sealed|abstract|partial|readonly)\s+)*(?:class|struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)/
+		/\bpublic\s+(?:(?:static|sealed|abstract|partial|readonly)\s+)*(?:class|struct|record(?:\s+(?:struct|class))?)\s+([A-Za-z_][A-Za-z0-9_]*)/
 	);
 	if (publicMatch) { return publicMatch[1]; }
-	return stripped.match(/\b(?:class|struct|record)\s+([A-Za-z_][A-Za-z0-9_]*)/)?.[1];
+	return stripped.match(/\b(?:class|struct|record(?:\s+(?:struct|class))?)\s+([A-Za-z_][A-Za-z0-9_]*)/)?.[1];
 }
 
 export function parseTypeFields(content: string, typeName: string): ParsedFields {
 	const body = extractTypeBody(content, typeName);
-	if (body === undefined) { return []; }
-	return extractFields(body, content, typeName);
+	return extractFields(body ?? '', content, typeName);
 }
 
 /**
@@ -908,7 +929,7 @@ function findInsertionPosition(
 	const escaped  = escapeRe(typeName);
 
 	const typeRegex = new RegExp(
-		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record)\\s+${escaped}(?:\\s*<[^>]*>)?\\s*(?::[^{]*)?\\{`,
+		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record(?:\\s+(?:struct|class))?)\\s+${escaped}(?:\\s*<[^>]*>)?\\s*(?::[^{]*)?\\{`,
 		'g'
 	);
 
@@ -921,6 +942,15 @@ function findInsertionPosition(
 		// Column 0 of the line containing `}` — insert goes before it
 		const closingLine = document.positionAt(closeBrace).line;
 		return new vscode.Position(closingLine, 0);
+	}
+
+	const bodylessTypeRegex = new RegExp(
+		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record(?:\\s+(?:struct|class))?)\\s+${escaped}(?:\\s*<[^>]*>)?(?:\\s*\\([^)]*\\))?\\s*(?::[^;]*)?;`,
+		'g'
+	);
+	const bodylessMatch = bodylessTypeRegex.exec(stripped);
+	if (bodylessMatch) {
+		return document.positionAt(bodylessMatch.index + bodylessMatch[0].length - 1);
 	}
 
 	return undefined;

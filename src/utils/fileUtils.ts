@@ -8,12 +8,12 @@ import { CsprojCache } from './csprojCache.js';
 
 /**
  * Path segments that should be excluded from C# file operations.
- * These are standard .NET build output directories.
+ * These are standard .NET build output and tooling directories.
  */
-const EXCLUDED_PATH_SEGMENTS = new Set(['bin', 'obj']);
+const EXCLUDED_PATH_SEGMENTS = new Set(['bin', 'obj', '.dotnet']);
 
 /**
- * Checks if a file path is inside an excluded directory (bin, obj, etc.).
+ * Checks if a file path is inside an excluded directory (bin, obj, .dotnet, etc.).
  */
 export function isPathExcluded(filePath: string): boolean {
 	const pathSegments = filePath.split('/').filter(Boolean);
@@ -30,7 +30,7 @@ export function isPathExcluded(filePath: string): boolean {
  */
 export async function collectCsFiles(folderUri: vscode.Uri): Promise<vscode.Uri[]> {
 	const pattern = '**/*.cs';
-	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
 	const files = await vscode.workspace.findFiles(pattern, exclusionPattern);
 
 	// Filter to only include files within the target folder and exclude bin/obj
@@ -54,7 +54,7 @@ export async function collectCsFiles(folderUri: vscode.Uri): Promise<vscode.Uri[
  */
 export async function collectAllCsFilesInWorkspace(): Promise<vscode.Uri[]> {
 	const pattern = '**/*.cs';
-	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
 	const files = await vscode.workspace.findFiles(pattern, exclusionPattern);
 
 	// Exclude files in bin/obj directories
@@ -98,7 +98,7 @@ export function findProjectRootForPath(
  * This is called once per folder operation to avoid repeated searches.
  */
 export async function preloadCsprojs(_folderUri: vscode.Uri): Promise<ProjectContext> {
-	const exclusionPattern = '{**/bin/**,**/obj/**}';
+	const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
 	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', exclusionPattern);
 
 	const csprojs: CsprojInfo[] = csprojFiles.map(uri => ({

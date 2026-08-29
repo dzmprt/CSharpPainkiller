@@ -59,6 +59,7 @@ import { scheduleDiagnosticsForDocumentChange, clearDebounceForDocument } from '
 import { CSharpDiagnosticsCodeActionProvider } from './diagnostics/codeActionProvider.js';
 import { analyzeSolutionCommand } from './services/analyzeSolution.js';
 import { migrateSolutionToCentralPackageManagement } from './services/migrateToCentralPackageManagement.js';
+import { migrateSolutionToSlnx } from './services/migrateSolutionToSlnx.js';
 
 /**
  * List of all "Create" commands for C# types.
@@ -171,7 +172,10 @@ export async function activate(context: vscode.ExtensionContext) {
 		}),
 		vscode.commands.registerCommand('csharppainkiller.projects.migrateToCentralPackageManagement', async (uri?: vscode.Uri) => {
 			await migrateSolutionToCentralPackageManagement(uri);
-		})
+		}),
+		vscode.commands.registerCommand('csharppainkiller.projects.migrateToSlnx', async (uri?: vscode.Uri) => {
+			await migrateSolutionToSlnx(uri);
+		}),
 	);
 	console.log('File decoration provider registered');
 
@@ -718,7 +722,7 @@ export async function activate(context: vscode.ExtensionContext) {
 }
 
 async function updateHasSolutionContext(): Promise<void> {
-	const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**}');
+	const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 	await vscode.commands.executeCommand('setContext', 'csharppainkiller.hasSolution', solutionFiles.length > 0);
 }
 
