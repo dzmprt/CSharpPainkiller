@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
-import { spawnSync } from 'child_process';
 import * as pathModule from 'path';
+import { AsyncCache, waitWithCancellation, throwIfCancelled } from '../utils/asyncWork.js';
+import { runDotnet } from '../utils/dotnetCli.js';
+import { CsprojCache } from '../utils/csprojCache.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -25,19 +27,8 @@ interface DotnetCreateProjectTarget {
 // Parsing: run `dotnet new list` and parse the text table output
 // ---------------------------------------------------------------------------
 
-function parseDotnetNewList(): Array<{ name: string; shorthand: string; language: string; tags: string }> {
-  try {
-    const result = spawnSync('dotnet', ['new', 'list'], {
-      timeout: 30_000,
-      shell: false,
-    });
-
-    if (result.error) {
-      vscode.window.showErrorMessage(`Failed to list .NET templates: ${result.error.message}`);
-      return [];
-    }
-
-    const output = (result.stdout?.toString() || result.stderr?.toString() || '').replace(/^\r?\n/, ''); // remove leading blank line
+export function parseDotnetTemplateList(output: string): Array<{ name: string; shorthand: string; language: string; tags: string }> {
+    output = output.replace(/^\r?\n/, '');
     const lines = output.split(/\r?\n/).filter(line => line.trim() !== '');
 
     // Skip header lines (lines starting with "Template", "--------------------------------", etc.)
@@ -66,6 +57,7 @@ function parseDotnetNewList(): Array<{ name: string; shorthand: string; language
     for (const line of dataLines) {
       // Split by 2+ spaces to get columns
       const parts = line.split(/\s{2,}/).filter(p => p.trim() !== '');
+      if (parts.length < 3) { throw new Error(`Cannot parse .NET template row: ${line.trim()}`); }
 
       const name = parts[0].trim();
       const shorthand = parts[1].trim();
@@ -98,12 +90,8 @@ function parseDotnetNewList(): Array<{ name: string; shorthand: string; language
       }
     }
 
+    if (!startedData) { throw new Error('dotnet new list did not return a template table.'); }
     return templates;
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    vscode.window.showWarningMessage(`Could not list .NET templates: ${msg}`);
-    return [];
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -162,8 +150,21 @@ function isRelevantFileTemplate(shorthand: string, tagsLower: string): boolean {
 // Main: fetch and build template menu structure
 // ---------------------------------------------------------------------------
 
-export async function fetchDotnetTemplates(_context: vscode.ExtensionContext): Promise<DotnetTemplate[]> {
-  const rawTemplates = parseDotnetNewList();
+const sdkCache = new AsyncCache<string, string>(20, 30_000);
+const templateCache = new AsyncCache<string, DotnetTemplate[]>(20, 5 * 60_000);
+
+export async function fetchDotnetTemplates(
+  _context: Pick<vscode.ExtensionContext, 'subscriptions'>,
+  cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+  token?: vscode.CancellationToken,
+): Promise<DotnetTemplate[]> {
+  throwIfCancelled(token);
+  const sdk = await waitWithCancellation(sdkCache.get(cwd, async () =>
+    (await runDotnet(['--version'], cwd, undefined, 30_000)).stdout.trim()
+  ), token);
+  return waitWithCancellation(templateCache.get(`${cwd}::${sdk}`, async () => {
+  const listed = await runDotnet(['new', 'list'], cwd, undefined, 30_000);
+  const rawTemplates = parseDotnetTemplateList(listed.stdout);
 
   const result: DotnetTemplate[] = [];
 
@@ -203,6 +204,7 @@ export async function fetchDotnetTemplates(_context: vscode.ExtensionContext): P
   }
 
   return result;
+  }), token);
 }
 
 // ---------------------------------------------------------------------------
@@ -214,23 +216,45 @@ export interface TemplateMenuEntry {
   commandDisposable: vscode.Disposable;
 }
 
-export function registerDynamicTemplateCommands(templates: DotnetTemplate[], context: vscode.ExtensionContext): TemplateMenuEntry[] {
+export function registerDynamicTemplateCommands(templates: DotnetTemplate[], context: Pick<vscode.ExtensionContext, 'subscriptions'>, registerUnified = true): TemplateMenuEntry[] {
   const entries: TemplateMenuEntry[] = [];
+  const uniqueTemplates: DotnetTemplate[] = [];
+  const shorthands = new Set<string>();
+  const commandIds = new Set<string>();
+  const reservedIds = new Set(templates.map(template => template.classId));
 
   for (const template of templates) {
+    // CLI rows can share a short name; creation uses only the primary alias.
+    const shorthand = getPrimaryTemplateShorthand(template.shorthand);
+    if (shorthands.has(shorthand)) {
+      continue;
+    }
+    shorthands.add(shorthand);
+
+    let classId = template.classId;
+    if (commandIds.has(classId)) {
+      let suffix = 1;
+      do {
+        classId = `${template.classId}_${suffix++}`;
+      } while (reservedIds.has(classId) || commandIds.has(classId));
+    }
+    commandIds.add(classId);
+    const commandTemplate = { ...template, classId };
+    uniqueTemplates.push(commandTemplate);
+
     const disposable = vscode.commands.registerCommand(
-      template.classId,
+      commandTemplate.classId,
       async () => {
-        await createProjectByTemplate(template);
+        await createProjectByTemplate(commandTemplate);
       }
     );
 
     context.subscriptions.push(disposable);
-    entries.push({ template, commandDisposable: disposable });
+    entries.push({ template: commandTemplate, commandDisposable: disposable });
   }
 
   // Register the unified "Create .NET Project" command that shows grouped templates
-  registerUnifiedCreateProjectCommand(templates, context);
+  if (registerUnified) { registerUnifiedCreateProjectCommand(async () => uniqueTemplates, context); }
 
   return entries;
 }
@@ -239,10 +263,52 @@ export function registerDynamicTemplateCommands(templates: DotnetTemplate[], con
 // Unified "Create .NET Project" command with grouped QuickPick
 // ---------------------------------------------------------------------------
 
-function registerUnifiedCreateProjectCommand(templates: DotnetTemplate[], context: vscode.ExtensionContext): void {
+export function registerLazyTemplateCommands(context: Pick<vscode.ExtensionContext, 'subscriptions'>): void {
+  let currentTemplates: DotnetTemplate[] | undefined;
+  let entries: TemplateMenuEntry[] = [];
+  registerUnifiedCreateProjectCommand(async target => {
+    const uri = target instanceof vscode.Uri ? target : target?.physicalBaseUri;
+    const base = uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
+    if (!base) { throw new Error('Open a workspace folder to list .NET templates.'); }
+    let cwd = base.fsPath;
+    try {
+      if ((await vscode.workspace.fs.stat(base)).type === vscode.FileType.File) { cwd = pathModule.dirname(cwd); }
+    } catch (error) {
+      if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') { throw error; }
+      cwd = vscode.workspace.getWorkspaceFolder(base)?.uri.fsPath ?? cwd;
+    }
+    const templates = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification, title: 'Loading .NET templates', cancellable: true,
+    }, (_progress, token) => fetchDotnetTemplates(context, cwd, token));
+    if (templates !== currentTemplates) {
+      for (const entry of entries) { entry.commandDisposable.dispose(); }
+      entries = registerDynamicTemplateCommands(templates, context, false);
+      currentTemplates = templates;
+    }
+    return entries.map(entry => entry.template);
+  }, context);
+  const watcher = vscode.workspace.createFileSystemWatcher('**/global.json');
+  const clear = () => { sdkCache.clear(); templateCache.clear(); };
+  context.subscriptions.push(watcher, watcher.onDidCreate(clear), watcher.onDidChange(clear), watcher.onDidDelete(clear),
+    { dispose: clear });
+}
+
+function registerUnifiedCreateProjectCommand(
+  load: (target?: vscode.Uri | DotnetCreateProjectTarget) => Promise<DotnetTemplate[]>,
+  context: Pick<vscode.ExtensionContext, 'subscriptions'>,
+): void {
   const disposable = vscode.commands.registerCommand(
     'csharppainkiller.dotnet.createProject',
     async (target?: vscode.Uri | DotnetCreateProjectTarget) => {
+      let templates: DotnetTemplate[];
+      try {
+        templates = await load(target);
+      } catch (error) {
+        if (error instanceof vscode.CancellationError) { return; }
+        console.error('Loading .NET templates failed:', error);
+        vscode.window.showErrorMessage(`Failed to list .NET templates: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
       // Sort templates by shorthand for consistent ordering
       const sortedTemplates = [...templates].sort((a, b) => a.shorthand.localeCompare(b.shorthand));
 
@@ -349,7 +415,7 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedTarget?
 
     if (solution) {
       const slnDir = pathModule.dirname(solution.fsPath);
-      runDotnetCommand(newArgs, slnDir);
+      await runDotnetCommand(newArgs, slnDir);
 
       let addedToSolution = false;
       // Only project templates create .csproj files that can be added to a solution.
@@ -363,10 +429,11 @@ async function createProjectByTemplate(template: DotnetTemplate, selectedTarget?
           : `Created ${template.name} "${projectName}".`
       );
     } else {
-      runDotnetCommand(newArgs, pathModule.dirname(projectFolderPath.fsPath));
+      await runDotnetCommand(newArgs, pathModule.dirname(projectFolderPath.fsPath));
       vscode.window.showInformationMessage(`Created ${template.name} project "${projectName}".`);
     }
   } catch (error) {
+    if (error instanceof vscode.CancellationError) { return; }
     vscode.window.showErrorMessage(`Failed to create ${template.name} project: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -403,7 +470,7 @@ async function fileExists(uri: vscode.Uri): Promise<boolean> {
 }
 
 async function isInsideExistingProject(folderUri: vscode.Uri): Promise<boolean> {
-  const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+  const csprojFiles = await CsprojCache.getInstance().getProjectUris();
   const selectedPath = pathModule.normalize(folderUri.fsPath);
 
   return csprojFiles.some(csprojUri => {
@@ -459,29 +526,10 @@ async function findSolutionFileNear(uri: vscode.Uri): Promise<vscode.Uri | null>
 // Helper: run dotnet command (simplified version from dotnetCommands.ts)
 // ---------------------------------------------------------------------------
 
-function runDotnetCommand(args: string[], cwd: string): void {
-  try {
-    const result = spawnSync('dotnet', args, {
-      cwd,
-      stdio: 'inherit',
-      timeout: 120_000,
-      shell: false,
-    });
-
-    if (result.error) {
-      throw result.error;
-    }
-
-    if (result.status !== 0) {
-      const stderr = result.stderr?.toString() || '';
-      const stdout = result.stdout?.toString() || '';
-      throw new Error(stderr || stdout || `Command exited with code ${result.status}`);
-    }
-  } catch (error: unknown) {
-    const msg = error instanceof Error ? error.message : String(error);
-    vscode.window.showErrorMessage(`Failed to run dotnet ${args.join(' ')}: ${msg}`);
-    throw error;
-  }
+async function runDotnetCommand(args: string[], cwd: string): Promise<void> {
+  await vscode.window.withProgress({
+    location: vscode.ProgressLocation.Notification, title: `dotnet ${args.slice(0, 2).join(' ')}`, cancellable: true,
+  }, async (_progress, token) => { await runDotnet(args, cwd, token); });
 }
 
 // ---------------------------------------------------------------------------
@@ -489,10 +537,7 @@ function runDotnetCommand(args: string[], cwd: string): void {
 // ---------------------------------------------------------------------------
 
 async function ensureDirectoryExists(dirPath: string): Promise<void> {
-  const fsModule = await import('fs');
-  if (!fsModule.existsSync(dirPath)) {
-    fsModule.mkdirSync(dirPath, { recursive: true });
-  }
+  await vscode.workspace.fs.createDirectory(vscode.Uri.file(dirPath));
 }
 
 // ---------------------------------------------------------------------------
@@ -505,7 +550,7 @@ async function addProjectToSolution(solutionUri: vscode.Uri, projectFolderUri: v
     if (solutionUri.path.endsWith('.slnx')) {
       await addProjectToSlnx(solutionUri, projectFilePath, slnDir, solutionFolderPath);
     } else {
-      runDotnetCommand(['sln', solutionUri.fsPath, 'add', projectFilePath], slnDir);
+      await runDotnetCommand(['sln', solutionUri.fsPath, 'add', projectFilePath], slnDir);
       if (solutionFolderPath) {
         const content = await readUtf8(solutionUri);
         const relativeProjectPath = pathModule.relative(slnDir, projectFilePath).replace(/\\/g, '/');
@@ -516,8 +561,10 @@ async function addProjectToSolution(solutionUri: vscode.Uri, projectFolderUri: v
       }
     }
     return true;
-  } catch {
-    console.error('Failed to add project to solution');
+  } catch (error) {
+    if (error instanceof vscode.CancellationError) { throw error; }
+    console.error('Failed to add project to solution:', error);
+    vscode.window.showWarningMessage(`Project was created but could not be added to the solution: ${error instanceof Error ? error.message : String(error)}`);
     return false;
   }
 }

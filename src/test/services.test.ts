@@ -1,9 +1,11 @@
 import * as assert from 'assert';
-import { sortUsingsInContent } from '../services/sortUsings.js';
+import * as vscode from 'vscode';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import { removeUnusedUsingsFromContent } from '../services/removeUnusedUsings.js';
-import { extractPublicMembers } from '../services/extractInterface.js';
-import { collectTopLevelUsingBlock, isUsingOrderSorted } from '../utils/usingBlock.js';
-import { collectPackageVulnerabilities, collectProjectPackages, compareVersions } from '../services/nugetCommands.js';
+import { extractPublicMembers, generateInterfaceContent } from '../services/extractInterface.js';
+import { clearNugetCaches, collectPackageVulnerabilities, collectProjectPackages, compareVersions, getNugetSources, showAddPackagePicker } from '../services/nugetCommands.js';
 import {
 	addPackageReferenceToCsproj,
 	addPackageVersionToProps,
@@ -11,7 +13,10 @@ import {
 	isAutomaticPackageCheckEnabled,
 	parsePackageReferences,
 	removePackageVersionFromProps,
+	removeSlnFolder,
+	removeSlnProject,
 	updatePackageReferenceVersionInCsproj,
+	updatePackageVersionInProps,
 } from '../decoration/csprojProjectsTreeProvider.js';
 import {
 	parsePublicProperties,
@@ -21,12 +26,17 @@ import {
 	normalizeControllerName,
 	generateEmptyController,
 } from '../services/templates/aspnet.js';
-import { generateFluentValidatorContent } from '../services/generateFluentValidator.js';
+import { generateFluentValidatorContent, generateFluentValidatorForDocument } from '../services/generateFluentValidator.js';
+import { buildDtoContent, generateDtoForDocument } from '../services/generateDto.js';
+import { csharpLanguageService } from '../services/csharpLanguageService.js';
+import { buildExtractedFileContent } from '../services/extractTypeToFileCore.js';
+import { type TypeFileContext } from '../utils/usingBlock.js';
 import {
 	buildDirectoryPackagesProps,
 	createMigrationPlan,
 	parseVersionedPackageReferences,
 	removePackageVersions,
+	migrateSolutionToCentralPackageManagement,
 } from '../services/migrateToCentralPackageManagement.js';
 import {
 	capitalize,
@@ -38,106 +48,96 @@ import {
 } from '../services/templates/shared/helpers.js';
 
 suite('services', () => {
-	suite('sortUsingsInContent', () => {
-		test('sorts System usings first', () => {
-			const content = [
-				'using MyApp.Domain;',
-				'using System.Linq;',
-				'using System;',
-				'namespace MyApp;',
-			].join('\n');
-			const sorted = sortUsingsInContent(content);
-			assert.ok(sorted);
-			const lines = sorted!.split('\n').slice(0, 3);
-			assert.strictEqual(lines[0], 'using System;');
-			assert.strictEqual(lines[1], 'using System.Linq;');
-			assert.strictEqual(lines[2], 'using MyApp.Domain;');
-		});
-
-		test('deduplicates usings', () => {
-			const content = [
-				'using System;',
-				'using System;',
-				'namespace MyApp;',
-			].join('\n');
-			const sorted = sortUsingsInContent(content);
-			assert.ok(sorted);
-			assert.strictEqual((sorted!.match(/^using System;/gm) ?? []).length, 1);
-		});
-
-		test('returns undefined when already sorted', () => {
-			const content = [
-				'using System;',
-				'using System.Linq;',
-				'namespace MyApp;',
-			].join('\n');
-			assert.strictEqual(sortUsingsInContent(content), undefined);
-		});
-
-		test('does not rewrite using directives inside namespace body', () => {
-			const content = [
-				'using MyApp.Domain;',
-				'using System;',
-				'',
-				'namespace MyApp',
-				'{',
-				'    using Nested;',
-				'    public class Book { }',
-				'}',
-			].join('\n');
-
-			const sorted = sortUsingsInContent(content);
-
-			assert.ok(sorted);
-			assert.ok(sorted!.includes('    using Nested;'));
-			assert.ok(sorted!.includes('public class Book { }'));
-		});
+	test('generates a generic DTO with the source type arguments and constraints', async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'painkiller-generic-dto-'));
+		const sourceUri = vscode.Uri.file(path.join(directory, 'Box.cs'));
+		const originalSymbols = csharpLanguageService.getSymbols;
+		const originalInput = vscode.window.showInputBox;
+		const originalShow = vscode.window.showTextDocument;
+		try {
+			const content = 'public class Box<T> where T : class, new() { public T Value { get; set; } }';
+			await fs.writeFile(sourceUri.fsPath, content);
+			const document = await vscode.workspace.openTextDocument(sourceUri);
+			const box = new vscode.DocumentSymbol('Box', '', vscode.SymbolKind.Class,
+				new vscode.Range(document.positionAt(0), document.positionAt(content.length)),
+				new vscode.Range(document.positionAt(content.indexOf('Box')), document.positionAt(content.indexOf('Box') + 3)));
+			const member = 'public T Value { get; set; }';
+			const start = content.indexOf(member);
+			const name = content.indexOf('Value');
+			box.children.push(new vscode.DocumentSymbol('Value', '', vscode.SymbolKind.Property,
+				new vscode.Range(document.positionAt(start), document.positionAt(start + member.length)),
+				new vscode.Range(document.positionAt(name), document.positionAt(name + 5))));
+			csharpLanguageService.getSymbols = async () => [box];
+			Object.defineProperty(vscode.window, 'showInputBox', { configurable: true, value: async () => 'BoxDto' });
+			Object.defineProperty(vscode.window, 'showTextDocument', { configurable: true, value: async () => undefined });
+			await generateDtoForDocument(document, 'Box');
+			const generated = await fs.readFile(path.join(directory, 'BoxDto.cs'), 'utf8');
+			assert.ok(generated.includes('public class BoxDto<T>'));
+			assert.ok(generated.includes('where T : class, new()'));
+			assert.ok(generated.includes('public BoxDto(Box<T> source)'));
+			assert.ok(generated.includes('Value = source.Value;'));
+		} finally {
+			csharpLanguageService.getSymbols = originalSymbols;
+			Object.defineProperty(vscode.window, 'showInputBox', { configurable: true, value: originalInput });
+			Object.defineProperty(vscode.window, 'showTextDocument', { configurable: true, value: originalShow });
+			await fs.rm(directory, { recursive: true, force: true });
+		}
 	});
 
-	suite('isUsingOrderSorted', () => {
-		test('treats System.* group before other namespaces as sorted (regression)', () => {
-			// Reported bug: this is correctly sorted (System.* first, then alphabetical),
-			// but the diagnostic used to flag it because it compared the whole list
-			// alphabetically without accounting for the System.* group.
-			const content = [
-				'using System.Reflection;',
-				'using Books.Application.Behaviors;',
-				'using FluentValidation;',
-				'using Microsoft.Extensions.DependencyInjection;',
-				'using MitMediator;',
-				'namespace MyApp;',
-			].join('\n');
+	test('validator commands exclude private getters and write-only properties', async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'painkiller-validator-accessors-'));
+		const uri = vscode.Uri.file(path.join(directory, 'Source.cs'));
+		const originalSymbols = csharpLanguageService.getSymbols;
+		const originalShow = vscode.window.showTextDocument;
+		try {
+			const members = [
+				'public string Name { get; set; }',
+				'public string Hidden { private get; set; }',
+				'public string WriteOnly { set {} }',
+			];
+			const content = `public class Source { ${members.join(' ')} }`;
+			await fs.writeFile(uri.fsPath, content);
+			const document = await vscode.workspace.openTextDocument(uri);
+			const source = new vscode.DocumentSymbol('Source', '', vscode.SymbolKind.Class,
+				new vscode.Range(document.positionAt(0), document.positionAt(content.length)),
+				new vscode.Range(document.positionAt(13), document.positionAt(19)));
+			source.children = members.map((member, index) => {
+				const name = ['Name', 'Hidden', 'WriteOnly'][index];
+				const start = content.indexOf(member);
+				const selection = content.indexOf(name, start);
+				return new vscode.DocumentSymbol(name, '', vscode.SymbolKind.Property,
+					new vscode.Range(document.positionAt(start), document.positionAt(start + member.length)),
+					new vscode.Range(document.positionAt(selection), document.positionAt(selection + name.length)));
+			});
+			csharpLanguageService.getSymbols = async () => [source];
+			Object.defineProperty(vscode.window, 'showTextDocument', { configurable: true, value: async () => undefined });
+			await generateFluentValidatorForDocument(document, 'Source');
+			const generated = await fs.readFile(path.join(directory, 'SourceValidator.cs'), 'utf8');
+			assert.ok(generated.includes('RuleFor(x => x.Name)'));
+			assert.ok(!generated.includes('Hidden') && !generated.includes('WriteOnly'));
+		} finally {
+			csharpLanguageService.getSymbols = originalSymbols;
+			Object.defineProperty(vscode.window, 'showTextDocument', { configurable: true, value: originalShow });
+			await fs.rm(directory, { recursive: true, force: true });
+		}
+	});
 
-			const usingBlock = collectTopLevelUsingBlock(content);
-			assert.ok(usingBlock);
-			assert.strictEqual(isUsingOrderSorted(usingBlock!.directives), true);
-		});
-
-		test('detects usings that are actually unsorted', () => {
-			const content = [
-				'using System;',
-				'using Microsoft.Extensions.DependencyInjection;',
-				'using Books.Application.Behaviors;',
-				'namespace MyApp;',
-			].join('\n');
-
-			const usingBlock = collectTopLevelUsingBlock(content);
-			assert.ok(usingBlock);
-			assert.strictEqual(isUsingOrderSorted(usingBlock!.directives), false);
-		});
-
-		test('same-sorted content matches sortUsingsInContent output (no changes needed)', () => {
-			const content = [
-				'using System.Reflection;',
-				'using Books.Application.Behaviors;',
-				'using FluentValidation;',
-				'using Microsoft.Extensions.DependencyInjection;',
-				'using MitMediator;',
-				'namespace MyApp;',
-			].join('\n');
-
-			assert.strictEqual(sortUsingsInContent(content), undefined);
-		});
+	test('DTOs and extracted types preserve file imports and nested namespace import scopes', () => {
+		const context: TypeFileContext = {
+			usings: ['using External;'],
+			namespaces: [
+				{ name: 'Outer', usings: ['using Payload = External.Payload;'] },
+				{ name: 'Inner', usings: ['using static External.Helpers;'] },
+			],
+		};
+		const dto = buildDtoContent('BookDto', 'Book', [{ name: 'Value', typeName: 'Payload' }], context, '\n');
+		const extracted = buildExtractedFileContent('', 'public class Book { public Payload Value { get; set; } }', 'Outer.Inner', context);
+		for (const content of [dto, extracted]) {
+			assert.ok(content.startsWith('using External;\n'));
+			assert.ok(content.includes('namespace Outer\n{\n    using Payload = External.Payload;'));
+			assert.ok(content.includes('namespace Inner\n    {\n        using static External.Helpers;'));
+			assert.ok(content.includes('public Payload Value'));
+		}
 	});
 
 	suite('compareVersions', () => {
@@ -159,6 +159,73 @@ suite('services', () => {
 			assert.strictEqual(compareVersions('3.1.4', '3.1.4'), 0);
 		});
 	});
+
+		suite('NuGet source configuration', () => {
+			async function withConfigs<T>(configs: ReadonlyMap<string, string>, work: (projectPath: string) => Promise<T>): Promise<T> {
+				const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'painkiller-sources-'));
+				clearNugetCaches();
+				try {
+					await fs.mkdir(path.join(directory, 'App'));
+					for (const [relativePath, content] of configs) {
+						const filePath = path.join(directory, relativePath);
+						await fs.mkdir(path.dirname(filePath), { recursive: true });
+						await fs.writeFile(filePath, content);
+					}
+					return await work(path.join(directory, 'App', 'App.csproj'));
+				} finally {
+					clearNugetCaches();
+					await fs.rm(directory, { recursive: true, force: true });
+				}
+			}
+
+			test('respects clear and does not reintroduce a disabled public source', async () => {
+				await withConfigs(new Map([['App/nuget.config', [
+					'<configuration><packageSources>',
+					'<clear /><add value="https://private.invalid/v3/index.json" key="Private" />',
+					'</packageSources><disabledPackageSources><add key="nuget.org" value="true" /></disabledPackageSources></configuration>',
+				].join('\n')]]), async projectPath => {
+					assert.deepStrictEqual(await getNugetSources(projectPath), [
+						{ name: 'Private', url: 'https://private.invalid/v3/index.json' },
+					]);
+				});
+			});
+
+			test('applies inherited removals, overrides and disabled-source re-enabling', async () => {
+				await withConfigs(new Map([
+					['nuget.config', '<configuration><packageSources><clear /><add key="Legacy" value="https://legacy.invalid" /><add key="Shared" value="https://old.invalid" /></packageSources><disabledPackageSources><add key="Shared" value="true" /></disabledPackageSources></configuration>'],
+					['App/nuget.config', '<configuration><packageSources><remove key="Legacy" /><add key="Shared" value="https://new.invalid" /><add key="Extra" value="https://extra.invalid" /></packageSources><disabledPackageSources><add key="Shared" value="false" /></disabledPackageSources></configuration>'],
+				]), async projectPath => {
+					assert.deepStrictEqual(await getNugetSources(projectPath), [
+						{ name: 'Shared', url: 'https://new.invalid' }, { name: 'Extra', url: 'https://extra.invalid' },
+					]);
+				});
+			});
+
+			test('reports no enabled sources instead of falling back after all sources are disabled', async () => {
+				const originalError = vscode.window.showErrorMessage;
+				let message = '';
+				try {
+					Object.defineProperty(vscode.window, 'showErrorMessage', { configurable: true, value: async (text: string) => { message = text; } });
+					await withConfigs(new Map([['App/nuget.config',
+						'<configuration><disabledPackageSources><add key="nuget.org" value="true" /></disabledPackageSources></configuration>',
+					]]), async projectPath => {
+						assert.deepStrictEqual(await getNugetSources(projectPath), []);
+						assert.strictEqual(await showAddPackagePicker(projectPath), undefined);
+						assert.ok(message.includes('No enabled NuGet sources'));
+					});
+				} finally {
+					Object.defineProperty(vscode.window, 'showErrorMessage', { configurable: true, value: originalError });
+				}
+			});
+
+			test('does not fall back to public sources when a configuration entry is invalid', async () => {
+				await withConfigs(new Map([['App/nuget.config',
+					'<configuration><packageSources><clear /><add key="Private" /></packageSources></configuration>',
+				]]), async projectPath => {
+					await assert.rejects(getNugetSources(projectPath), /value is required/);
+				});
+			});
+		});
 
 	suite('collectPackageVulnerabilities', () => {
 		test('includes vulnerabilities from transitive packages', () => {
@@ -260,6 +327,107 @@ suite('services', () => {
 	});
 
 	suite('central package management migration', () => {
+		test('rejects explicit or conditional project opt-outs before creating any updates', () => {
+			for (const settings of [
+				'<ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally>',
+				'<ManagePackageVersionsCentrally Condition="\'$(TargetFramework)\' == \'net8.0\'">false</ManagePackageVersionsCentrally>',
+			]) {
+				const plan = createMigrationPlan(new Map([
+					['A.csproj', `<Project><PropertyGroup>${settings}</PropertyGroup><PackageReference Include="A" Version="1.0.0" /></Project>`],
+					['B.csproj', '<Project><PackageReference Include="B" Version="2.0.0" /></Project>'],
+				]));
+				assert.strictEqual(plan.projectUpdates.size, 0);
+				assert.ok(plan.conflicts.some(conflict => conflict.includes('A.csproj') && conflict.includes('explicitly disabled')));
+			}
+			const commented = createMigrationPlan(new Map([['A.csproj',
+				'<Project><!-- <ManagePackageVersionsCentrally>false</ManagePackageVersionsCentrally> --><PackageReference Include="A" Version="1.0.0" /></Project>',
+			]]));
+			assert.deepStrictEqual(commented.conflicts, []);
+			assert.strictEqual(commented.projectUpdates.size, 1);
+		});
+
+		test('preserves nested central versions and detects their conflicts', () => {
+			const props = '<Project>\n<ItemGroup>\n<PackageVersion Include="A">\n<Version>1.0.0</Version>\n</PackageVersion>\n</ItemGroup>\n</Project>';
+			const matching = buildDirectoryPackagesProps(props, new Map([['A', '1.0.0']]));
+			assert.strictEqual((matching.content!.match(/<PackageVersion\b/g) ?? []).length, 1);
+			assert.ok(matching.content!.includes('<Version>1.0.0</Version>'));
+			const conflict = createMigrationPlan(new Map([['A.csproj', '<PackageReference Include="A" Version="2.0.0" />']]), props);
+			assert.deepStrictEqual(conflict.conflicts, ['A: 1.0.0 vs 2.0.0']);
+			assert.strictEqual(conflict.projectUpdates.size, 0);
+		});
+
+		test('rejects nested props without changing any migration files or asking to migrate', async () => {
+			const originalFind = vscode.workspace.findFiles;
+			const originalError = vscode.window.showErrorMessage;
+			const originalInfo = vscode.window.showInformationMessage;
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'painkiller-migration-'));
+			const rootProps = vscode.Uri.file(path.join(directory, 'Directory.Packages.props'));
+			const nested = vscode.Uri.file(path.join(directory, 'A', 'Directory.Packages.props'));
+			const project = vscode.Uri.file(path.join(directory, 'A', 'A.csproj'));
+			const propsContent = '<Project />';
+			const projectContent = '<Project><PackageReference Include="A" Version="1.0.0" /></Project>';
+			let confirmations = 0;
+			let message = '';
+			try {
+				await fs.mkdir(path.dirname(project.fsPath));
+				await fs.writeFile(rootProps.fsPath, propsContent);
+				await fs.writeFile(nested.fsPath, propsContent);
+				await fs.writeFile(project.fsPath, projectContent);
+				Object.defineProperty(vscode.workspace, 'findFiles', { configurable: true, value: async (pattern: vscode.RelativePattern) =>
+					pattern.pattern.endsWith('.csproj') ? [project] : [rootProps, nested] });
+				Object.defineProperty(vscode.window, 'showErrorMessage', { configurable: true, value: async (text: string) => { message = text; } });
+				Object.defineProperty(vscode.window, 'showInformationMessage', { configurable: true, value: async () => { confirmations++; return 'Migrate'; } });
+				await migrateSolutionToCentralPackageManagement(vscode.Uri.file(path.join(directory, 'Main.sln')));
+				assert.ok(message.includes('Nested Directory.Packages.props'));
+				assert.ok(message.includes(nested.fsPath));
+				assert.strictEqual(confirmations, 0);
+				assert.strictEqual(await fs.readFile(rootProps.fsPath, 'utf8'), propsContent);
+				assert.strictEqual(await fs.readFile(nested.fsPath, 'utf8'), propsContent);
+				assert.strictEqual(await fs.readFile(project.fsPath, 'utf8'), projectContent);
+			} finally {
+				Object.defineProperty(vscode.workspace, 'findFiles', { configurable: true, value: originalFind });
+				Object.defineProperty(vscode.window, 'showErrorMessage', { configurable: true, value: originalError });
+				Object.defineProperty(vscode.window, 'showInformationMessage', { configurable: true, value: originalInfo });
+				await fs.rm(directory, { recursive: true, force: true });
+			}
+		});
+
+		test('allows a single root props file and migrates the project version', async () => {
+			const originalFind = vscode.workspace.findFiles;
+			const originalInfo = vscode.window.showInformationMessage;
+			const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'painkiller-migration-'));
+			const rootProps = vscode.Uri.file(path.join(directory, 'Directory.Packages.props'));
+			const project = vscode.Uri.file(path.join(directory, 'A', 'A.csproj'));
+			try {
+				await fs.mkdir(path.dirname(project.fsPath));
+				await fs.writeFile(rootProps.fsPath, '<Project><ItemGroup><PackageVersion Include="A" Version="1.0.0" /></ItemGroup></Project>');
+				await fs.writeFile(project.fsPath, '<Project><PackageReference Include="A" Version="1.0.0" /></Project>');
+				Object.defineProperty(vscode.workspace, 'findFiles', { configurable: true, value: async (pattern: vscode.RelativePattern) =>
+					pattern.pattern.endsWith('.csproj') ? [project] : [rootProps] });
+				Object.defineProperty(vscode.window, 'showInformationMessage', { configurable: true, value: async () => 'Migrate' });
+				await migrateSolutionToCentralPackageManagement(vscode.Uri.file(path.join(directory, 'Main.sln')));
+				const props = await fs.readFile(rootProps.fsPath, 'utf8');
+				assert.ok(!(await fs.readFile(project.fsPath, 'utf8')).includes('Version='));
+				assert.strictEqual((props.match(/<PackageVersion\b/g) ?? []).length, 1);
+				assert.ok(props.includes('<ManagePackageVersionsCentrally>true'));
+			} finally {
+				Object.defineProperty(vscode.workspace, 'findFiles', { configurable: true, value: originalFind });
+				Object.defineProperty(vscode.window, 'showInformationMessage', { configurable: true, value: originalInfo });
+				await fs.rm(directory, { recursive: true, force: true });
+			}
+		});
+
+		test('rejects project-dependent version expressions before producing any updates', () => {
+			for (const version of ['$(PackageVersion)', '$([System.String]::Concat(1, 2))', '@(Versions)', '%(Version)']) {
+				const plan = createMigrationPlan(new Map([
+					['A.csproj', `<Project><PackageReference Include="Serilog" Version="${version}" /></Project>`],
+					['B.csproj', '<Project><PackageReference Include="Moq" Version="4.20.0" /></Project>'],
+				]));
+				assert.strictEqual(plan.projectUpdates.size, 0);
+				assert.ok(plan.conflicts.some(conflict => conflict.includes('A.csproj') && conflict.includes('MSBuild expression')));
+			}
+		});
+
 		test('parses attribute and child PackageReference versions', () => {
 			assert.deepStrictEqual(
 				parseVersionedPackageReferences([
@@ -338,6 +506,14 @@ suite('services', () => {
 	});
 
 	suite('central package management when adding packages', () => {
+		test('does not read the next package version for a self-closing unversioned entry', () => {
+			const content = '<PackageVersion Include="A" />\n<PackageVersion Include="B"><Version>2.0.0</Version></PackageVersion>';
+			assert.strictEqual(getCentralPackageVersion(content, 'A'), undefined);
+			assert.strictEqual(getCentralPackageVersion(content, 'B'), '2.0.0');
+			assert.strictEqual(updatePackageVersionInProps(content, 'A', '3.0.0'),
+				'<PackageVersion Include="A" Version="3.0.0" />\n<PackageVersion Include="B"><Version>2.0.0</Version></PackageVersion>');
+		});
+
 		test('reads attribute and nested central versions', () => {
 			const content = [
 				'<Project><ItemGroup>',
@@ -394,6 +570,14 @@ suite('services', () => {
 	});
 
 	suite('updatePackageReferenceVersionInCsproj', () => {
+		test('updates only the selected package when self-closing and paired entries are mixed', () => {
+			const content = '<PackageReference Include="A" Version="1.0.0" />\n<PackageReference Include="B"><Version>2.0.0</Version><PrivateAssets>all</PrivateAssets></PackageReference>';
+			assert.strictEqual(updatePackageReferenceVersionInCsproj(content, 'A', '3.0.0'),
+				content.replace('Version="1.0.0"', 'Version="3.0.0"'));
+			assert.strictEqual(updatePackageReferenceVersionInCsproj(content, 'B', '4.0.0'),
+				content.replace('<Version>2.0.0</Version>', '<Version>4.0.0</Version>'));
+		});
+
 		test('updates nested PackageReference Version elements without adding a conflicting attribute', () => {
 			const content = [
 				'<Project>',
@@ -430,6 +614,62 @@ suite('services', () => {
 			assert.strictEqual(isAutomaticPackageCheckEnabled({ get: () => false }), false);
 		});
 	});
+
+		suite('solution project removal', () => {
+			const folderGuid = 'AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA';
+			const firstGuid = '11111111-1111-1111-1111-111111111111';
+			const secondGuid = '22222222-2222-2222-2222-222222222222';
+			const folderBlock = [
+				`Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{${folderGuid}}"`,
+				'\tProjectSection(SolutionItems) = preProject',
+				'\t\tREADME.md = README.md',
+				'\tEndProjectSection',
+				'EndProject',
+			].join('\r\n');
+			const firstBlock = [
+				`Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "A", "A\\A.csproj", "{${firstGuid}}"`,
+				'\tProjectSection(ProjectDependencies) = postProject',
+				`\t\t{${secondGuid}} = {${secondGuid}}`,
+				'\tEndProjectSection',
+				'EndProject',
+			].join('\r\n');
+			const secondBlock = [
+				`Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "B", "B\\B.csproj", "{${secondGuid}}"`,
+				'EndProject',
+			].join('\r\n');
+			const content = [
+				'Microsoft Visual Studio Solution File, Format Version 12.00', folderBlock, firstBlock, secondBlock,
+				'Global',
+				'\tGlobalSection(ProjectConfigurationPlatforms) = postSolution',
+				`\t\t{${firstGuid}}.Debug|Any CPU.ActiveCfg = Debug|Any CPU`,
+				`\t\t{${secondGuid}}.Debug|Any CPU.ActiveCfg = Debug|Any CPU`,
+				'\tEndGlobalSection',
+				'\tGlobalSection(NestedProjects) = preSolution',
+				`\t\t{${firstGuid}} = {${folderGuid}}`,
+				'\tEndGlobalSection',
+				'EndGlobal', '',
+			].join('\r\n');
+
+			test('removes complete project blocks and their configuration while preserving other projects and CRLF', () => {
+				const updated = removeSlnProject(content, 'A/A.csproj');
+				assert.ok(!updated.includes(firstGuid));
+				assert.ok(!updated.includes('NestedProjects'));
+				assert.ok(updated.includes(folderBlock));
+				assert.ok(updated.includes(secondBlock));
+				assert.ok(updated.includes(`{${secondGuid}}.Debug|Any CPU.ActiveCfg`));
+				assert.ok(!/(?<!\r)\n/.test(updated));
+			});
+
+			test('removes folders with solution items and complete nested project blocks', () => {
+				const updated = removeSlnFolder(content, folderGuid.toLowerCase());
+				assert.ok(!updated.includes(folderGuid));
+				assert.ok(!updated.includes(firstGuid));
+				assert.ok(!updated.includes('SolutionItems'));
+				assert.ok(!updated.includes('ProjectDependencies'));
+				assert.ok(updated.includes(secondBlock));
+				assert.ok(!/(?<!\r)\n/.test(updated));
+			});
+		});
 
 	suite('removeUnusedUsingsFromContent', () => {
 		test('removes unused using directives', () => {
@@ -474,6 +714,66 @@ suite('services', () => {
 	});
 
 	suite('extractPublicMembers', () => {
+		test('extracts only instance members while preserving instance accessor visibility', () => {
+			const members = extractPublicMembers([
+				'public class Service {',
+				'    public static int Count { get; set; }',
+				'    public static string Title => "";',
+				'    public new static void Reset() {}',
+				'    public string Name { get; private set; }',
+				'    public void Save() {}',
+				'}',
+			].join('\n'));
+			assert.ok(members);
+			const generated = generateInterfaceContent(members, 'IService', undefined, '\n');
+			assert.ok(generated.includes('string Name { get; }'));
+			assert.ok(generated.includes('void Save();'));
+			assert.ok(!generated.includes('Count') && !generated.includes('Title') && !generated.includes('Reset'));
+		});
+
+		test('preserves class and method type parameters and constraints', () => {
+			const members = extractPublicMembers([
+				'public class Box<T, U> : BaseBox<T>',
+				'    where T : class, new()',
+				'    where U : System.Collections.Generic.IEnumerable<T>',
+				'{',
+				'    public T Value { get; set; }',
+				'    public U Items { get; init; }',
+				'    public TResult Convert<TResult>(T value) where TResult : class, new() => new TResult();',
+				'}',
+			].join('\n'));
+			assert.ok(members);
+			const generated = generateInterfaceContent(members, 'IBox', 'Example', '\r\n');
+			assert.ok(generated.includes('public interface IBox<T, U>\r\n'));
+			assert.ok(generated.includes('where T : class, new() where U : System.Collections.Generic.IEnumerable<T>'));
+			assert.ok(generated.includes('T Value { get; set; }'));
+			assert.ok(generated.includes('U Items { get; init; }'));
+			assert.ok(generated.includes('TResult Convert<TResult>(T value) where TResult : class, new();'));
+			assert.ok(!generated.includes('BaseBox'));
+		});
+
+		test('preserves only public accessors, including init and write-only properties', () => {
+			const members = extractPublicMembers([
+				'public class Book',
+				'{',
+				'    public string Name {get;private set;}',
+				'    public int Age { get; init; }',
+				'    public string Secret { private get; set; }',
+				'    public int Size => 42;',
+				'    public int Count { get { return 0; } set { Store(value); } }',
+				'    public async void Notify() { }',
+				'}',
+			].join('\n'));
+			assert.ok(members);
+			const result = generateInterfaceContent(members, 'IBook', 'MyApp', '\n');
+			assert.ok(result.includes('string Name { get; }'));
+			assert.ok(result.includes('int Age { get; init; }'));
+			assert.ok(result.includes('string Secret { set; }'));
+			assert.ok(result.includes('int Size { get; }'));
+			assert.ok(result.includes('int Count { get; set; }'));
+			assert.ok(result.includes('void Notify();'));
+		});
+
 		test('extracts public properties and methods', () => {
 			const content = [
 				'namespace MyApp;',
@@ -724,6 +1024,30 @@ suite('services', () => {
 	});
 
 	suite('generateFluentValidatorContent', () => {
+		test('validates collections separately from their elements and permits nullable collections', () => {
+			const content = generateFluentValidatorContent('Book', [
+				{ name: 'Items', type: 'List<string>', isNullable: false },
+				{ name: 'OptionalItems', type: 'string[]', isNullable: true },
+			], 'Example', '\n', new Set());
+			assert.ok(content.includes('RuleFor(x => x.Items)\n            .NotNull()\n            .NotEmpty();'));
+			assert.ok(content.includes('RuleFor(x => x.OptionalItems)\n            .NotEmpty().When(x => x.OptionalItems != null);'));
+			assert.ok(content.includes('RuleForEach(x => x.Items)\n            .ChildRules'));
+			assert.ok(!content.includes('RuleForEach(x => x.Items)\n            .Not'));
+		});
+
+		test('omits nullable properties with no inferred validation rule', () => {
+			const content = generateFluentValidatorContent('Book', [
+				{ name: 'Date', type: 'DateTime', isNullable: true },
+				{ name: 'Id', type: 'Guid', isNullable: true },
+				{ name: 'Author', type: 'Author', isNullable: true },
+				{ name: 'Title', type: 'string', isNullable: true },
+			], 'MyApp', '\n', new Set());
+			assert.ok(!content.includes('RuleFor(x => x.Date)'));
+			assert.ok(!content.includes('RuleFor(x => x.Id)'));
+			assert.ok(!content.includes('RuleFor(x => x.Author)'));
+			assert.ok(content.includes('RuleFor(x => x.Title)\n            .MaximumLength(256);'));
+		});
+
 		test('generates validator with string rules', () => {
 			const content = generateFluentValidatorContent(
 				'Book',

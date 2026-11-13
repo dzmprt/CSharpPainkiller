@@ -1,51 +1,37 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { extractFileNamespace } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
 import { coerceTypeName } from '../utils/sharedUtilities.js';
+import { buildTypeFileContent, type TypeFileContext } from '../utils/usingBlock.js';
+import { parseGenericDeclaration, type GenericDeclaration } from '../utils/contentParser.js';
 import {
 	buildDtoMapFromMethod,
-	detectPrimaryTypeName,
-	parseTypeFields,
+	buildMappingProperties,
+	parseDocumentTypeFields,
 	type FieldInfo,
 } from './generateMapTo.js';
 
-function buildDtoProperties(fields: FieldInfo[], eol: string): string {
-	const i1 = '    ';
-	return fields
-		.filter(f => f.canRead !== false)
-		.map(f => `${i1}public ${f.typeName} ${f.name} { get; init; }`)
-		.join(eol);
-}
-
-function buildDtoContent(
+export function buildDtoContent(
 	dtoTypeName: string,
 	sourceTypeName: string,
-	namespace: string | undefined,
-	sourceNamespace: string | undefined,
 	fields: FieldInfo[],
-	eol: string
+	context: TypeFileContext,
+	eol: string,
+	generics: GenericDeclaration = {}
 ): string {
 	const lines: string[] = [];
 
-	if (sourceNamespace && sourceNamespace !== namespace) {
-		lines.push(`using ${sourceNamespace};`);
-	}
-
-	if (namespace) {
-		lines.push(`namespace ${namespace};`);
-		lines.push('');
-	}
-
-	lines.push(`public class ${dtoTypeName}`);
+	lines.push(`public class ${dtoTypeName}${generics.typeParameters ?? ''}`);
+	if (generics.constraints) { lines.push(`    ${generics.constraints}`); }
 	lines.push('{');
-	lines.push(buildDtoProperties(fields, eol));
+	lines.push(buildMappingProperties(fields, eol));
 	if (fields.length > 0) {
 		lines.push('');
 	}
-	lines.push(buildDtoMapFromMethod(dtoTypeName, sourceTypeName, fields, fields, eol));
+	lines.push(buildDtoMapFromMethod(dtoTypeName, `${sourceTypeName}${generics.typeParameters ?? ''}`, fields, fields, eol));
 	lines.push('}');
 
-	return lines.join(eol);
+	return buildTypeFileContent(lines.join(eol), context, eol);
 }
 
 /**
@@ -58,7 +44,7 @@ export async function generateDtoForDocument(
 ): Promise<void> {
 	const content = document.getText();
 	const eol = content.includes('\r\n') ? '\r\n' : '\n';
-	const resolvedSource = coerceTypeName(sourceTypeName) ?? detectPrimaryTypeName(content);
+	const resolvedSource = coerceTypeName(sourceTypeName) ?? (await csharpLanguageService.getPrimaryType(document))?.name;
 
 	if (!resolvedSource) {
 		vscode.window.showErrorMessage('CSharp Painkiller: Cannot find a class, struct, or record in the current file.');
@@ -89,7 +75,7 @@ export async function generateDtoForDocument(
 		// File doesn't exist — proceed
 	}
 
-	const sourceFields = parseTypeFields(content, resolvedSource);
+	const sourceFields = await parseDocumentTypeFields(document, resolvedSource);
 	if (sourceFields.length === 0) {
 		vscode.window.showWarningMessage(
 			`CSharp Painkiller: No mappable public properties found on ${resolvedSource}.`
@@ -97,17 +83,18 @@ export async function generateDtoForDocument(
 		return;
 	}
 
-	const namespace = extractFileNamespace(content);
+	const type = (await csharpLanguageService.getTypes(document)).find(type => type.name === resolvedSource);
+	if (!type) { throw new Error(`Cannot resolve source type "${resolvedSource}".`); }
 	const dtoContent = buildDtoContent(
 		trimmedDtoName,
 		resolvedSource,
-		namespace,
-		namespace,
 		sourceFields,
-		eol
+		await csharpLanguageService.getTypeFileContext(document, type),
+		eol,
+		parseGenericDeclaration(csharpLanguageService.getHeader(document, type), type.name)
 	);
 
-	await vscode.workspace.fs.writeFile(outUri, Buffer.from(dtoContent + eol, 'utf-8'));
+	await vscode.workspace.fs.writeFile(outUri, Buffer.from(dtoContent, 'utf-8'));
 	const doc = await vscode.workspace.openTextDocument(outUri);
 	await vscode.window.showTextDocument(doc, { preview: false });
 
@@ -120,15 +107,6 @@ export async function generateDtoForDocument(
  * Triggered from the Explorer context menu on a .cs file.
  */
 export async function generateDtoForFile(fileUri: vscode.Uri): Promise<void> {
-	let content: string;
-	try {
-		const buf = await vscode.workspace.fs.readFile(fileUri);
-		content = Buffer.from(buf).toString('utf-8');
-	} catch {
-		vscode.window.showErrorMessage('CSharp Painkiller: Cannot read the selected file.');
-		return;
-	}
-
 	const doc = await vscode.workspace.openTextDocument(fileUri);
-	await generateDtoForDocument(doc, detectPrimaryTypeName(content));
+	await generateDtoForDocument(doc);
 }

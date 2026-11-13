@@ -1,6 +1,9 @@
 import * as vscode from 'vscode';
 import * as pathModule from 'path';
-import { execFile } from 'child_process';
+import { AsyncCache, WorkQueue, waitWithCancellation, throwIfCancelled } from '../utils/asyncWork.js';
+import { runDotnet } from '../utils/dotnetCli.js';
+import { CsprojCache } from '../utils/csprojCache.js';
+import { ErrorHandler } from '../utils/errorHandler.js';
 
 // ============================================================================
 // Types
@@ -81,13 +84,36 @@ class AuthRequiredError extends Error {
 // Service index cache
 // ============================================================================
 
-const serviceIndexCache = new Map<string, ServiceResource[]>();
+const serviceIndexCache = new AsyncCache<string, ServiceResource[]>(100, 5 * 60_000);
+const versionsCache = new AsyncCache<string, string[]>(1000, 5 * 60_000);
+const nuspecCache = new AsyncCache<string, PackageDependencyInfo[] | undefined>(2000, 5 * 60_000);
+const sourcesCache = new AsyncCache<string, NugetSource[]>(200, 30_000);
+const packageListCache = new AsyncCache<string, DotnetPackageListJson>(200, 30_000);
+const assetsCache = new AsyncCache<string, ProjectAssets | undefined>(200, 30_000);
+const httpQueue = new WorkQueue(4);
+
+export function clearNugetCaches(): void {
+	serviceIndexCache.clear();
+	versionsCache.clear();
+	nuspecCache.clear();
+	sourcesCache.clear();
+	packageListCache.clear();
+	assetsCache.clear();
+}
+
+export function registerNugetCache(context: Pick<vscode.ExtensionContext, 'subscriptions'>): void {
+	const watcher = vscode.workspace.createFileSystemWatcher('**/{nuget.config,NuGet.Config,Nuget.Config,Directory.Packages.props,project.assets.json}');
+	context.subscriptions.push(watcher,
+		watcher.onDidCreate(clearNugetCaches), watcher.onDidChange(clearNugetCaches), watcher.onDidDelete(clearNugetCaches),
+		CsprojCache.getInstance().onDidChange(clearNugetCaches), { dispose: clearNugetCaches });
+}
 
 // ============================================================================
 // API helpers
 // ============================================================================
 
 async function fetchJson<T>(url: string): Promise<T> {
+	return httpQueue.run(async () => {
 	const response = await fetch(url, {
 		headers: { Accept: 'application/json' },
 		signal: AbortSignal.timeout(15_000),
@@ -99,17 +125,15 @@ async function fetchJson<T>(url: string): Promise<T> {
 		throw new Error(`HTTP ${response.status} fetching ${url}`);
 	}
 	return response.json() as Promise<T>;
+	});
 }
 
 async function getServiceResources(sourceUrl: string): Promise<ServiceResource[]> {
-	const cached = serviceIndexCache.get(sourceUrl);
-	if (cached) {
-		return cached;
-	}
+	return serviceIndexCache.get(sourceUrl, async () => {
 	const index = await fetchJson<{ resources: ServiceResource[] }>(sourceUrl);
 	const resources = index.resources ?? [];
-	serviceIndexCache.set(sourceUrl, resources);
 	return resources;
+	});
 }
 
 async function getResourceUrl(sourceUrl: string, ...preferredTypes: string[]): Promise<string | undefined> {
@@ -165,8 +189,10 @@ async function getPackageVersions(
 		return [];
 	}
 	const url = `${baseUrl.replace(/\/$/, '')}/${packageId.toLowerCase()}/index.json`;
-	const result = await fetchJson<{ versions: string[] }>(url);
-	const all = [...(result.versions ?? [])].reverse();
+	const versions = await versionsCache.get(url, async () =>
+		(await fetchJson<{ versions: string[] }>(url)).versions ?? []
+	);
+	const all = [...versions].reverse();
 	return preRelease ? all : all.filter(v => !v.includes('-'));
 }
 
@@ -226,22 +252,28 @@ export async function getLatestPackageVersion(
 	csprojFsPath: string,
 	packageId: string,
 	preRelease = false,
+	token?: vscode.CancellationToken,
+	checkProject = true,
 ): Promise<string | undefined> {
-	if (!preRelease) {
+	throwIfCancelled(token);
+	if (!preRelease && checkProject) {
 		try {
-			const update = (await getProjectPackageUpdates(csprojFsPath)).get(packageId.toLowerCase());
+			const update = (await getProjectPackageUpdates(csprojFsPath, token)).get(packageId.toLowerCase());
 			if (update?.latestVersion) {
 				return update.latestVersion;
 			}
-		} catch {
+		} catch (error) {
+			throwIfCancelled(token);
+			ErrorHandler.logWarn('NuGet updates', 'Project listing failed; trying configured sources', error);
 			// Fall back to direct source probing below for older SDKs or unsupported output.
 		}
 	}
 
-	const sources = await getNugetSources(csprojFsPath);
+	const sources = await waitWithCancellation(getNugetSources(csprojFsPath), token);
+	if (sources.length === 0) { throw new Error('No enabled NuGet sources are configured. Check nuget.config.'); }
 
 	let anySourceReachable = false;
-	const candidates = await Promise.all(
+	const candidates = await waitWithCancellation(Promise.all(
 		sources.map(async source => {
 			try {
 				const versions = await getPackageVersions(source.url, packageId, preRelease);
@@ -251,7 +283,7 @@ export async function getLatestPackageVersion(
 				return undefined;
 			}
 		}),
-	);
+	), token);
 
 	if (!anySourceReachable) {
 		throw new Error(`Could not reach any configured NuGet source to check "${packageId}" for updates.`);
@@ -272,8 +304,9 @@ export async function getLatestPackageVersion(
  * credentials, source mappings, and non-nuget.org feeds better than direct HTTP
  * probing can.
  */
-export async function getProjectPackageUpdates(csprojFsPath: string): Promise<Map<string, PackageUpdateInfo>> {
-	const parsed = await runDotnetPackageList(csprojFsPath, '--outdated');
+export async function getProjectPackageUpdates(csprojFsPath: string, token?: vscode.CancellationToken): Promise<Map<string, PackageUpdateInfo>> {
+	throwIfCancelled(token);
+	const parsed = await waitWithCancellation(runDotnetPackageList(csprojFsPath, '--outdated'), token);
 	const updates = new Map<string, PackageUpdateInfo>();
 
 	for (const project of parsed.projects ?? []) {
@@ -300,8 +333,9 @@ export async function getProjectPackageUpdates(csprojFsPath: string): Promise<Ma
 	return updates;
 }
 
-export async function getProjectPackages(csprojFsPath: string): Promise<Map<string, PackageInfo>> {
-	const parsed = await runDotnetPackageList(csprojFsPath, '--include-transitive');
+export async function getProjectPackages(csprojFsPath: string, token?: vscode.CancellationToken): Promise<Map<string, PackageInfo>> {
+	throwIfCancelled(token);
+	const parsed = await waitWithCancellation(runDotnetPackageList(csprojFsPath, '--include-transitive'), token);
 	return collectProjectPackages(parsed);
 }
 
@@ -331,8 +365,9 @@ export function collectProjectPackages(parsed: DotnetPackageListJson): Map<strin
 	return packages;
 }
 
-export async function getProjectPackageVulnerabilities(csprojFsPath: string): Promise<PackageVulnerabilityInfo[]> {
-	const parsed = await runDotnetPackageList(csprojFsPath, '--vulnerable', '--include-transitive');
+export async function getProjectPackageVulnerabilities(csprojFsPath: string, token?: vscode.CancellationToken): Promise<PackageVulnerabilityInfo[]> {
+	throwIfCancelled(token);
+	const parsed = await waitWithCancellation(runDotnetPackageList(csprojFsPath, '--vulnerable', '--include-transitive'), token);
 	return collectPackageVulnerabilities(parsed);
 }
 
@@ -369,34 +404,12 @@ export function collectPackageVulnerabilities(parsed: DotnetPackageListJson): Pa
 }
 
 function runDotnetPackageList(csprojFsPath: string, ...extraArgs: string[]): Promise<DotnetPackageListJson> {
-	return new Promise((resolve, reject) => {
-		execFile(
-			'dotnet',
-			['list', csprojFsPath, 'package', ...extraArgs, '--format', 'json'],
-			{
-				cwd: pathModule.dirname(csprojFsPath),
-				encoding: 'utf8',
-				maxBuffer: 1024 * 1024 * 10,
-			},
-			(error, stdout, stderr) => {
-				if (error) {
-					reject(new Error((stderr || stdout || error.message || 'dotnet list package failed').trim()));
-					return;
-				}
-
-				const jsonStart = stdout.indexOf('{');
-				if (jsonStart < 0) {
-					reject(new Error('dotnet list package did not return JSON output.'));
-					return;
-				}
-
-				try {
-					resolve(JSON.parse(stdout.slice(jsonStart)) as DotnetPackageListJson);
-				} catch (parseError) {
-					reject(parseError);
-				}
-			},
-		);
+	return packageListCache.get(JSON.stringify([csprojFsPath, ...extraArgs]), async () => {
+		const { stdout } = await runDotnet(['list', csprojFsPath, 'package', ...extraArgs, '--format', 'json'],
+			pathModule.dirname(csprojFsPath));
+		const jsonStart = stdout.indexOf('{');
+		if (jsonStart < 0) { throw new Error('dotnet list package did not return JSON output.'); }
+		return JSON.parse(stdout.slice(jsonStart)) as DotnetPackageListJson;
 	});
 }
 
@@ -412,6 +425,70 @@ export interface PackageDependencyInfo {
 	dependencies?: PackageDependencyInfo[];
 }
 
+export interface ProjectAssets {
+	targets?: Record<string, Record<string, { type?: string; dependencies?: Record<string, string> }>>;
+}
+
+export function getDependenciesFromAssets(
+	assets: ProjectAssets, packageId: string, version: string,
+): PackageDependencyInfo[] | undefined {
+	let found = false;
+	const merged = new Map<string, PackageDependencyInfo>();
+	const merge = (previous: PackageDependencyInfo[], current: PackageDependencyInfo[]): PackageDependencyInfo[] => {
+		const entries = new Map(previous.map(dependency => [`${dependency.id.toLowerCase()}/${dependency.version}`, dependency]));
+		for (const dependency of current) {
+			const key = `${dependency.id.toLowerCase()}/${dependency.version}`;
+			const old = entries.get(key);
+			if (old?.dependencies && dependency.dependencies) {
+				dependency.dependencies = merge(old.dependencies, dependency.dependencies);
+			} else if (old?.dependencies) {
+				dependency.dependencies = old.dependencies;
+			}
+			entries.set(key, dependency);
+		}
+		return [...entries.values()];
+	};
+	for (const target of Object.values(assets.targets ?? {})) {
+		const root = Object.keys(target).find(key => key.toLowerCase() === `${packageId}/${version}`.toLowerCase());
+		if (!root) { continue; }
+		found = true;
+		const entries = new Map(Object.entries(target).map(([key, value]) => {
+			const separator = key.lastIndexOf('/');
+			return [key.slice(0, separator).toLowerCase(), { id: key.slice(0, separator), version: key.slice(separator + 1), value }];
+		}));
+		const visit = (key: string, ancestors: ReadonlySet<string>): PackageDependencyInfo[] =>
+			Object.entries(target[key].dependencies ?? {}).map(([id, requestedVersion]) => {
+				const resolved = entries.get(id.toLowerCase());
+				const dependency: PackageDependencyInfo = { id, version: resolved?.version ?? requestedVersion };
+				if (resolved && !ancestors.has(id.toLowerCase())) {
+					const children = visit(`${resolved.id}/${resolved.version}`, new Set([...ancestors, id.toLowerCase()]));
+					if (children.length > 0) { dependency.dependencies = children; }
+				}
+				return dependency;
+			});
+		for (const dependency of visit(root, new Set([packageId.toLowerCase()]))) {
+			// Keep distinct resolved versions when a multi-targeted project resolves differently.
+			const key = `${dependency.id.toLowerCase()}/${dependency.version}`;
+			const old = merged.get(key);
+			merged.set(key, merge(old ? [old] : [], [dependency])[0]);
+		}
+	}
+	return found ? [...merged.values()] : undefined;
+}
+
+async function readProjectAssets(csprojFsPath: string): Promise<ProjectAssets | undefined> {
+	const uri = vscode.Uri.file(pathModule.join(pathModule.dirname(csprojFsPath), 'obj', 'project.assets.json'));
+	return assetsCache.get(uri.toString(), async () => {
+		try {
+			return JSON.parse(Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8')) as ProjectAssets;
+		} catch (error) {
+			if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') { return undefined; }
+			ErrorHandler.logWarn('NuGet dependencies', 'Could not read project.assets.json; trying package metadata', error);
+			throw error;
+		}
+	});
+}
+
 /**
  * Finds the dependencies declared by a specific installed package version, by reading
  * its `.nuspec` from the "package content" (flat container) resource. Tries each
@@ -424,10 +501,22 @@ export async function getPackageDependencies(
 	packageId: string,
 	version: string,
 	resolvedPackages?: ReadonlyMap<string, PackageInfo>,
+	token?: vscode.CancellationToken,
 ): Promise<PackageDependencyInfo[]> {
-	const sources = await getNugetSources(csprojFsPath);
-	const packageVersions = resolvedPackages ?? await getProjectPackages(csprojFsPath).catch(() => new Map<string, PackageInfo>());
-	return getPackageDependenciesRecursive(sources, packageVersions, packageId, version, new Set([packageId.toLowerCase()]));
+	throwIfCancelled(token);
+	const assets = await waitWithCancellation(readProjectAssets(csprojFsPath).catch(() => undefined), token);
+	if (assets) {
+		const local = getDependenciesFromAssets(assets, packageId, version);
+		if (local !== undefined) { return local; }
+	}
+	const sources = await waitWithCancellation(getNugetSources(csprojFsPath), token);
+	const packageVersions = resolvedPackages ?? await getProjectPackages(csprojFsPath, token).catch(error => {
+		throwIfCancelled(token);
+		ErrorHandler.logWarn('NuGet dependencies', 'Could not resolve installed package versions', error);
+		return new Map<string, PackageInfo>();
+	});
+	return waitWithCancellation(getPackageDependenciesRecursive(sources, packageVersions, packageId, version,
+		new Set([packageId.toLowerCase()]), token), token);
 }
 
 async function getPackageDependenciesRecursive(
@@ -436,7 +525,9 @@ async function getPackageDependenciesRecursive(
 	packageId: string,
 	version: string,
 	visited: ReadonlySet<string>,
+	token?: vscode.CancellationToken,
 ): Promise<PackageDependencyInfo[]> {
+	throwIfCancelled(token);
 	const dependencies = await getDirectPackageDependencies(sources, packageId, version);
 	return Promise.all(dependencies.map(async dependency => {
 		const key = dependency.id.toLowerCase();
@@ -455,7 +546,8 @@ async function getPackageDependenciesRecursive(
 			dependency.id,
 			resolvedVersion,
 			new Set([...visited, key]),
-		).catch(() => []);
+			token,
+		);
 
 		return childDependencies.length > 0
 			? { ...dependency, dependencies: childDependencies }
@@ -468,15 +560,20 @@ async function getDirectPackageDependencies(
 	packageId: string,
 	version: string,
 ): Promise<PackageDependencyInfo[]> {
+	let failures = 0;
 	for (const source of sources) {
 		try {
 			const dependencies = await fetchNuspecDependencies(source.url, packageId, version);
-			if (dependencies.length > 0) {
+			if (dependencies !== undefined) {
 				return dependencies;
 			}
-		} catch {
-			// Try the next source.
+		} catch (error) {
+			failures++;
+			ErrorHandler.logWarn('NuGet dependencies', `Could not read ${packageId} metadata from ${source.name}`, error);
 		}
+	}
+	if (sources.length > 0 && failures === sources.length) {
+		throw new Error(`Could not reach any configured source to load dependencies for "${packageId}".`);
 	}
 	return [];
 }
@@ -485,21 +582,22 @@ async function fetchNuspecDependencies(
 	sourceUrl: string,
 	packageId: string,
 	version: string,
-): Promise<PackageDependencyInfo[]> {
+): Promise<PackageDependencyInfo[] | undefined> {
 	const baseUrl = await getResourceUrl(sourceUrl, 'PackageBaseAddress/3.0.0', 'PackageBaseAddress');
 	if (!baseUrl) {
-		return [];
+		return undefined;
 	}
 	const lowerId = packageId.toLowerCase();
 	const lowerVersion = version.toLowerCase();
 	const url = `${baseUrl.replace(/\/$/, '')}/${lowerId}/${lowerVersion}/${lowerId}.nuspec`;
 
-	const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
-	if (!response.ok) {
-		return []; // Missing nuspec / auth issues / etc. — best-effort, not fatal.
-	}
-	const xml = await response.text();
-	return parseNuspecDependencies(xml);
+	const dependencies = await nuspecCache.get(url, () => httpQueue.run(async () => {
+		const response = await fetch(url, { signal: AbortSignal.timeout(15_000) });
+		if (response.status === 404) { return undefined; }
+		if (!response.ok) { throw new Error(`HTTP ${response.status} fetching ${url}`); }
+		return parseNuspecDependencies(await response.text());
+	}));
+	return dependencies;
 }
 
 /**
@@ -532,38 +630,38 @@ function parseNuspecDependencies(xml: string): PackageDependencyInfo[] {
 // nuget.config parsing
 // ============================================================================
 
-function parseNugetConfig(content: string): { sources: NugetSource[]; disabled: Set<string> } {
-	const sources: NugetSource[] = [];
-	const disabled = new Set<string>();
+type NugetConfigEntry = { action: 'clear' } | { action: 'remove'; key: string } | { action: 'add'; key: string; value: string };
 
-	const sourcesBlock = content.match(/<packageSources>([\s\S]*?)<\/packageSources>/i)?.[1] ?? '';
-	const addRegex = /<add\b[^>]*\bkey="([^"]+)"[^>]*\bvalue="([^"]+)"[^>]*\/?>/gi;
-	let m: RegExpExecArray | null;
-	while ((m = addRegex.exec(sourcesBlock)) !== null) {
-		sources.push({ name: m[1], url: m[2] });
+function parseNugetConfigSection(content: string, section: string): NugetConfigEntry[] {
+	const masked = content.replace(/<!--[\s\S]*?-->/g, '');
+	const body = masked.match(new RegExp(`<${section}\\b[^>]*>([\\s\\S]*?)<\\/${section}>`, 'i'))?.[1] ?? '';
+	const entries: NugetConfigEntry[] = [];
+	for (const match of body.matchAll(/<(add|remove|clear)\b([^>]*?)\/?>/gi)) {
+		const action = match[1].toLowerCase();
+		if (action === 'clear') { entries.push({ action }); continue; }
+		const attributes = new Map<string, string>();
+		for (const attribute of match[2].matchAll(/(\w+)\s*=\s*(["'])(.*?)\2/g)) {
+			attributes.set(attribute[1], attribute[3]
+				.replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+		}
+		const key = attributes.get('key');
+		if (!key) { throw new Error(`Invalid ${section} entry: key is required.`); }
+		if (action === 'remove') { entries.push({ action, key }); continue; }
+		const value = attributes.get('value');
+		if (value === undefined) { throw new Error(`Invalid ${section} entry "${key}": value is required.`); }
+		entries.push({ action: 'add', key, value });
 	}
-
-	const disabledBlock = content.match(/<disabledPackageSources>([\s\S]*?)<\/disabledPackageSources>/i)?.[1] ?? '';
-	const disabledRegex = /<add\b[^>]*\bkey="([^"]+)"[^>]*\bvalue="true"[^>]*\/?>/gi;
-	while ((m = disabledRegex.exec(disabledBlock)) !== null) {
-		disabled.add(m[1]);
-	}
-
-	return { sources, disabled };
+	return entries;
 }
 
 const NUGET_ORG_DEFAULT: NugetSource = { name: 'nuget.org', url: 'https://api.nuget.org/v3/index.json' };
 
 export async function getNugetSources(csprojFsPath: string): Promise<NugetSource[]> {
-	const sources: NugetSource[] = [];
-	const seenUrls = new Set<string>();
+	return sourcesCache.get(pathModule.dirname(csprojFsPath), () => discoverNugetSources(csprojFsPath));
+}
 
-	const addSource = (s: NugetSource) => {
-		if (!seenUrls.has(s.url.toLowerCase())) {
-			seenUrls.add(s.url.toLowerCase());
-			sources.push(s);
-		}
-	};
+async function discoverNugetSources(csprojFsPath: string): Promise<NugetSource[]> {
+	const configs: string[] = [];
 
 	// Walk up from the project directory to find nuget.config files
 	let dir = pathModule.dirname(csprojFsPath);
@@ -575,15 +673,10 @@ export async function getNugetSources(csprojFsPath: string): Promise<NugetSource
 				const uri = vscode.Uri.file(pathModule.join(dir, name));
 				const bytes = await vscode.workspace.fs.readFile(uri);
 				const content = Buffer.from(bytes).toString('utf-8');
-				const { sources: fileSources, disabled } = parseNugetConfig(content);
-				for (const s of fileSources) {
-					if (!disabled.has(s.name)) {
-						addSource(s);
-					}
-				}
+				configs.push(content);
 				break;
-			} catch {
-				// not found, continue
+			} catch (error) {
+				if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') { throw error; }
 			}
 		}
 		const parent = pathModule.dirname(dir);
@@ -593,12 +686,24 @@ export async function getNugetSources(csprojFsPath: string): Promise<NugetSource
 		dir = parent;
 	}
 
-	// Always include nuget.org if not already present via config
-	if (!sources.some(s => s.url.toLowerCase().includes('nuget.org'))) {
-		sources.unshift(NUGET_ORG_DEFAULT);
+	const sources = new Map<string, NugetSource>([[NUGET_ORG_DEFAULT.name, NUGET_ORG_DEFAULT]]);
+	const disabled = new Map<string, boolean>();
+	for (const config of configs.reverse()) {
+		for (const entry of parseNugetConfigSection(config, 'packageSources')) {
+			if (entry.action === 'clear') { sources.clear(); }
+			else if (entry.action === 'remove') { sources.delete(entry.key.toLowerCase()); }
+			else { sources.set(entry.key.toLowerCase(), { name: entry.key, url: entry.value }); }
+		}
+		for (const entry of parseNugetConfigSection(config, 'disabledPackageSources')) {
+			if (entry.action === 'clear') { disabled.clear(); }
+			else if (entry.action === 'remove') { disabled.delete(entry.key.toLowerCase()); }
+			else {
+				if (!/^(true|false)$/i.test(entry.value)) { throw new Error(`Invalid disabledPackageSources value for "${entry.key}".`); }
+				disabled.set(entry.key.toLowerCase(), entry.value.toLowerCase() === 'true');
+			}
+		}
 	}
-
-	return sources.length > 0 ? sources : [NUGET_ORG_DEFAULT];
+	return [...sources].filter(([name]) => !disabled.get(name)).map(([, source]) => source);
 }
 
 // ============================================================================
@@ -658,6 +763,10 @@ export async function showAddPackagePicker(
 	csprojFsPath: string,
 ): Promise<{ id: string; version: string } | undefined> {
 	const sources = await getNugetSources(csprojFsPath);
+	if (sources.length === 0) {
+		vscode.window.showErrorMessage('CSharp Painkiller: No enabled NuGet sources are configured. Check nuget.config.');
+		return undefined;
+	}
 	const centralPackageVersions = await getCentralPackageVersions(csprojFsPath);
 
 	let selectedSource: NugetSource;

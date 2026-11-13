@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { type CsprojInfo } from '../types.js';
 import { findProjectRootForPath, findProjectDirectory } from '../utils/fileUtils.js';
 import { sanitizeNamespaceSegment, normalizePath } from '../utils/contentParser.js';
+import { CsprojCache } from '../utils/csprojCache.js';
 
 // ============================================================================
 // Core namespace computation (shared by all paths)
@@ -47,7 +48,12 @@ export function computeNamespaceForFile(
 		}
 	}
 
-	return buildNamespaceFromPath(projectRootPath, relativePath);
+	const roots = new Set(csprojs?.filter(project => project.dirPath === projectRootPath)
+		.map(project => project.rootNamespace).filter(namespace => namespace !== undefined));
+	if (roots.size > 1) {
+		throw new Error(`Projects in "${projectRootPath}" have different RootNamespace values; the file namespace is ambiguous.`);
+	}
+	return buildNamespaceFromPath(projectRootPath, relativePath, [...roots][0]);
 }
 
 /**
@@ -81,7 +87,14 @@ export async function deriveNamespaceFromFolder(folderUri: vscode.Uri): Promise<
 		return sanitizeNamespaceSegment(folderName.replace(/\./g, '.'));
 	}
 
-	return buildNamespaceFromPath(projDirPath, relativePath);
+	const cache = CsprojCache.getInstance();
+	const projects = (await cache.getCsprojs()).filter(project => project.dirPath === projDirPath);
+	const roots = new Set(await Promise.all(projects.map(project =>
+		project.projectUri ? cache.getRootNamespace(project.projectUri) : Promise.resolve(project.rootNamespace))));
+	if (roots.size > 1) {
+		throw new Error(`Projects in "${projDirPath}" have different RootNamespace values; the file namespace is ambiguous.`);
+	}
+	return buildNamespaceFromPath(projDirPath, relativePath, [...roots][0]);
 }
 
 /**
@@ -130,11 +143,11 @@ function fallbackNamespace(targetFolderPath: string, workspaceName: string): str
 
 /**
  * Builds a namespace string from a project root path and a relative sub-path.
- * The project root's deepest segment becomes the root namespace segment.
+ * Uses the evaluated project namespace when available.
  */
-function buildNamespaceFromPath(projectRootPath: string, relativePath: string): string {
+function buildNamespaceFromPath(projectRootPath: string, relativePath: string, rootNamespace?: string): string {
 	const rootSegments = projectRootPath.split('/').filter(Boolean);
-	const baseNamespace = sanitizeNamespaceSegment(
+	const baseNamespace = rootNamespace ?? sanitizeNamespaceSegment(
 		(rootSegments.pop() ?? 'MyNamespace').replace(/\./g, '.')
 	);
 

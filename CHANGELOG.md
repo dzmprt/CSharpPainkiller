@@ -4,6 +4,51 @@ All notable changes to the "csharppainkiller" extension will be documented in th
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.0.13]
+
+### Added
+
+- **Blazor and MAUI project icons** - show distinct icons for Blazor WebAssembly and MAUI projects, including MAUI Blazor Hybrid.
+
+### Fixed
+
+- Refresh project reference lists and dependency caches immediately after adding or removing references, including drag-and-drop and open project files.
+- Insert new namespace imports before file-scoped declarations or after existing file-level usings, and preserve spacing and trailing comments when replacing namespace declarations.
+- Reopen unchanged documents evicted by VS Code during large namespace adjustments, preserving atomic edits and rejecting files changed on disk.
+- Refresh project discovery immediately after physical project or solution folder deletion, and reject missing project files before adding them to a solution.
+- Update only the selected NuGet package when self-closing and paired XML entries are mixed, and correctly read nested central package versions.
+- Remove complete solution project and folder blocks, including their sections and GUID references; prevent physical deletion when project removal fails, and preserve workspace roots and folders containing other projects or solutions.
+- Reject nested `Directory.Packages.props` files and project-level central package management opt-outs before migration changes any files.
+- Preserve generic type and method parameters and constraints in extracted interfaces.
+- Exclude static members from mappings, DTOs and extracted interfaces, and validate whole collections separately from their elements.
+- Respect inherited NuGet source overrides, clearing, removal and disabled-source settings without reintroducing explicitly excluded public sources.
+- Prevent physical project moves from relocating other projects in shared or nested folders.
+- Reject context-dependent MSBuild package version expressions before central package management migration changes any files.
+- Generate null-safe nullable mappings and combine required constructors with writable property initialization; match constructor arguments even when the target has no same-named property.
+- Preserve case-sensitive C# type comparisons while recognizing standard BCL aliases.
+- Preserve generic type parameters and constraints in generated DTOs, and exclude write-only or inaccessible getters from mappings, DTOs and validators.
+- Avoid incomplete validator rules for nullable dates, GUIDs and complex objects.
+- Preserve public property accessor visibility and `init` semantics in extracted interfaces.
+- Preserve file and namespace-scoped imports in extracted types, interfaces and generated DTOs.
+- Fix the macOS test runner launch for VS Code versions whose executable is named `Code` instead of `Electron`.
+- Rewrite namespace dependency updates around references to individual types, not namespace usages. Preserve imports for types left behind; update aliases, qualified names, static imports and extension methods without changing unrelated files. Prepare folder-wide edits before changing any declarations and apply them atomically; guard ambiguous imports and concurrent edits.
+- Fix namespace refactoring for qualified names when Roslyn selects only the first segment, including file-scoped declarations and diagnostic quick fixes. Report single-file adjustment failures instead of claiming the namespace is already correct.
+- Prevent activation failures when `dotnet new list` contains repeated short names (such as stable and preview MAUI templates). Deduplicate identical template invocations in commands and the template picker, and keep distinct templates with colliding sanitized command IDs.
+
+### Changed
+
+- **C# Language Server integration** — the extension now uses Microsoft C#'s existing language server through VS Code providers for type discovery, diagnostics and refactoring instead of text-based source discovery. Microsoft C# is required; C# Dev Kit remains optional.
+- Cache document symbols by version; use server-provided declarations for refactoring, generators and diagnostics, semantic tokens for identifier diagnostics, and workspace symbols/references for type and handler lookup.
+- Resolve mediator libraries through C# definitions, including global usings, and ignore generic constraints when identifying handlers. Handle Roslyn's property display names and constructor symbols when generating mappings.
+- Remove the startup workspace-wide C# text index. Namespace dependency updates use references captured before namespace changes and preserve unsaved buffers with undoable workspace edits.
+- Synchronize renamed files with semantic C# type renames, including constructors and cross-file references, rather than rewriting only the declaration.
+- Detect namespaces using the project's evaluated `RootNamespace`, including imported and conditional settings, rather than its folder name. Namespace detection requires .NET SDK 8+.
+- Update the extension test runner; development and tests now require Node.js 22+.
+
+### Removed
+
+- The using-sorting command, its unsorted-import diagnostic, settings and quick fix.
+
 ## [0.0.12]
 
 ### Added

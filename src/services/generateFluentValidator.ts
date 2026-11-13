@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
-import { extractFileNamespace } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
 import { coerceTypeName } from '../utils/sharedUtilities.js';
-import { detectPrimaryTypeName, parseTypeFields } from './generateMapTo.js';
+import { parseDocumentTypeFields, type ParsedFields } from './generateMapTo.js';
 import { findTypeInWorkspaceWithOptions } from '../utils/typeSearch.js';
 import { type ParsedProperty } from './templates/efcore.js';
 
@@ -21,8 +21,8 @@ const NUMERIC_TYPES = new Set([
 
 const DATE_TYPES = new Set(['DateTime', 'DateTimeOffset', 'TimeSpan']);
 
-function toParsedProperties(fields: ReturnType<typeof parseTypeFields>): ParsedProperty[] {
-	return fields.map(f => {
+function toParsedProperties(fields: ParsedFields): ParsedProperty[] {
+	return fields.filter(f => f.canRead !== false).map(f => {
 		const trimmed = f.typeName.replace(/\s+/g, '');
 		const isNullable = trimmed.endsWith('?');
 		const type = isNullable ? trimmed.slice(0, -1) : trimmed;
@@ -49,25 +49,6 @@ function parseCollectionType(type: string): CollectionInfo | null {
 	return null;
 }
 
-function escapeRe(s: string): string {
-	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function collectEnumNamesFromContent(content: string): Set<string> {
-	const enums = new Set<string>();
-	const re = /\benum\s+([A-Za-z_][A-Za-z0-9_]*)/g;
-	let match: RegExpExecArray | null;
-	while ((match = re.exec(content)) !== null) {
-		enums.add(match[1]);
-	}
-	return enums;
-}
-
-function isEnumDeclarationInContent(content: string, typeName: string): boolean {
-	const escaped = escapeRe(typeName);
-	return new RegExp(`\\benum\\s+${escaped}(?:\\s*<[^>]*>)?\\s*(?:\\{|;)`, 'm').test(content);
-}
-
 function unwrapTypeName(type: string): string {
 	return type.replace(/\?$/, '').replace(/\s+/g, '').trim();
 }
@@ -84,27 +65,22 @@ function collectReferencedTypes(properties: ParsedProperty[]): Set<string> {
 	return types;
 }
 
-async function resolveEnumTypes(content: string, properties: ParsedProperty[], contextUri: vscode.Uri): Promise<Set<string>> {
-	const enumTypes = collectEnumNamesFromContent(content);
+async function resolveEnumTypes(document: vscode.TextDocument, properties: ParsedProperty[]): Promise<Set<string>> {
+	const enumTypes = new Set((await csharpLanguageService.getTypes(document)).filter(type => type.type === 'enum').map(type => type.name));
 
 	for (const typeName of collectReferencedTypes(properties)) {
 		if (!typeName || enumTypes.has(typeName) || PRIMITIVE_TYPES.has(typeName)) {
 			continue;
 		}
 
-		const found = await findTypeInWorkspaceWithOptions(typeName, { contextUri });
+		const found = await findTypeInWorkspaceWithOptions(typeName, { contextUri: document.uri });
 		if (!found) {
 			continue;
 		}
 
-		try {
-			const buf = await vscode.workspace.fs.readFile(found.fileUri);
-			const fileContent = Buffer.from(buf).toString('utf-8');
-			if (isEnumDeclarationInContent(fileContent, typeName)) {
-				enumTypes.add(typeName);
-			}
-		} catch {
-			// Skip unreadable files
+		const enumDocument = await vscode.workspace.openTextDocument(found.fileUri);
+		if ((await csharpLanguageService.getTypes(enumDocument)).some(type => type.name === typeName && type.type === 'enum')) {
+			enumTypes.add(typeName);
 		}
 	}
 
@@ -124,11 +100,12 @@ function buildPropertyRules(prop: ParsedProperty, enumTypes: Set<string>): strin
 
 	const collection = parseCollectionType(base);
 	if (collection) {
-		lines.push(`        RuleForEach(x => x.${prop.name})`);
+		lines.push(`        RuleFor(x => x.${prop.name})`);
 		if (!prop.isNullable) {
 			lines.push(`${chainIndent}.NotNull()`);
 		}
-		lines.push(`${chainIndent}.NotEmpty()`);
+		lines.push(`${chainIndent}.NotEmpty()${prop.isNullable ? `.When(x => x.${prop.name} != null)` : ''};`);
+		lines.push('', `        RuleForEach(x => x.${prop.name})`);
 		appendChildRulesStub(lines, chainIndent);
 		return lines;
 	}
@@ -158,16 +135,14 @@ function buildPropertyRules(prop: ParsedProperty, enumTypes: Set<string>): strin
 	}
 
 	if (DATE_TYPES.has(base)) {
-		if (!prop.isNullable) {
-			lines.push(`${chainIndent}.NotEmpty();`);
-		}
+		if (prop.isNullable) { return []; }
+		lines.push(`${chainIndent}.NotEmpty();`);
 		return lines;
 	}
 
 	if (base === 'Guid') {
-		if (!prop.isNullable) {
-			lines.push(`${chainIndent}.NotEqual(Guid.Empty);`);
-		}
+		if (prop.isNullable) { return []; }
+		lines.push(`${chainIndent}.NotEqual(Guid.Empty);`);
 		return lines;
 	}
 
@@ -177,9 +152,8 @@ function buildPropertyRules(prop: ParsedProperty, enumTypes: Set<string>): strin
 	}
 
 	// Complex object type — only null check
-	if (!prop.isNullable) {
-		lines.push(`${chainIndent}.NotNull();`);
-	}
+	if (prop.isNullable) { return []; }
+	lines.push(`${chainIndent}.NotNull();`);
 	return lines;
 }
 
@@ -228,14 +202,14 @@ export async function generateFluentValidatorForDocument(
 ): Promise<void> {
 	const content = document.getText();
 	const eol = content.includes('\r\n') ? '\r\n' : '\n';
-	const resolvedType = coerceTypeName(typeName) ?? detectPrimaryTypeName(content);
+	const resolvedType = coerceTypeName(typeName) ?? (await csharpLanguageService.getPrimaryType(document))?.name;
 
 	if (!resolvedType) {
 		vscode.window.showErrorMessage('CSharp Painkiller: Cannot find a type to validate in the current file.');
 		return;
 	}
 
-	const properties = toParsedProperties(parseTypeFields(content, resolvedType));
+	const properties = toParsedProperties(await parseDocumentTypeFields(document, resolvedType));
 	if (properties.length === 0) {
 		vscode.window.showWarningMessage(
 			`CSharp Painkiller: No public properties found on ${resolvedType}.`
@@ -254,8 +228,8 @@ export async function generateFluentValidatorForDocument(
 		// File doesn't exist — proceed
 	}
 
-	const namespace = extractFileNamespace(content);
-	const enumTypes = await resolveEnumTypes(content, properties, document.uri);
+	const namespace = (await csharpLanguageService.getTypes(document)).find(type => type.name === resolvedType)?.namespace;
+	const enumTypes = await resolveEnumTypes(document, properties);
 	const validatorContent = generateFluentValidatorContent(
 		resolvedType,
 		properties,

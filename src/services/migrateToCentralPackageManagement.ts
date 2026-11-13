@@ -78,7 +78,7 @@ function parseCentralVersions(content: string): Map<string, string> {
 	while ((match = regex.exec(content)) !== null) {
 		const attributes = parseAttributes(match[1]);
 		const name = attributes.get('Include') ?? attributes.get('Update');
-		const version = attributes.get('Version') ?? match[2]?.match(/([^<]+)/)?.[1]?.trim();
+		const version = attributes.get('Version') ?? match[2]?.match(/<Version>\s*([^<]+?)\s*<\/Version>/i)?.[1]?.trim();
 		if (name && version) {
 			versions.set(name.toLowerCase(), version);
 		}
@@ -149,8 +149,16 @@ export function createMigrationPlan(
 	const centralVersions = new Map<string, string>();
 	const projectUpdates = new Map<string, string>();
 	const conflicts: string[] = [];
-	for (const [, content] of projects) {
+	for (const [projectPath, content] of projects) {
+		if (/<ManagePackageVersionsCentrally\b[^>]*>\s*false\s*<\/ManagePackageVersionsCentrally>/i
+			.test(content.replace(/<!--[\s\S]*?-->/g, ''))) {
+			conflicts.push(`${projectPath}: central package management is explicitly disabled. Enable it before migration.`);
+		}
 		for (const reference of parseVersionedPackageReferences(content)) {
+			if (/[$@%]\(/.test(reference.version)) {
+				conflicts.push(`${projectPath}: ${reference.name} uses an MSBuild expression (${reference.version}). Replace it with a literal version before migration.`);
+				continue;
+			}
 			const existingName = [...centralVersions.keys()].find(name => name.toLowerCase() === reference.name.toLowerCase());
 			const previous = existingName ? centralVersions.get(existingName) : undefined;
 			if (previous && previous !== reference.version) {
@@ -195,7 +203,18 @@ export async function migrateSolutionToCentralPackageManagement(uri?: vscode.Uri
 		vscode.window.showErrorMessage('CSharp Painkiller: The selected folder does not contain a .sln or .slnx file.');
 		return;
 	}
-	const projectUris = await vscode.workspace.findFiles(new vscode.RelativePattern(root, '**/*.csproj'));
+	const propsUri = vscode.Uri.file(pathModule.join(root.fsPath, DIRECTORY_PACKAGES_PROPS));
+	const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
+	const nestedProps = (await vscode.workspace.findFiles(
+		new vscode.RelativePattern(root, `**/${DIRECTORY_PACKAGES_PROPS}`), exclusionPattern,
+	)).filter(uri => uri.toString() !== propsUri.toString());
+	if (nestedProps.length > 0) {
+		vscode.window.showErrorMessage(
+			`CSharp Painkiller: Nested ${DIRECTORY_PACKAGES_PROPS} files prevent migration. Keep only one file at the solution root. No files were changed. Nested files: ${nestedProps.map(uri => uri.fsPath).join('; ')}`,
+		);
+		return;
+	}
+	const projectUris = await vscode.workspace.findFiles(new vscode.RelativePattern(root, '**/*.csproj'), exclusionPattern);
 	if (projectUris.length === 0) {
 		vscode.window.showInformationMessage('CSharp Painkiller: No projects found under the solution root.');
 		return;
@@ -204,16 +223,15 @@ export async function migrateSolutionToCentralPackageManagement(uri?: vscode.Uri
 	for (const projectUri of projectUris) {
 		projectContents.set(projectUri.fsPath, Buffer.from(await vscode.workspace.fs.readFile(projectUri)).toString('utf8'));
 	}
-	const propsUri = vscode.Uri.file(pathModule.join(root.fsPath, DIRECTORY_PACKAGES_PROPS));
 	let existingProps: string | undefined;
 	try {
 		existingProps = Buffer.from(await vscode.workspace.fs.readFile(propsUri)).toString('utf8');
-	} catch {
-		// The file is created when central package management is first enabled.
+	} catch (error) {
+		if (!(error instanceof vscode.FileSystemError) || error.code !== 'FileNotFound') { throw error; }
 	}
 	const plan = createMigrationPlan(projectContents, existingProps);
 	if (plan.conflicts.length > 0) {
-		vscode.window.showErrorMessage(`CSharp Painkiller: Package version conflicts prevent migration: ${plan.conflicts.join('; ')}`);
+		vscode.window.showErrorMessage(`CSharp Painkiller: Package version conflicts or unsupported project settings prevent migration: ${plan.conflicts.join('; ')}`);
 		return;
 	}
 	if (plan.centralVersions.size === 0) {

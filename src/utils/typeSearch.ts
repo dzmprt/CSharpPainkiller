@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as pathModule from 'path';
 import { isPathExcluded } from './fileUtils.js';
+import { csharpLanguageService } from '../services/csharpLanguageService.js';
+import { CsprojCache } from './csprojCache.js';
 
 // ============================================================================
 // Type search result
@@ -37,7 +39,8 @@ export async function findTypeInWorkspaceWithOptions(
 	typeName: string,
 	options?: SearchOptions
 ): Promise<FoundType | undefined> {
-	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+	const candidates = await csharpLanguageService.findTypes(typeName);
+	const files = candidates.map(symbol => symbol.location.uri);
 	const searchBuckets = await buildSearchBuckets(files, options?.contextUri);
 
 	for (const bucket of searchBuckets) {
@@ -46,19 +49,12 @@ export async function findTypeInWorkspaceWithOptions(
 				continue;
 			}
 
-			let content: string;
-			try {
-				const buf = await vscode.workspace.fs.readFile(uri);
-				content = Buffer.from(buf).toString('utf-8');
-			} catch {
-				continue;
-			}
-
-			const ns = extractNamespaceFromContent(content);
-			if (typeExistsInContent(content, typeName)) {
+			const document = await vscode.workspace.openTextDocument(uri);
+			const type = (await csharpLanguageService.getTypes(document)).find(type => type.name === typeName);
+			if (type) {
 				return {
 					name: typeName,
-					namespace: ns ?? '',
+					namespace: type.namespace,
 					fileUri: uri,
 				};
 			}
@@ -80,15 +76,23 @@ export async function findHandlerForMediator(
 	kind: 'request' | 'notification',
 	options?: SearchOptions
 ): Promise<FoundType | undefined> {
-	const files = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
-	const searchBuckets = await buildSearchBuckets(files, options?.contextUri);
+	const request = await findTypeInWorkspaceWithOptions(className, options);
+	if (!request) { return undefined; }
+	const document = await vscode.workspace.openTextDocument(request.fileUri);
+	const requestType = (await csharpLanguageService.getTypes(document)).find(type => type.name === className);
+	if (!requestType) { return undefined; }
+	const references = await csharpLanguageService.request<vscode.Location[]>(
+		'vscode.executeReferenceProvider', request.fileUri, requestType.symbol.selectionRange.start
+	);
+	const files = [...new Map(references.map(location => [location.uri.toString(), location.uri])).values()];
+	// References already identify this request semantically, including handlers in
+	// consuming projects which aren't referenced by the request's own project.
+	const searchBuckets = [files];
 
-	// Build a pattern that matches IRequestHandler<ClassName or INotificationHandler<ClassName
-	// Allow optional whitespace around the angle brackets.
 	const escaped = className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 	const iface = kind === 'request'
-		? `IRequestHandler\\s*<\\s*${escaped}\\s*[,>]`
-		: `INotificationHandler\\s*<\\s*${escaped}\\s*>`;
+		? `^(?:(?:global::)?[\\w.]+\\.)?IRequestHandler\\s*<\\s*(?:[\\w.]+\\.)?${escaped}\\s*[,>]`
+		: `^(?:(?:global::)?[\\w.]+\\.)?INotificationHandler\\s*<\\s*(?:[\\w.]+\\.)?${escaped}\\s*>`;
 	const re = new RegExp(iface);
 
 	for (const bucket of searchBuckets) {
@@ -97,26 +101,12 @@ export async function findHandlerForMediator(
 				continue;
 			}
 
-			let content: string;
-			try {
-				const buf = await vscode.workspace.fs.readFile(uri);
-				content = Buffer.from(buf).toString('utf-8');
-			} catch {
-				continue;
+			const handlerDocument = await vscode.workspace.openTextDocument(uri);
+			for (const type of await csharpLanguageService.getTypes(handlerDocument)) {
+				if (!type.nested && csharpLanguageService.getBaseTypes(handlerDocument, type).some(base => re.test(base.text))) {
+					return { name: type.name, namespace: type.namespace, fileUri: uri };
+				}
 			}
-
-			if (!re.test(content)) {
-				continue;
-			}
-
-			// Extract the handler class name from the file
-			const classMatch = content.match(
-				/(?:public|internal|sealed)\s+(?:sealed\s+)?class\s+([A-Za-z_][A-Za-z0-9_]*)/
-			);
-			const name = classMatch ? classMatch[1] : className + 'Handler';
-			const ns = extractNamespaceFromContent(content) ?? '';
-
-			return { name, namespace: ns, fileUri: uri };
 		}
 	}
 
@@ -143,7 +133,8 @@ async function buildSearchBuckets(
 		return [Array.from(files)];
 	}
 
-	const allowedProjectOrder = await computeReferencedProjectOrder(contextProjectDir, projectMap);
+	const allowedProjectOrder = (await CsprojCache.getInstance().getReferencedProjectOrder(projectMap.get(contextProjectDir)!))
+		.map(normalizeFsPath);
 	const allowedProjects = new Set(allowedProjectOrder);
 	const byProject = new Map<string, vscode.Uri[]>();
 
@@ -164,7 +155,7 @@ async function buildSearchBuckets(
 }
 
 async function loadProjectMap(): Promise<Map<string, vscode.Uri>> {
-	const csprojUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+	const csprojUris = await CsprojCache.getInstance().getProjectUris();
 	const projectMap = new Map<string, vscode.Uri>();
 	for (const uri of csprojUris) {
 		projectMap.set(normalizeFsPath(pathModule.dirname(uri.fsPath)), uri);
@@ -186,83 +177,3 @@ function projectDirForPath(filePath: string, sortedProjectDirs: readonly string[
 	return undefined;
 }
 
-function parseProjectReferences(content: string): string[] {
-	const references: string[] = [];
-	const regex = /<ProjectReference\b[^>]*Include="([^"]+)"[^>]*\/?>(?:\s*<\/ProjectReference>)?/gi;
-	let match: RegExpExecArray | null;
-	while ((match = regex.exec(content)) !== null) {
-		references.push(match[1]);
-	}
-	return references;
-}
-
-async function computeReferencedProjectOrder(
-	contextProjectDir: string,
-	projectMap: ReadonlyMap<string, vscode.Uri>
-): Promise<string[]> {
-	const order: string[] = [contextProjectDir];
-	const visited = new Set<string>([contextProjectDir]);
-	const queue: string[] = [contextProjectDir];
-
-	while (queue.length > 0) {
-		const currentDir = queue.shift();
-		if (!currentDir) {
-			continue;
-		}
-		const csprojUri = projectMap.get(currentDir);
-		if (!csprojUri) {
-			continue;
-		}
-
-		let content: string;
-		try {
-			const bytes = await vscode.workspace.fs.readFile(csprojUri);
-			content = Buffer.from(bytes).toString('utf-8');
-		} catch {
-			continue;
-		}
-
-		for (const referencePath of parseProjectReferences(content)) {
-			const normalizedReferencePath = referencePath.replace(/\\/g, '/');
-			const absoluteReferencePath = pathModule.isAbsolute(normalizedReferencePath)
-				? normalizedReferencePath
-				: pathModule.resolve(currentDir, normalizedReferencePath);
-			const referencedProjectDir = normalizeFsPath(pathModule.dirname(absoluteReferencePath));
-			if (!projectMap.has(referencedProjectDir) || visited.has(referencedProjectDir)) {
-				continue;
-			}
-			visited.add(referencedProjectDir);
-			order.push(referencedProjectDir);
-			queue.push(referencedProjectDir);
-		}
-	}
-
-	return order;
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/**
- * Extracts the namespace from file content (file-scoped or block-scoped).
- */
-function extractNamespaceFromContent(content: string): string | undefined {
-	const match = content.match(/^\s*namespace\s+([\w.]+)\s*(?:;|\{)/m);
-	return match ? match[1] : undefined;
-}
-
-/**
- * Returns true if a type (class/struct/record/enum/interface) with the exact
- * given name is declared anywhere in the content.
- */
-function typeExistsInContent(content: string, typeName: string): boolean {
-	// Match:  [access-mod] [extra-mods] (class|struct|record|enum|interface) TypeName
-	// or readonly record struct TypeName
-	const escaped = typeName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-	const re = new RegExp(
-		`(?:^|\\s)(?:readonly\\s+)?(?:record\\s+struct|class|struct|record|enum|interface)\\s+${escaped}(?:[\\s<{(;]|$)`,
-		'm'
-	);
-	return re.test(content);
-}

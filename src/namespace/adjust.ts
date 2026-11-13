@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
-import { type FileAdjustResultWithContext } from '../types.js';
-import { extractTypesFromContent, extractFileNamespaceWithIndent, hasPartialTypes } from '../utils/contentParser.js';
+import { type FileAdjustResultWithContext, type NamespaceAdjustmentPlan } from '../types.js';
+import { extractFileNamespaceWithIndent, hasPartialTypes, stripComments } from '../utils/contentParser.js';
+import { csharpLanguageService } from '../services/csharpLanguageService.js';
 import { deriveNamespaceFromFile, deriveNamespaceForFile } from './compute.js';
 import { removeUsingDirective } from './usingDirectives.js';
+import { applyNamespaceAdjustmentPlans } from './refactor.js';
 
 // ============================================================================
 // Namespace adjustment in file content
@@ -123,27 +125,8 @@ export async function adjustNamespaceForFile(
 	_projectContext?: { csprojs: import('../types.js').CsprojInfo[] }
 ): Promise<FileAdjustResultWithContext> {
 	try {
-		const existingContent = await vscode.workspace.fs.readFile(fileUri);
-		const content = Buffer.from(existingContent).toString('utf-8');
-
-		// Extract types from original content before namespace change
-		const extractionResult = extractTypesFromContent(content);
-
 		const newNamespace = await deriveNamespaceFromFile(fileUri);
-		const { adjustedContent, wasAdjusted, oldNamespace } = adjustFileNamespace(content, fileUri.path, newNamespace, true);
-
-		if (!wasAdjusted) {
-			return { uri: fileUri, adjusted: false };
-		}
-
-		await vscode.workspace.fs.writeFile(fileUri, Buffer.from(adjustedContent, 'utf-8'));
-		return {
-			uri: fileUri,
-			adjusted: true,
-			oldNamespace: oldNamespace !== newNamespace ? oldNamespace : undefined,
-			newNamespace: wasAdjusted ? newNamespace : undefined,
-			types: extractionResult.types,
-		};
+		return await adjustDocumentNamespace(await vscode.workspace.openTextDocument(fileUri), newNamespace);
 	} catch (error) {
 		return { uri: fileUri, adjusted: false, error: `${fileUri.fsPath}: ${error}` };
 	}
@@ -158,30 +141,90 @@ export async function adjustNamespaceForFileWithContext(
 	projectContext: { csprojs: import('../types.js').CsprojInfo[] }
 ): Promise<FileAdjustResultWithContext> {
 	try {
-		const existingContent = await vscode.workspace.fs.readFile(fileUri);
-		const content = Buffer.from(existingContent).toString('utf-8');
-
-		// Extract types from original content before namespace change
-		const extractionResult = extractTypesFromContent(content);
-
 		const newNamespace = await deriveNamespaceForFile(fileUri, targetFolderUri, projectContext);
-		const { adjustedContent, wasAdjusted, oldNamespace } = adjustFileNamespace(content, fileUri.path, newNamespace, true);
-
-		if (!wasAdjusted) {
-			return { uri: fileUri, adjusted: false };
-		}
-
-		await vscode.workspace.fs.writeFile(fileUri, Buffer.from(adjustedContent, 'utf-8'));
-		return {
-			uri: fileUri,
-			adjusted: true,
-			oldNamespace: oldNamespace !== newNamespace ? oldNamespace : undefined,
-			newNamespace: wasAdjusted ? newNamespace : undefined,
-			types: extractionResult.types,
-		};
+		return await adjustDocumentNamespace(await vscode.workspace.openTextDocument(fileUri), newNamespace);
 	} catch (error) {
 		return { uri: fileUri, adjusted: false, error: `${fileUri.fsPath}: ${error}` };
 	}
+}
+
+export async function adjustDocumentNamespace(
+	document: vscode.TextDocument,
+	newNamespace: string
+): Promise<FileAdjustResultWithContext> {
+	const plan = await prepareDocumentNamespaceAdjustment(document, newNamespace);
+	if (!plan) { return { uri: document.uri, adjusted: false }; }
+	const referencesUpdatedCount = await applyNamespaceAdjustmentPlans([plan]);
+	return {
+		uri: document.uri, adjusted: true, oldNamespace: plan.types[0]?.namespace,
+		newNamespace, types: plan.types, referencesUpdatedCount,
+	};
+}
+
+export async function prepareDocumentNamespaceAdjustment(
+	document: vscode.TextDocument,
+	newNamespace: string
+): Promise<NamespaceAdjustmentPlan | undefined> {
+	const version = document.version;
+	const types = await csharpLanguageService.getTypes(document);
+	const symbols = await csharpLanguageService.getSymbols(document);
+	const namespaces: vscode.DocumentSymbol[] = [];
+	const collect = (children: readonly vscode.DocumentSymbol[]): void => {
+		for (const symbol of children) {
+			if (symbol.kind === vscode.SymbolKind.Namespace) {
+				namespaces.push(symbol);
+				collect(symbol.children);
+			}
+		}
+	};
+	collect(symbols);
+	if (namespaces.length > 1) {
+		throw new Error('Files with multiple namespace declarations cannot be safely merged. Split the declarations into separate files first.');
+	}
+	const oldNamespace = types[0]?.namespace ?? namespaces[0]?.name;
+	if (types.some(type => type.partial) || (namespaces.length === 1 && oldNamespace === newNamespace) ||
+		(isProgramCs(document.uri.path) && namespaces.length === 0)) {
+		return undefined;
+	}
+
+	const textEdits: vscode.TextEdit[] = [];
+	const eol = document.eol === vscode.EndOfLine.CRLF ? '\r\n' : '\n';
+	for (const namespace of namespaces) {
+		const header = csharpLanguageService.getDeclarationHeaderRange(document, namespace);
+		const headerEnd = document.positionAt(document.offsetAt(header.end) + 1);
+		const delimiter = document.getText(new vscode.Range(header.end, headerEnd));
+		if (delimiter !== ';' && delimiter !== '{') {
+			throw new Error(`Cannot locate the namespace body for "${namespace.name}".`);
+		}
+		const range = new vscode.Range(namespace.range.start, headerEnd);
+		const inlineBody = delimiter === '{' &&
+			stripComments(document.getText(new vscode.Range(headerEnd, document.lineAt(headerEnd.line).range.end))).trim() !== '';
+		textEdits.push(namespace === namespaces[0]
+			? vscode.TextEdit.replace(range, `namespace ${newNamespace};${inlineBody ? eol : ''}`)
+			: vscode.TextEdit.delete(range));
+		if (delimiter === '{') {
+			const end = document.offsetAt(namespace.range.end);
+			if (document.getText(new vscode.Range(document.positionAt(end - 1), namespace.range.end)) !== '}') {
+				throw new Error(`Cannot locate the closing namespace brace for "${namespace.name}".`);
+			}
+			textEdits.push(vscode.TextEdit.delete(new vscode.Range(document.positionAt(end - 1), namespace.range.end)));
+		}
+	}
+	if (namespaces.length === 0) {
+		const content = document.getText();
+		const adjusted = insertNamespaceAtTop(content.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n'), newNamespace).adjustedContent;
+		const normalized = (content.startsWith('\uFEFF') ? '\uFEFF' : '') + (eol === '\r\n' ? adjusted.replace(/\n/g, eol) : adjusted);
+		let start = 0;
+		while (start < content.length && content[start] === normalized[start]) { start++; }
+		let end = content.length;
+		let newEnd = normalized.length;
+		while (end > start && newEnd > start && content[end - 1] === normalized[newEnd - 1]) { end--; newEnd--; }
+		textEdits.push(vscode.TextEdit.replace(new vscode.Range(document.positionAt(start), document.positionAt(end)), normalized.slice(start, newEnd)));
+	}
+	if (document.version !== version) {
+		throw new Error('The C# document changed while preparing namespace edits. Try again.');
+	}
+	return { document, version, newNamespace, types, edits: textEdits };
 }
 
 // ============================================================================

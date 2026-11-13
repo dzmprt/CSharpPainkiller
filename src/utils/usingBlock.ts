@@ -17,6 +17,37 @@ export interface TopLevelUsingBlock {
 	eol: string;
 }
 
+export interface TypeFileContext {
+	usings: string[];
+	namespaces: { name: string; usings: string[] }[];
+}
+
+export function buildTypeFileContent(typeDeclaration: string, context: TypeFileContext, eol: string): string {
+	const lines = [...context.usings];
+	if (lines.length > 0) { lines.push(''); }
+	if (context.namespaces.length === 1) {
+		const namespace = context.namespaces[0];
+		lines.push(`namespace ${namespace.name};`, '');
+		if (namespace.usings.length > 0) { lines.push(...namespace.usings, ''); }
+		lines.push(...typeDeclaration.trimEnd().split(/\r?\n/));
+	} else {
+		let indent = '';
+		for (const namespace of context.namespaces) {
+			lines.push(`${indent}namespace ${namespace.name}`, `${indent}{`);
+			indent += '    ';
+			if (namespace.usings.length > 0) {
+				lines.push(...namespace.usings.map(using => `${indent}${using}`), '');
+			}
+		}
+		lines.push(...typeDeclaration.trimEnd().split(/\r?\n/).map(line => line ? `${indent}${line}` : ''));
+		for (let i = context.namespaces.length - 1; i >= 0; i--) {
+			indent = indent.slice(0, -4);
+			lines.push(`${indent}}`);
+		}
+	}
+	return lines.join(eol) + eol;
+}
+
 const USING_DIRECTIVE_REGEX = /^\s*(global\s+)?using\s+(?:(static)\s+)?(?:(?<alias>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*)?(?<namespace>[\w.]+)\s*;[ \t]*(?:\/\/.*)?$/;
 
 function isBlank(line: string): boolean {
@@ -38,7 +69,6 @@ function parseUsingLine(line: string): Omit<TopLevelUsingDirective, 'fullText' |
 		isGlobal: Boolean(match[1]),
 	};
 }
-
 /**
  * Collects only the leading using block. This deliberately stops before the
  * namespace/type body so refactor commands never rewrite nested using blocks.
@@ -87,60 +117,4 @@ export function collectTopLevelUsingBlock(content: string): TopLevelUsingBlock |
 		end: directives[directives.length - 1].end,
 		eol,
 	};
-}
-
-// ============================================================================
-// Canonical sort order — shared by the "Sort Usings" command and the
-// unsorted-usings diagnostic, so both always agree on what "sorted" means.
-// ============================================================================
-
-/**
- * Determines the sort group for a using directive:
- * 0 = global usings, 1 = `System.*` namespace usings, 2 = other namespace usings,
- * 3 = static usings, 4 = alias usings.
- */
-export function getUsingSortGroup(usingDirective: TopLevelUsingDirective): number {
-	if (usingDirective.isGlobal) {
-		return 0;
-	}
-	if (usingDirective.kind === 'namespace' && usingDirective.namespace.startsWith('System')) {
-		return 1;
-	}
-	if (usingDirective.kind === 'namespace') {
-		return 2;
-	}
-	if (usingDirective.kind === 'static') {
-		return 3;
-	}
-	return 4;
-}
-
-/**
- * Compares two using directives using the canonical CSharp Painkiller sort order:
- * group (global → `System.*` → other namespaces → static → alias), then alphabetically
- * by namespace, then by alias.
- */
-export function compareUsingDirectives(a: TopLevelUsingDirective, b: TopLevelUsingDirective): number {
-	const groupDiff = getUsingSortGroup(a) - getUsingSortGroup(b);
-	if (groupDiff !== 0) {
-		return groupDiff;
-	}
-	const namespaceDiff = a.namespace.localeCompare(b.namespace);
-	if (namespaceDiff !== 0) {
-		return namespaceDiff;
-	}
-	return (a.alias ?? '').localeCompare(b.alias ?? '');
-}
-
-/**
- * Returns true if the given using directives are already in canonical sorted order
- * (this only checks ordering, not deduplication).
- */
-export function isUsingOrderSorted(directives: TopLevelUsingDirective[]): boolean {
-	for (let i = 1; i < directives.length; i++) {
-		if (compareUsingDirectives(directives[i - 1], directives[i]) > 0) {
-			return false;
-		}
-	}
-	return true;
 }

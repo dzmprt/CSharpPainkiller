@@ -4,6 +4,7 @@
  */
 
 import * as vscode from 'vscode';
+import { type CSharpType } from './services/csharpLanguageService.js';
 
 // ============================================================================
 // C# type system
@@ -27,6 +28,8 @@ export type TemplateParts = { prefix: string; suffix: string };
 export interface CsprojInfo {
 	/** The directory path containing this .csproj file */
 	dirPath: string;
+	projectUri?: vscode.Uri;
+	rootNamespace?: string;
 }
 
 /** Preloaded project information for a workspace folder. */
@@ -61,16 +64,13 @@ export interface TypeExtractionResult {
 // Namespace adjustment types
 // ============================================================================
 
-/** Namespace change tracking for a file. */
-export interface NamespaceChange {
-	/** The file URI that was changed */
-	fileUri: vscode.Uri;
-	/** The old namespace value */
-	oldNamespace: string;
-	/** The new namespace value */
+/** Namespace edits prepared against the unchanged language-server snapshot. */
+export interface NamespaceAdjustmentPlan {
+	document: vscode.TextDocument;
+	version: number;
 	newNamespace: string;
-	/** Types that were in this file (with their names) */
-	types: TypeDefinition[];
+	types: CSharpType[];
+	edits: vscode.TextEdit[];
 }
 
 /** Extended result for file adjustment that includes type information. */
@@ -82,6 +82,7 @@ export interface FileAdjustResultWithContext {
 	error?: string;
 	/** Types that were in this file before adjustment */
 	types?: TypeDefinition[];
+	referencesUpdatedCount?: number;
 }
 
 /** Result of adding/removing using directives. */

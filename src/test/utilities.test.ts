@@ -108,6 +108,16 @@ suite('utilities', () => {
 	});
 
 	suite('extractTypeToFileCore', () => {
+		test('keeps alias and static using directives preceding normal imports', () => {
+			const extracted = buildExtractedFileContent([
+				'using Payload = External.Payload;',
+				'using static External.Helpers;',
+				'using System;',
+				'namespace Demo;',
+			].join('\n'), 'public class Book { public Payload Value { get; set; } }');
+			assert.ok(extracted.startsWith('using Payload = External.Payload;\nusing static External.Helpers;\nusing System;'));
+		});
+
 		const multiTypeContent = [
 			'using System;',
 			'namespace MyApp.Models;',

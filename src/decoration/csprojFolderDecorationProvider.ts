@@ -20,19 +20,13 @@ export class CsprojFolderDecorationProvider implements vscode.FileDecorationProv
 	async initialize(): Promise<void> {
 		await this.refresh();
 
-		// Listen for csproj file changes to update decorations
-		const csprojWatcher = vscode.workspace.createFileSystemWatcher('**/*.csproj');
-		this.disposable = csprojWatcher;
-
-		csprojWatcher.onDidCreate(() => this.refresh());
-		csprojWatcher.onDidDelete(() => this.refresh());
-		csprojWatcher.onDidChange(() => {
-			// Don't need to refresh on change, only creation/deletion affects structure
+		this.disposable = CsprojCache.getInstance().onDidChange(change => {
+			if (!change.structureChanged) { return; }
+			void this.refresh().catch(error => console.error('Refreshing project decorations failed:', error));
 		});
 	}
 
 	async refresh(): Promise<void> {
-		CsprojCache.getInstance().invalidate();
 		await this.refreshCsprojFolders();
 	}
 
@@ -51,7 +45,8 @@ export class CsprojFolderDecorationProvider implements vscode.FileDecorationProv
 
 		this.csprojFolders = newFolders;
 
-		const changedFolders = new Set([...previousFolders, ...newFolders]);
+		const changedFolders = new Set([...previousFolders, ...newFolders].filter(folder =>
+			previousFolders.has(folder) !== newFolders.has(folder)));
 		for (const folderPath of changedFolders) {
 			this.updateEmitter.fire(vscode.Uri.file(folderPath));
 		}

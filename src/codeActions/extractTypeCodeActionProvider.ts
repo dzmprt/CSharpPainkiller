@@ -1,6 +1,5 @@
 import * as vscode from 'vscode';
-import { getTypeNameAtPosition } from '../services/generateMapTo.js';
-import { canExtractTypeFromFile } from '../services/extractTypeToFileCore.js';
+import { csharpLanguageService } from '../services/csharpLanguageService.js';
 import { getFileBaseNameFromUri } from '../utils/fileUtils.js';
 
 /**
@@ -11,23 +10,25 @@ import { getFileBaseNameFromUri } from '../utils/fileUtils.js';
 export class ExtractTypeCodeActionProvider implements vscode.CodeActionProvider {
 	public static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
 
-	provideCodeActions(
+	async provideCodeActions(
 		document: vscode.TextDocument,
 		range: vscode.Range | vscode.Selection,
 		_context: vscode.CodeActionContext,
-		_token: vscode.CancellationToken
-	): vscode.CodeAction[] {
+		token: vscode.CancellationToken
+	): Promise<vscode.CodeAction[]> {
 		if (!document.uri.path.endsWith('.cs')) {
 			return [];
 		}
 
 		const position = range instanceof vscode.Selection ? range.active : range.start;
-		const typeName = getTypeNameAtPosition(document, position);
-		if (!typeName) {
+		const types = (await csharpLanguageService.getTypes(document, token)).filter(type => !type.nested);
+		const type = types.find(type => type.symbol.selectionRange.contains(position));
+		if (!type) {
 			return [];
 		}
 
-		if (!canExtractTypeFromFile(document.getText(), typeName, getFileBaseNameFromUri(document.uri))) {
+		const typeName = type.name;
+		if (types.length <= 1 || type.partial || typeName === getFileBaseNameFromUri(document.uri)) {
 			return [];
 		}
 

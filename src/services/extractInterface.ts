@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { extractFileNamespace } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
+import { buildTypeFileContent, type TypeFileContext } from '../utils/usingBlock.js';
+import { getPublicPropertyAccessors, parseGenericDeclaration, stripComments as maskNonCode } from '../utils/contentParser.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -11,6 +13,7 @@ interface PropertySignature {
 	type: string;
 	hasGet: boolean;
 	hasSet: boolean;
+	hasInit: boolean;
 }
 
 interface MethodSignature {
@@ -18,10 +21,14 @@ interface MethodSignature {
 	returnType: string;
 	parameters: string;
 	isAsync: boolean;
+	typeParameters?: string;
+	constraints?: string;
 }
 
 interface ExtractedMembers {
 	className: string;
+	typeParameters?: string;
+	constraints?: string;
 	properties: PropertySignature[];
 	methods: MethodSignature[];
 }
@@ -29,17 +36,6 @@ interface ExtractedMembers {
 // ---------------------------------------------------------------------------
 // Parsing helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Removes single-line and multi-line comments from content.
- */
-function stripComments(content: string): string {
-	// Multi-line comments first
-	content = content.replace(/\/\*[\s\S]*?\*\//g, ' ');
-	// Single-line comments
-	content = content.replace(/\/\/[^\n]*/g, '');
-	return content;
-}
 
 /**
  * Finds the index of the matching closing brace for the opening brace at `openPos`.
@@ -60,21 +56,20 @@ function findMatchingBrace(content: string, openPos: number): number {
  * Extracts the body of the first public class in the file.
  * Returns { className, body } or undefined if none found.
  */
-function extractClassBody(content: string): { className: string; body: string } | undefined {
-	const stripped = stripComments(content);
+function extractClassBody(content: string): { className: string; body: string; header: string } | undefined {
+	const stripped = maskNonCode(content);
 
 	// Match: public [optional-mods] class ClassName [: BaseClass, IFoo]
-	const classRegex = /\bpublic\s+(?:(?:static|sealed|abstract|partial)\s+)*class\s+([A-Za-z_][A-Za-z0-9_<>,\s]*?)\s*(?:<[^>]*>)?\s*(?::[^{]*)?\{/g;
+	const classRegex = /\bpublic\s+(?:(?:static|sealed|abstract|partial)\s+)*class\s+([A-Za-z_][A-Za-z0-9_]*)\b[^{]*\{/g;
 
 	let match: RegExpExecArray | null;
 	while ((match = classRegex.exec(stripped)) !== null) {
-		// Extract the raw class name (without generic parameters)
-		const rawName = match[1].trim().replace(/<.*$/, '');
+		const rawName = match[1];
 		const openBracePos = match.index + match[0].length - 1;
 		const closeBracePos = findMatchingBrace(stripped, openBracePos);
 		if (closeBracePos === -1) { continue; }
 		const body = stripped.slice(openBracePos + 1, closeBracePos);
-		return { className: rawName, body };
+		return { className: rawName, body, header: stripped.slice(match.index, openBracePos) };
 	}
 	return undefined;
 }
@@ -92,16 +87,25 @@ function normaliseWs(s: string): string {
  */
 function extractPublicProperties(body: string): PropertySignature[] {
 	const results: PropertySignature[] = [];
+	const maskedBody = maskNonCode(body);
 
 	// Match: public [mods] Type Name { [get;] [set;] }
 	// Also handles expression-bodied: public Type Name => ...;
-	const propRegex = /\bpublic\s+(?:(?:static|virtual|abstract|override|new|required)\s+)*([^\s{;(]+(?:\s*<[^>]*>)?(?:\?|(?:\s*\[\s*\])+)?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{([^}]*)\}|=>)/g;
+	const propRegex = /\bpublic\s+((?:(?:static|virtual|abstract|override|new|required)\s+)*)([^\s{;(]+(?:\s*<[^>]*>)?(?:\?|(?:\s*\[\s*\])+)?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{([^}]*)\}|=>)/g;
 
 	let match: RegExpExecArray | null;
-	while ((match = propRegex.exec(body)) !== null) {
-		const type = normaliseWs(match[1]);
-		const name = match[2];
-		const accessors = match[3] ?? ''; // undefined for expression-bodied → treat as get-only
+	while ((match = propRegex.exec(maskedBody)) !== null) {
+		const type = normaliseWs(match[2]);
+		const name = match[3];
+		let accessors = '';
+		if (match[4] !== undefined) {
+			const start = match.index + match[0].indexOf('{');
+			const end = findMatchingBrace(maskedBody, start);
+			if (end < 0) { continue; }
+			accessors = maskedBody.slice(start + 1, end);
+			propRegex.lastIndex = end + 1;
+		}
+		if (/\bstatic\b/.test(match[1])) { continue; }
 
 		// Skip indexers
 		if (name === 'this') { continue; }
@@ -109,13 +113,14 @@ function extractPublicProperties(body: string): PropertySignature[] {
 		const before = body.slice(Math.max(0, match.index), match.index + match[0].indexOf(name) + name.length + 5);
 		if (/\(/.test(before.slice(before.indexOf(name) + name.length))) { continue; }
 
-		const hasGet = accessors === '' || /\bget\b/.test(accessors);
-		const hasSet = /\bset\b|\binit\b/.test(accessors);
+		const parsed = getPublicPropertyAccessors(accessors);
+		const hasGet = match[4] === undefined || parsed.hasGet;
+		const { hasSet, hasInit } = parsed;
 
 		// Skip write-only (very rare) or if name is a keyword
-		if (!hasGet && !hasSet) { continue; }
+		if (!hasGet && !hasSet && !hasInit) { continue; }
 
-		results.push({ name, type, hasGet: true, hasSet });
+		results.push({ name, type, hasGet, hasSet, hasInit });
 	}
 
 	return results;
@@ -129,14 +134,17 @@ function extractPublicMethods(body: string, className: string): MethodSignature[
 	const results: MethodSignature[] = [];
 
 	// Match: public [mods] [async] ReturnType MethodName([params]) [where ...]
-	const methodRegex = /\bpublic\s+((?:(?:static|virtual|abstract|override|new|async|sealed)\s+)*)([^\s(]+(?:\s*<[^>]*>)?(?:\?)?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:<[^>]*)?\s*\(([^)]*)\)/g;
+	const methodRegex = /\bpublic\s+((?:(?:static|virtual|abstract|override|new|async|sealed)\s+)*)([^\s(]+(?:\s*<[^>]*>)?(?:\?)?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(<[^>]*>)?\s*\(([^)]*)\)/g;
 
 	let match: RegExpExecArray | null;
 	while ((match = methodRegex.exec(body)) !== null) {
 		const mods = match[1];
+		if (/\bstatic\b/.test(mods)) { continue; }
 		const returnType = normaliseWs(match[2]);
 		const name = match[3];
-		const rawParams = normaliseWs(match[4]);
+		const rawParams = normaliseWs(match[5]);
+		const constraints = normaliseWs(maskNonCode(body.slice(methodRegex.lastIndex))
+			.match(/^\s*(where\b[\s\S]*?)(?=\s*(?:=>|\{|;))/)?.[1] ?? '') || undefined;
 
 		// Skip constructors (name === className), operators, property-like things
 		if (name === className) { continue; }
@@ -158,7 +166,8 @@ function extractPublicMethods(body: string, className: string): MethodSignature[
 			.filter(Boolean)
 			.join(', ');
 
-		results.push({ name, returnType, parameters: cleanedParams, isAsync });
+		results.push({ name, returnType, parameters: cleanedParams, isAsync,
+			typeParameters: match[4] ? normaliseWs(match[4]) : undefined, constraints });
 	}
 
 	return results;
@@ -171,11 +180,11 @@ export function extractPublicMembers(content: string): ExtractedMembers | undefi
 	const classInfo = extractClassBody(content);
 	if (!classInfo) { return undefined; }
 
-	const { className, body } = classInfo;
+	const { className, body, header } = classInfo;
 	const properties = extractPublicProperties(body);
 	const methods = extractPublicMethods(body, className);
 
-	return { className, properties, methods };
+	return { className, ...parseGenericDeclaration(header, className), properties, methods };
 }
 
 // ---------------------------------------------------------------------------
@@ -185,29 +194,23 @@ export function extractPublicMembers(content: string): ExtractedMembers | undefi
 /**
  * Generates the interface file content.
  */
-function generateInterfaceContent(
+export function generateInterfaceContent(
 	members: ExtractedMembers,
 	interfaceName: string,
 	namespaceName: string | undefined,
-	eol: string
+	eol: string,
+	context?: TypeFileContext
 ): string {
 	const lines: string[] = [];
 
-	if (namespaceName) {
-		lines.push(`namespace ${namespaceName};`);
-		lines.push('');
-	}
-
-	lines.push(`public interface ${interfaceName}`);
+	lines.push(`public interface ${interfaceName}${members.typeParameters ?? ''}`);
+	if (members.constraints) { lines.push(`    ${members.constraints}`); }
 	lines.push('{');
 
 	// Properties
 	for (const prop of members.properties) {
-		const accessors = prop.hasGet && prop.hasSet
-			? 'get; set;'
-			: prop.hasGet
-				? 'get;'
-				: 'set;';
+		const accessors = [prop.hasGet ? 'get;' : '', prop.hasSet ? 'set;' : '', prop.hasInit ? 'init;' : '']
+			.filter(Boolean).join(' ');
 		lines.push(`    ${prop.type} ${prop.name} { ${accessors} }`);
 	}
 
@@ -217,18 +220,15 @@ function generateInterfaceContent(
 
 	// Methods
 	for (const method of members.methods) {
-		// In the interface, async methods drop the Task wrapper in the signature only
-		// when returning void → use Task instead
-		let returnType = method.returnType;
-		if (method.isAsync && returnType === 'void') {
-			returnType = 'Task';
-		}
-		lines.push(`    ${returnType} ${method.name}(${method.parameters});`);
+		lines.push(`    ${method.returnType} ${method.name}${method.typeParameters ?? ''}(${method.parameters})${method.constraints ? ` ${method.constraints}` : ''};`);
 	}
 
 	lines.push('}');
 
-	return lines.join(eol);
+	return buildTypeFileContent(lines.join(eol), context ?? {
+		usings: [],
+		namespaces: namespaceName ? [{ name: namespaceName, usings: [] }] : [],
+	}, eol);
 }
 
 // ---------------------------------------------------------------------------
@@ -240,16 +240,6 @@ function generateInterfaceContent(
  * the given .cs file and creates a new I<ClassName>.cs file next to it.
  */
 export async function extractInterfaceFromFile(fileUri: vscode.Uri): Promise<void> {
-	// Read file
-	let content: string;
-	try {
-		const raw = await vscode.workspace.fs.readFile(fileUri);
-		content = Buffer.from(raw).toString('utf-8');
-	} catch {
-		vscode.window.showErrorMessage('Cannot read the selected file.');
-		return;
-	}
-
 	// Ensure it is a .cs file
 	if (!fileUri.path.endsWith('.cs')) {
 		vscode.window.showErrorMessage('This command only works on .cs files.');
@@ -257,11 +247,23 @@ export async function extractInterfaceFromFile(fileUri: vscode.Uri): Promise<voi
 	}
 
 	// Extract members
-	const members = extractPublicMembers(content);
-	if (!members) {
+	const document = await vscode.workspace.openTextDocument(fileUri);
+	const type = (await csharpLanguageService.getTypes(document)).find(type => type.public && !type.nested && type.type === 'class');
+	if (!type) {
 		vscode.window.showErrorMessage('No public class found in the selected file.');
 		return;
 	}
+	const content = document.getText();
+	const members: ExtractedMembers = {
+		className: type.name,
+		...parseGenericDeclaration(csharpLanguageService.getHeader(document, type), type.name),
+		properties: type.symbol.children.filter(symbol => symbol.kind === vscode.SymbolKind.Property)
+			.flatMap(symbol => extractPublicProperties(document.getText(symbol.range))
+				.filter(property => property.name === document.getText(symbol.selectionRange)).slice(0, 1)),
+		methods: type.symbol.children.filter(symbol => symbol.kind === vscode.SymbolKind.Method)
+			.flatMap(symbol => extractPublicMethods(document.getText(symbol.range), type.name)
+				.filter(method => method.name === document.getText(symbol.selectionRange)).slice(0, 1)),
+	};
 
 	if (members.properties.length === 0 && members.methods.length === 0) {
 		vscode.window.showWarningMessage(
@@ -286,8 +288,9 @@ export async function extractInterfaceFromFile(fileUri: vscode.Uri): Promise<voi
 	}
 
 	const eol = content.includes('\r\n') ? '\r\n' : '\n';
-	const namespaceName = extractFileNamespace(content);
-	const interfaceContent = generateInterfaceContent(members, interfaceName, namespaceName, eol);
+	const namespaceName = type.namespace;
+	const interfaceContent = generateInterfaceContent(members, interfaceName, namespaceName, eol,
+		await csharpLanguageService.getTypeFileContext(document, type));
 
 	// Determine output path: same directory as the source file
 	const dir = path.posix.dirname(fileUri.path);
@@ -308,7 +311,7 @@ export async function extractInterfaceFromFile(fileUri: vscode.Uri): Promise<voi
 	}
 
 	// Write interface file
-	await vscode.workspace.fs.writeFile(outUri, Buffer.from(interfaceContent + eol, 'utf-8'));
+	await vscode.workspace.fs.writeFile(outUri, Buffer.from(interfaceContent, 'utf-8'));
 
 	// Open the new file
 	const doc = await vscode.workspace.openTextDocument(outUri);

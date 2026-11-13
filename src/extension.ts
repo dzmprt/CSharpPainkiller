@@ -3,10 +3,9 @@ import { type CType } from './types.js';
 import { createCSharpFile } from './services/createFile.js';
 import { renameFileByType, renameFilesByTypeInFolder } from './services/renameFile.js';
 import { adjustNamespaceForFolder, adjustNamespaceForSingleFile } from './services/namespaceAdjuster.js';
-import { sortUsingsInFile, sortUsingsInFolder } from './services/sortUsings.js';
 import { extractInterfaceFromFile } from './services/extractInterface.js';
 import { uriIsDirectory, uriIsFile } from './utils/fileUtils.js';
-import { detectMediatorFile } from './utils/contentParser.js';
+import { csharpLanguageService } from './services/csharpLanguageService.js';
 import { ExtractTypeCodeActionProvider } from './codeActions/extractTypeCodeActionProvider.js';
 import { extractTypeToFile } from './services/extractTypeToFile.js';
 import { generateMapToForDocument, generateMapFromForDocument } from './services/generateMapTo.js';
@@ -49,13 +48,13 @@ import {
 import { validateUri as validateSharedUri, resolveCommandFileContext } from './utils/sharedUtilities.js';
 
 import { CsprojCache } from './utils/csprojCache.js';
-import { ProjectTypeIndex } from './utils/projectTypeIndex.js';
-import { fetchDotnetTemplates, registerDynamicTemplateCommands } from './services/dotnetTemplates.js';
+import { registerLazyTemplateCommands } from './services/dotnetTemplates.js';
+import { registerDotnetCli } from './utils/dotnetCli.js';
+import { registerNugetCache } from './services/nugetCommands.js';
 import { CsprojFolderDecorationProvider } from './decoration/csprojFolderDecorationProvider.js';
 import { CsprojProjectsTreeProvider } from './decoration/csprojProjectsTreeProvider.js';
-import { ParserCache } from './codeActions/parserCache.js';
 import { runDiagnosticsForDocument, runDiagnosticsForOpenEditors, clearDiagnosticsCacheForUri, clearDiagnosticsCache } from './diagnostics/diagnosticsProvider.js';
-import { scheduleDiagnosticsForDocumentChange, clearDebounceForDocument } from './diagnostics/scheduler.js';
+import { scheduleDiagnosticsForDocumentChange, clearDebounceForDocument, clearPendingDiagnostics } from './diagnostics/scheduler.js';
 import { CSharpDiagnosticsCodeActionProvider } from './diagnostics/codeActionProvider.js';
 import { analyzeSolutionCommand } from './services/analyzeSolution.js';
 import { migrateSolutionToCentralPackageManagement } from './services/migrateToCentralPackageManagement.js';
@@ -83,6 +82,8 @@ const validateUri = validateSharedUri;
  */
 export async function activate(context: vscode.ExtensionContext) {
 	console.log('CSharp Painkiller is starting...');
+	registerDotnetCli(context);
+	registerLazyTemplateCommands(context);
 	await updateHasSolutionContext();
 	const solutionContextWatcher = vscode.workspace.createFileSystemWatcher('**/*.{sln,slnx}');
 	context.subscriptions.push(
@@ -96,15 +97,10 @@ export async function activate(context: vscode.ExtensionContext) {
 	// -------------------------------------------------------------------------
 	const csprojCache = CsprojCache.getInstance();
 	await csprojCache.initialize(context);
+	registerNugetCache(context);
 	console.log('CsprojCache initialized');
 
-	// -------------------------------------------------------------------------
-	// Initialize ProjectTypeIndex — backs the cross-file diagnostics (request-without-
-	// handler, duplicate-type-name). Scans the workspace in the background (not awaited)
-	// so activation isn't delayed by a full .cs file scan on large solutions; kept fresh
-	// afterwards via a file watcher and via live document updates from the diagnostics pipeline.
-	// -------------------------------------------------------------------------
-	void ProjectTypeIndex.getInstance().initialize(context);
+	context.subscriptions.push(csharpLanguageService);
 
 	// -------------------------------------------------------------------------
 	// Register file decoration provider for csproj folders
@@ -186,16 +182,15 @@ export async function activate(context: vscode.ExtensionContext) {
 	);
 	context.subscriptions.push(extractTypeCodeActionProvider);
 
-	const parserCache = ParserCache.getInstance();
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeTextDocument(event => {
 			if (event.document.languageId === 'csharp') {
-				parserCache.clearAllCaches(event.document);
+				csharpLanguageService.invalidate(event.document);
 			}
 		}),
 		vscode.workspace.onDidCloseTextDocument(document => {
 			if (document.languageId === 'csharp') {
-				parserCache.clearAllCaches(document);
+				csharpLanguageService.invalidate(document);
 			}
 		})
 	);
@@ -220,6 +215,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	// Analyze .cs files already open in editors at startup (no workspace-wide scan).
 	void runDiagnosticsForOpenEditors(diagnosticCollection);
+	context.subscriptions.push(csprojCache.onDidChange(() => {
+		clearDiagnosticsCache();
+		void runDiagnosticsForOpenEditors(diagnosticCollection);
+	}), { dispose: () => { clearPendingDiagnostics(); clearDiagnosticsCache(); } });
 
 	context.subscriptions.push(
 		vscode.workspace.onDidOpenTextDocument(document => {
@@ -349,11 +348,12 @@ export async function activate(context: vscode.ExtensionContext) {
 			return;
 		}
 		try {
-			const buf = await vscode.workspace.fs.readFile(uri);
-			const content = Buffer.from(buf).toString('utf-8');
-			const info = detectMediatorFile(content);
+			const document = await vscode.workspace.openTextDocument(uri);
+			const info = await csharpLanguageService.getMediatorInfo(document);
+			if (vscode.window.activeTextEditor?.document.uri.toString() !== uri.toString()) { return; }
 			await vscode.commands.executeCommand('setContext', 'csharppainkiller.isMediatorFile', info !== null);
-		} catch {
+		} catch (error) {
+			console.warn('Failed to query C# mediator symbols:', error);
 			await vscode.commands.executeCommand('setContext', 'csharppainkiller.isMediatorFile', false);
 		}
 	}
@@ -449,34 +449,6 @@ export async function activate(context: vscode.ExtensionContext) {
 	);
 
 	// -------------------------------------------------------------------------
-	// "Sort Usings" command
-	// -------------------------------------------------------------------------
-	const sortUsingsDisposable = vscode.commands.registerCommand(
-		'csharppainkiller.sortUsings',
-		async (uri?: vscode.Uri) => {
-			const uriValue = uri;
-			if (!uriValue) {
-				vscode.window.showErrorMessage('No file or folder selected.');
-				return;
-			}
-
-			if (await uriIsDirectory(uriValue)) {
-				await sortUsingsInFolder(uriValue);
-			} else if (await uriIsFile(uriValue)) {
-				const fileError = validateUri(uriValue, { requireCsFile: true });
-				if (fileError) {
-					vscode.window.showErrorMessage(fileError);
-					return;
-				}
-				const result = await sortUsingsInFile(uriValue);
-				vscode.window.showInformationMessage(result.message);
-			} else {
-				vscode.window.showErrorMessage('Unsupported file type.');
-			}
-		}
-	);
-
-	// -------------------------------------------------------------------------
 	// "Extract Interface" command
 	// -------------------------------------------------------------------------
 	const extractInterfaceDisposable = vscode.commands.registerCommand(
@@ -499,7 +471,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(adjustNamespaceDisposable);
 	context.subscriptions.push(renameFileByTypeDisposable);
-	context.subscriptions.push(sortUsingsDisposable);
 	context.subscriptions.push(extractInterfaceDisposable);
 
 		// -------------------------------------------------------------------------
@@ -599,12 +570,6 @@ export async function activate(context: vscode.ExtensionContext) {
   // -------------------------------------------------------------------------
   // ".NET Project" commands — dynamically loaded from `dotnet new list`
   // -------------------------------------------------------------------------
-
-  // Fetch templates and register dynamic commands at startup
-  const dotnetTemplates = await fetchDotnetTemplates(context);
-
-  // Register all dynamic template commands (including the unified createProject command)
-  registerDynamicTemplateCommands(dotnetTemplates, context);
 
   // -------------------------------------------------------------------------
   // "C# Templates > MediatR" commands
@@ -715,18 +680,17 @@ export async function activate(context: vscode.ExtensionContext) {
 	// -------------------------------------------------------------------------
 	context.subscriptions.push({
 		dispose: () => {
-			csprojCache.dispose();
 			decorationProvider.dispose();
 		}
 	});
 }
 
 async function updateHasSolutionContext(): Promise<void> {
-	const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+	const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}', 1);
 	await vscode.commands.executeCommand('setContext', 'csharppainkiller.hasSolution', solutionFiles.length > 0);
 }
 
 export function deactivate() {
-	// Dispose CsprojCache on extension deactivation
-	CsprojCache.getInstance().dispose();
+	clearPendingDiagnostics();
+	clearDiagnosticsCache();
 }

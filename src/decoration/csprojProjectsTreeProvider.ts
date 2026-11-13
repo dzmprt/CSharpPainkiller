@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
 import * as pathModule from 'path';
-import { spawnSync } from 'child_process';
+import { AsyncCache, throwIfCancelled } from '../utils/asyncWork.js';
+import { runDotnet } from '../utils/dotnetCli.js';
+import { CsprojCache } from '../utils/csprojCache.js';
 import { showAddPackagePicker, getLatestPackageVersion, getPackageDependencies, compareVersions, getProjectPackageUpdates, getProjectPackages, getProjectPackageVulnerabilities, type PackageDependencyInfo, type PackageInfo } from '../services/nugetCommands.js';
 
 type CsprojTreeNode =
@@ -54,6 +56,8 @@ interface ProjectNode {
 	solutionProjectPaths: ReadonlySet<string>;
 	isAspNet: boolean;
 	isTest: boolean;
+	isBlazor: boolean;
+	isMaui: boolean;
 	virtualPath?: string;
 	targetFramework?: string;
 	languageVersion?: string;
@@ -168,6 +172,8 @@ interface DraggedProjectPayload {
 	projectPath: string;
 	isAspNet: boolean;
 	isTest: boolean;
+	isBlazor: boolean;
+	isMaui: boolean;
 	virtualPath?: string;
 }
 
@@ -222,9 +228,13 @@ export function isAutomaticPackageCheckEnabled(
 
 export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<CsprojProjectTreeItem>, vscode.TreeDragAndDropController<CsprojProjectTreeItem>, vscode.Disposable {
 	private readonly changeEmitter = new vscode.EventEmitter<CsprojProjectTreeItem | undefined>();
-	private readonly watcher: vscode.FileSystemWatcher;
+	private readonly watcher: vscode.Disposable;
 	private readonly solutionWatcher: vscode.FileSystemWatcher;
-	private readonly workspaceDeleteWatcher: vscode.FileSystemWatcher;
+	private readonly propsWatcher: vscode.FileSystemWatcher;
+	private readonly treeCache = new AsyncCache<string, CsprojTreeNode[]>(1);
+	private treeRoots: CsprojTreeNode[] | undefined;
+	private readonly treeItems = new Map<string, CsprojProjectTreeItem>();
+	private treeVersion = 0;
 	private treeView: vscode.TreeView<CsprojProjectTreeItem> | undefined;
 	private initialPackageUpdateCheckScheduled = false;
 	private initialPackageUpdateCheckTimer: ReturnType<typeof setTimeout> | undefined;
@@ -251,24 +261,59 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 
 	constructor(
 		private readonly extensionUri: vscode.Uri,
-		private readonly onProjectFoldersChanged?: () => Promise<void> | void
+		private readonly onProjectFoldersChanged?: () => Promise<void> | void,
+		private readonly discoverSolutions = () => vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}'),
 	) {
-		this.watcher = vscode.workspace.createFileSystemWatcher('**/*.csproj');
-		this.watcher.onDidCreate(() => this.scheduleRefresh());
-		this.watcher.onDidDelete(() => this.scheduleRefresh());
-		this.watcher.onDidChange(() => this.scheduleRefresh());
+		this.watcher = CsprojCache.getInstance().onDidChange(change => {
+			if (!change.structureChanged && change.uri) {
+				void this.refreshProject(change.uri).catch(error => {
+					console.error('Refreshing project metadata failed:', error);
+					this.scheduleRefresh();
+				});
+			} else {
+				this.scheduleRefresh();
+			}
+		});
 
 		this.solutionWatcher = vscode.workspace.createFileSystemWatcher('**/*.{sln,slnx}');
 		this.solutionWatcher.onDidCreate(() => this.scheduleRefresh());
 		this.solutionWatcher.onDidDelete(() => this.scheduleRefresh());
 		this.solutionWatcher.onDidChange(() => this.scheduleRefresh());
 
-		this.workspaceDeleteWatcher = vscode.workspace.createFileSystemWatcher('**/*');
-		this.workspaceDeleteWatcher.onDidDelete(() => this.scheduleRefresh());
+		this.propsWatcher = vscode.workspace.createFileSystemWatcher('**/{Directory.Build.props,Directory.Packages.props}');
+		this.propsWatcher.onDidCreate(() => this.scheduleRefresh());
+		this.propsWatcher.onDidChange(() => this.scheduleRefresh());
+		this.propsWatcher.onDidDelete(() => this.scheduleRefresh());
+
 	}
 
 	refresh(): void {
+		this.treeVersion++;
+		this.treeCache.clear();
+		this.treeRoots = undefined;
+		this.treeItems.clear();
 		this.changeEmitter.fire(undefined);
+	}
+
+	private async refreshProject(uri: vscode.Uri): Promise<void> {
+		if (!this.treeRoots) { this.scheduleRefresh(); return; }
+		const roots = this.treeRoots;
+		const generation = CsprojCache.getInstance().version;
+		const visit = async (nodes: CsprojTreeNode[]): Promise<void> => {
+			for (const node of nodes) {
+				if (node.kind === 'project' && node.csprojUri.toString() === uri.toString()) {
+					const updated = await this.createProjectNode(node.csprojUri, node.solutionUri, node.projectPath,
+						node.existsOnDisk, node.solutionProjectPaths, node.virtualPath, node.label);
+					if (roots !== this.treeRoots || generation !== CsprojCache.getInstance().version) { return; }
+					Object.assign(node, updated);
+					const item = this.treeItems.get(getNodeId(node));
+					if (item) { this.changeEmitter.fire(item); }
+				} else if ('children' in node) {
+					await visit(node.children);
+				}
+			}
+		};
+		await visit(this.treeRoots);
 	}
 
 	private scheduleRefresh(): void {
@@ -295,7 +340,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	}
 
 	getTreeItem(element: CsprojProjectTreeItem): vscode.TreeItem {
-		return element;
+		return new CsprojProjectTreeItem(element.node, this.extensionUri);
 	}
 
 	async getParent(element: CsprojProjectTreeItem): Promise<CsprojProjectTreeItem | undefined> {
@@ -319,7 +364,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return this.createTreeItem({ kind: 'referenceGroup', label: 'Project References', project: node.project, children: [] });
 		}
 
-		const roots = await this.buildTree();
+		const roots = await this.treeCache.get('root', () => this.buildTree());
 		const parent = findParentNode(roots, node);
 		return parent ? this.createTreeItem(parent) : undefined;
 	}
@@ -340,6 +385,8 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			projectPath: project.projectPath,
 			isAspNet: project.isAspNet,
 			isTest: project.isTest,
+			isBlazor: project.isBlazor,
+			isMaui: project.isMaui,
 			virtualPath: project.virtualPath,
 		} satisfies DraggedProjectPayload)))));
 	}
@@ -379,6 +426,24 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			}
 
 			if (element.node.kind === 'packageReference') {
+				const node = element.node;
+				if (node.dependencies === undefined) {
+					try {
+						if (!node.version) {
+							const installed = (await getProjectPackages(node.project.csprojUri.fsPath)).get(node.label.toLowerCase());
+							node.version = installed?.resolvedVersion ?? installed?.requestedVersion;
+						}
+						if (!node.version) { throw new Error(`Cannot resolve the installed version of ${node.label}. Restore the project first.`); }
+						const dependencies = await getPackageDependencies(node.project.csprojUri.fsPath, node.label, node.version);
+						this.packageDependencyCache.set(this.packageCacheKey(node.project.csprojUri, node.label), dependencies);
+						node.dependencies = dependencies.map(dependency => createPackageDependencyNode(dependency, node.project, node.label));
+						this.changeEmitter.fire(element);
+					} catch (error) {
+						console.error('Loading package dependencies failed:', error);
+						vscode.window.showWarningMessage(`CSharp Painkiller: Could not load dependencies for ${node.label}: ${error instanceof Error ? error.message : String(error)}`);
+						throw error;
+					}
+				}
 				return (element.node.dependencies ?? []).map(node => this.createTreeItem(node));
 			}
 
@@ -391,7 +456,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				: [];
 		}
 
-		const nodes = await this.buildTree();
+		const version = this.treeVersion;
+		const nodes = await this.treeCache.get('root', () => this.buildTree());
+		if (version !== this.treeVersion) { return this.getChildren(); }
+		this.treeRoots = nodes;
 		this.scheduleInitialPackageUpdateCheck();
 		return nodes.map(node => this.createTreeItem(node));
 	}
@@ -418,7 +486,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	}
 
 	private createTreeItem(node: CsprojTreeNode): CsprojProjectTreeItem {
-		return new CsprojProjectTreeItem(node, this.extensionUri);
+		const item = new CsprojProjectTreeItem(node, this.extensionUri);
+		this.treeItems.set(item.id!, item);
+		return item;
 	}
 
 	private async getProjectChildren(project: ProjectNode): Promise<CsprojTreeNode[]> {
@@ -537,6 +607,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 
 		if (deletePhysicalFolder) {
 			await vscode.workspace.fs.delete(target.physicalBaseUri, { recursive: true, useTrash: true });
+			CsprojCache.getInstance().invalidate();
 		}
 		this.refresh();
 	}
@@ -595,7 +666,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const includedPaths = new Set((solutionUri.path.endsWith('.slnx') ? parseSlnxProjects(content) : parseSlnProjects(content))
 			.filter(entry => !entry.isSolutionFolder)
 			.map(entry => normalizePath(pathModule.resolve(solutionDir, entry.projectPath))));
-		const candidates = (await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}'))
+		const candidates = (await CsprojCache.getInstance().getProjectUris())
 			.filter(uri => !includedPaths.has(normalizePath(uri.fsPath)));
 
 		if (candidates.length === 0) {
@@ -634,7 +705,20 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
-		const deletePhysicalFolder = await this.shouldDeletePhysicalFolder(item.node.folderUri, item.node.label, true);
+		const folderPath = normalizePath(item.node.folderUri.fsPath);
+		const solutions = [item.node.solutionUri, ...await this.discoverSolutions()];
+		const protectedFolder = folderPath === normalizePath(pathModule.parse(item.node.folderUri.fsPath).root) ||
+			(vscode.workspace.workspaceFolders ?? []).some(folder =>
+				normalizePath(folder.uri.fsPath) === folderPath || normalizePath(folder.uri.fsPath).startsWith(`${folderPath}/`)) ||
+			solutions.some(uri => normalizePath(uri.fsPath).startsWith(`${folderPath}/`)) ||
+			await this.projectFolderContainsOtherProjects(item.node);
+		if (protectedFolder) {
+			await vscode.window.showWarningMessage(
+				`CSharp Painkiller: Folder "${item.node.folderUri.fsPath}" is a protected root or contains another project or solution and will be kept. Only "${item.node.label}" will be removed from the solution.`
+			);
+		}
+		const deletePhysicalFolder = protectedFolder ? false
+			: await this.shouldDeletePhysicalFolder(item.node.folderUri, item.node.label, true);
 		if (deletePhysicalFolder === undefined) {
 			return;
 		}
@@ -642,6 +726,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		await this.removeProjectFromSolution(item.node.solutionUri, item.node.projectPath);
 		if (deletePhysicalFolder) {
 			await vscode.workspace.fs.delete(item.node.folderUri, { recursive: true, useTrash: true });
+			CsprojCache.getInstance().invalidate();
 		}
 		this.refresh();
 	}
@@ -666,7 +751,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			)
 		);
 
-		const allProjects = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+		const allProjects = await CsprojCache.getInstance().getProjectUris();
 
 		// Step 1: exclude self and already-referenced projects
 		const candidates = allProjects.filter(uri =>
@@ -700,8 +785,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 
 		const relativePath = pathModule.relative(sourceDir, pick.uri.fsPath).replace(/\\/g, '/');
 		const updated = addProjectReferenceToCsproj(content, relativePath);
-		await vscode.workspace.fs.writeFile(sourceProject.csprojUri, Buffer.from(updated, 'utf-8'));
-		this.refresh();
+		await this.writeProjectReferenceChanges(sourceProject.csprojUri, content, updated);
 	}
 
 	private async addDraggedProjectReference(targetProject: ProjectNode, draggedProject: ProjectNode): Promise<void> {
@@ -734,7 +818,27 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 
 		const updated = addProjectReferenceToCsproj(content, relativePath);
-		await vscode.workspace.fs.writeFile(targetProject.csprojUri, Buffer.from(updated, 'utf-8'));
+		await this.writeProjectReferenceChanges(targetProject.csprojUri, content, updated);
+	}
+
+	private async writeProjectReferenceChanges(uri: vscode.Uri, original: string, updated: string): Promise<void> {
+		const document = vscode.workspace.textDocuments.find(document => document.uri.toString() === uri.toString());
+		if (document) {
+			if (document.getText() !== original) {
+				throw new Error(`"${uri.fsPath}" changed while preparing project reference edits. Try again.`);
+			}
+			const edit = new vscode.WorkspaceEdit();
+			edit.replace(uri, new vscode.Range(document.positionAt(0), document.positionAt(original.length)), updated);
+			if (!await vscode.workspace.applyEdit(edit)) {
+				throw new Error(`VS Code could not apply project reference edits to "${uri.fsPath}".`);
+			}
+			if (!await document.save()) {
+				throw new Error(`VS Code could not save project reference edits to "${uri.fsPath}".`);
+			}
+		} else {
+			await vscode.workspace.fs.writeFile(uri, Buffer.from(updated, 'utf-8'));
+		}
+		CsprojCache.getInstance().invalidate(uri);
 		this.refresh();
 	}
 
@@ -779,7 +883,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				return;
 			}
 
-			const projectFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+			const projectFiles = await CsprojCache.getInstance().getProjectUris();
 			await vscode.workspace.fs.createDirectory(targetPhysicalBaseUri);
 			await vscode.workspace.fs.rename(sourceProject.folderUri, targetProjectFolderUri, { overwrite: false });
 			await this.updateProjectReferencesAfterPhysicalMove(projectFiles, sourceProject.csprojUri, targetProjectUri);
@@ -818,7 +922,10 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return false;
 		}
 
-		const projectFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+		if (await this.projectFolderContainsOtherProjects(sourceProject)) {
+			return false;
+		}
+		const projectFiles = await CsprojCache.getInstance().getProjectUris();
 		for (const projectFile of projectFiles) {
 			const projectDir = normalizePath(pathModule.dirname(projectFile.fsPath));
 			if (projectDir === sourceFolderPath) {
@@ -830,6 +937,34 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 
 		return true;
+	}
+
+	private async projectFolderContainsOtherProjects(project: ProjectNode): Promise<boolean> {
+		const folderPath = normalizePath(project.folderUri.fsPath);
+		const projectUri = project.csprojUri.toString();
+		if ((await CsprojCache.getInstance().getProjectUris()).some(uri =>
+			uri.toString() !== projectUri && normalizePath(uri.fsPath).startsWith(`${folderPath}/`))) {
+			return true;
+		}
+		const folders = [project.folderUri];
+		while (folders.length > 0) {
+			const folder = folders.pop()!;
+			let entries: [string, vscode.FileType][];
+			try {
+				entries = await vscode.workspace.fs.readDirectory(folder);
+			} catch (error) {
+				if (error instanceof vscode.FileSystemError && error.code === 'FileNotFound') { continue; }
+				throw error;
+			}
+			for (const [name, type] of entries) {
+				const uri = vscode.Uri.joinPath(folder, name);
+				if ((type & vscode.FileType.File) && name.toLowerCase().endsWith('.csproj') &&
+					uri.toString() !== projectUri) { return true; }
+				if ((type & vscode.FileType.Directory) && !(type & vscode.FileType.SymbolicLink) &&
+					!['bin', 'obj', '.dotnet'].includes(name)) { folders.push(uri); }
+			}
+		}
+		return false;
 	}
 
 	private async updateProjectReferencesAfterPhysicalMove(projectFiles: vscode.Uri[], oldProjectUri: vscode.Uri, newProjectUri: vscode.Uri): Promise<void> {
@@ -1053,9 +1188,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			{
 				location: vscode.ProgressLocation.Notification,
 				title: 'Checking central package updates',
-				cancellable: false,
+				cancellable: true,
 			},
-			async progress => this.checkCentralPackageUpdates(node.centralPropsUri, node.representativeCsprojUri!, progress),
+			async (progress, token) => this.checkCentralPackageUpdates(node.centralPropsUri, node.representativeCsprojUri!, progress, token),
 		);
 		this.refresh();
 	}
@@ -1064,22 +1199,25 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		centralPropsUri: vscode.Uri,
 		representativeCsprojUri: vscode.Uri,
 		progress?: vscode.Progress<{ message?: string; increment?: number }>,
+		token?: vscode.CancellationToken,
 	): Promise<void> {
 		const content = await readUtf8(centralPropsUri);
 		const packages = parsePackageVersions(content);
 		progress?.report({ message: `Checking 0/${packages.length}` });
 		let done = 0;
 		await runWithConcurrencyLimit(packages, PACKAGE_CHECK_CONCURRENCY, async packageVersion => {
+			throwIfCancelled(token);
 			const key = this.centralPackageCacheKey(centralPropsUri, packageVersion.name);
 			try {
-				const latest = await getLatestPackageVersion(representativeCsprojUri.fsPath, packageVersion.name);
+				const latest = await getLatestPackageVersion(representativeCsprojUri.fsPath, packageVersion.name, false, token);
 				if (latest && compareVersions(latest, packageVersion.version) > 0) {
 					this.centralPackageUpdateCache.set(key, latest);
 				} else {
 					this.centralPackageUpdateCache.delete(key);
 				}
-			} catch {
-				// Leave the previous result intact when sources are unavailable.
+			} catch (error) {
+				throwIfCancelled(token);
+				console.warn('Could not check central package updates:', error);
 			}
 			done++;
 			progress?.report({ increment: (1 / packages.length) * 100, message: `Checking ${done}/${packages.length}` });
@@ -1100,18 +1238,22 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		csprojUri: vscode.Uri,
 		packageId: string,
 		installedVersion: string,
+		token?: vscode.CancellationToken,
+		checkProject = true,
 	): Promise<{ hasUpdate: boolean; checkFailed: boolean }> {
 		const key = this.packageCacheKey(csprojUri, packageId);
 
 		let latest: string | undefined;
 		let checkFailed = false;
 		try {
-			latest = await getLatestPackageVersion(csprojUri.fsPath, packageId);
-		} catch {
+			latest = await getLatestPackageVersion(csprojUri.fsPath, packageId, false, token, checkProject);
+		} catch (error) {
+			throwIfCancelled(token);
+			console.warn(`Could not check ${packageId} for updates:`, error);
 			checkFailed = true;
 		}
-
-		const dependencies = await getPackageDependencies(csprojUri.fsPath, packageId, installedVersion).catch(() => []);
+		this.packageVersionCache.set(key, installedVersion);
+		this.packageDependencyCache.delete(key);
 
 		const hasUpdate = Boolean(latest && compareVersions(latest, installedVersion) > 0);
 		if (hasUpdate) {
@@ -1120,18 +1262,12 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			this.packageUpdateCache.delete(key);
 		}
 
-		if (dependencies.length > 0) {
-			this.packageDependencyCache.set(key, dependencies);
-		} else if (!checkFailed) {
-			this.packageDependencyCache.delete(key);
-		}
-
 		return { hasUpdate, checkFailed };
 	}
 
-	private async refreshProjectVulnerabilities(csprojUri: vscode.Uri): Promise<boolean> {
+	private async refreshProjectVulnerabilities(csprojUri: vscode.Uri, token?: vscode.CancellationToken): Promise<boolean> {
 		try {
-			const vulnerabilities = await getProjectPackageVulnerabilities(csprojUri.fsPath);
+			const vulnerabilities = await getProjectPackageVulnerabilities(csprojUri.fsPath, token);
 			this.packageVulnerabilityCache.set(
 				csprojUri.toString(),
 				vulnerabilities.map(vulnerability => ({
@@ -1144,7 +1280,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				})),
 			);
 			return true;
-		} catch {
+		} catch (error) {
+			throwIfCancelled(token);
+			console.warn('Could not check project vulnerabilities:', error);
 			return false;
 		}
 	}
@@ -1173,9 +1311,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			{
 				location: vscode.ProgressLocation.Notification,
 				title: `Checking for package updates — ${project.label}`,
-				cancellable: false,
+				cancellable: true,
 			},
-			async progress => {
+			async (progress, token) => {
 				progress.report({ message: 'Reading project packages...' });
 				const content = await readUtf8(project.csprojUri);
 				const packageRefs = parsePackageReferences(content);
@@ -1188,10 +1326,14 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				let failedCount = 0;
 				progress.report({ message: 'Checking configured NuGet sources...' });
 				const [projectUpdates, projectPackages] = await Promise.all([
-					getProjectPackageUpdates(project.csprojUri.fsPath).catch(() => undefined),
-					getProjectPackages(project.csprojUri.fsPath).catch(() => undefined),
+					getProjectPackageUpdates(project.csprojUri.fsPath, token).catch(error => {
+						throwIfCancelled(token); console.warn('Could not list package updates:', error); return undefined;
+					}),
+					getProjectPackages(project.csprojUri.fsPath, token).catch(error => {
+						throwIfCancelled(token); console.warn('Could not list installed packages:', error); return undefined;
+					}),
 				]);
-				await this.refreshProjectVulnerabilities(project.csprojUri);
+				await this.refreshProjectVulnerabilities(project.csprojUri, token);
 
 				const packages = packageRefs.map(pkg => {
 					const resolved = projectPackages?.get(pkg.name.toLowerCase());
@@ -1203,6 +1345,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 
 				let done = 0;
 				await runWithConcurrencyLimit(packages, PACKAGE_CHECK_CONCURRENCY, async pkg => {
+					throwIfCancelled(token);
 					const key = this.packageCacheKey(project.csprojUri, pkg.name);
 					if (pkg.version) {
 						this.packageVersionCache.set(key, pkg.version);
@@ -1221,16 +1364,8 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 							this.packageUpdateCache.delete(key);
 						}
 
-						const dependencies = pkg.version
-							? await getPackageDependencies(project.csprojUri.fsPath, pkg.name, pkg.version, projectPackages).catch(() => [])
-							: [];
-						if (dependencies.length > 0) {
-							this.packageDependencyCache.set(key, dependencies);
-						} else {
-							this.packageDependencyCache.delete(key);
-						}
 					} else if (pkg.version) {
-						({ hasUpdate, checkFailed } = await this.refreshPackageInfo(project.csprojUri, pkg.name, pkg.version));
+						({ hasUpdate, checkFailed } = await this.refreshPackageInfo(project.csprojUri, pkg.name, pkg.version, token, false));
 					} else {
 						checkFailed = true;
 					}
@@ -1244,9 +1379,13 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				});
 				return { kind: 'checked' as const, packagesLength: packages.length, updateCount, failedCount };
 			},
-		);
+		).then(result => result, (error: unknown) => {
+			if (error instanceof vscode.CancellationError) { return undefined; }
+			throw error;
+		});
 
 		this.refresh();
+		if (!result) { return; }
 
 		if (result.kind === 'empty') {
 			vscode.window.showInformationMessage(`CSharp Painkiller: ${project.label} has no NuGet package references.`);
@@ -1288,14 +1427,16 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			{
 				location: vscode.ProgressLocation.Window,
 				title: 'CSharp Painkiller: Checking for NuGet package updates…',
+				cancellable: true,
 			},
-			async progress => {
+			async (progress, token) => {
 				progress.report({ message: 'Finding projects...' });
-						const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+				const csprojFiles = await CsprojCache.getInstance().getProjectUris();
 				const projectTasks: { csprojUri: vscode.Uri; packages: { packageId: string; version?: string }[] }[] = [];
 				let packageCount = 0;
 
 				for (const csprojUri of csprojFiles) {
+					throwIfCancelled(token);
 					try {
 						const content = await readUtf8(csprojUri);
 						const packages: { packageId: string; version?: string }[] = [];
@@ -1306,11 +1447,12 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 							packageCount += packages.length;
 							projectTasks.push({ csprojUri, packages });
 						}
-					} catch {
-						// Skip unreadable project files.
+					} catch (error) {
+						console.warn('Could not read project packages:', error);
 					}
 				}
-				await this.checkAllCentralPackageUpdates(csprojFiles);
+				throwIfCancelled(token);
+				await this.checkAllCentralPackageUpdates(csprojFiles, token);
 
 				if (packageCount === 0) {
 					return { failedCount: 0, packageCount: 0 };
@@ -1324,19 +1466,22 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				};
 				await runWithConcurrencyLimit(projectTasks, PACKAGE_CHECK_CONCURRENCY, async projectTask => {
 					try {
+						throwIfCancelled(token);
 						let projectUpdates: Map<string, { latestVersion: string }> | undefined;
 						let projectPackages: Map<string, PackageInfo> | undefined;
 						try {
-							projectUpdates = await getProjectPackageUpdates(projectTask.csprojUri.fsPath);
-						} catch {
+							projectUpdates = await getProjectPackageUpdates(projectTask.csprojUri.fsPath, token);
+						} catch (error) {
+							throwIfCancelled(token); console.warn('Could not list package updates:', error);
 							projectUpdates = undefined;
 						}
 						try {
-							projectPackages = await getProjectPackages(projectTask.csprojUri.fsPath);
-						} catch {
+							projectPackages = await getProjectPackages(projectTask.csprojUri.fsPath, token);
+						} catch (error) {
+							throwIfCancelled(token); console.warn('Could not list installed packages:', error);
 							projectPackages = undefined;
 						}
-						await this.refreshProjectVulnerabilities(projectTask.csprojUri);
+						await this.refreshProjectVulnerabilities(projectTask.csprojUri, token);
 
 						if (projectUpdates) {
 							for (const pkg of projectTask.packages) {
@@ -1356,19 +1501,12 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 									this.packageUpdateCache.delete(key);
 								}
 
-								const dependencies = version
-									? await getPackageDependencies(projectTask.csprojUri.fsPath, pkg.packageId, version, projectPackages).catch(() => [])
-									: [];
-								if (dependencies.length > 0) {
-									this.packageDependencyCache.set(key, dependencies);
-								} else {
-									this.packageDependencyCache.delete(key);
-								}
 							}
 							return;
 						}
 
 						for (const pkg of projectTask.packages) {
+							throwIfCancelled(token);
 							const resolved = projectPackages?.get(pkg.packageId.toLowerCase());
 							const version = pkg.version ?? resolved?.resolvedVersion ?? resolved?.requestedVersion;
 							if (!version) {
@@ -1377,7 +1515,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 							}
 
 							this.packageVersionCache.set(this.packageCacheKey(projectTask.csprojUri, pkg.packageId), version);
-							const { checkFailed } = await this.refreshPackageInfo(projectTask.csprojUri, pkg.packageId, version);
+							const { checkFailed } = await this.refreshPackageInfo(projectTask.csprojUri, pkg.packageId, version, token, false);
 							if (checkFailed) {
 								failedCount++;
 							}
@@ -1388,8 +1526,12 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 				});
 			return { failedCount, packageCount };
 		},
-		);
+		).then(result => result, (error: unknown) => {
+			if (error instanceof vscode.CancellationError) { return undefined; }
+			throw error;
+		});
 		this.refresh();
+		if (!checkResult) { return; }
 
 		if (checkResult.failedCount > 0) {
 			vscode.window.showWarningMessage(
@@ -1401,12 +1543,13 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	}
 
 
-	private async checkAllCentralPackageUpdates(csprojFiles: vscode.Uri[]): Promise<void> {
+	private async checkAllCentralPackageUpdates(csprojFiles: vscode.Uri[], token?: vscode.CancellationToken): Promise<void> {
 		const propsFiles = await vscode.workspace.findFiles('**/Directory.Packages.props', '{**/bin/**,**/obj/**,**/.dotnet/**}');
 		await Promise.all(propsFiles.map(async centralPropsUri => {
+			throwIfCancelled(token);
 			const representative = await this.findCentralPackageRepresentativeFromFiles(centralPropsUri, csprojFiles);
 			if (representative) {
-				await this.checkCentralPackageUpdates(centralPropsUri, representative);
+				await this.checkCentralPackageUpdates(centralPropsUri, representative, undefined, token);
 			}
 		}));
 	}
@@ -1491,7 +1634,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		version: string,
 	): Promise<void> {
 
-			const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+			const projectUris = await CsprojCache.getInstance().getProjectUris();
 		await Promise.all(projectUris.map(async projectUri => {
 			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(projectUri.fsPath));
 			if (!projectCentralPropsUri || normalizePath(projectCentralPropsUri.fsPath) !== normalizePath(centralPropsUri.fsPath)) {
@@ -1512,7 +1655,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			return;
 		}
 
-			const projectUris = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+			const projectUris = await CsprojCache.getInstance().getProjectUris();
 		const packageReferences = await Promise.all(projectUris.map(async projectUri => {
 			const projectCentralPropsUri = await findCentralPackageVersionsFile(pathModule.dirname(projectUri.fsPath));
 			if (!projectCentralPropsUri || normalizePath(projectCentralPropsUri.fsPath) !== normalizePath(centralPropsUri.fsPath)) {
@@ -1551,8 +1694,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 
 		const content = await readUtf8(item.node.project.csprojUri);
 		const updated = removeProjectReferenceFromCsproj(content, item.node.referencePath);
-		await vscode.workspace.fs.writeFile(item.node.project.csprojUri, Buffer.from(updated, 'utf-8'));
-		this.refresh();
+		await this.writeProjectReferenceChanges(item.node.project.csprojUri, content, updated);
 	}
 
 	private async shouldDeletePhysicalFolder(
@@ -1642,10 +1784,17 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const updated = solutionUri.path.endsWith('.slnx')
 			? removeSlnxProject(content, projectPath)
 			: removeSlnProject(content, projectPath);
+		if (updated === content) {
+			throw new Error(`Could not remove project "${projectPath}" from the solution. No project files were deleted.`);
+		}
 		await vscode.workspace.fs.writeFile(solutionUri, Buffer.from(updated, 'utf-8'));
 	}
 
 	private async addProjectToSolution(solutionUri: vscode.Uri, projectUri: vscode.Uri): Promise<void> {
+		const stat = await vscode.workspace.fs.stat(projectUri);
+		if ((stat.type & vscode.FileType.File) === 0) {
+			throw new Error(`Cannot include project "${projectUri.fsPath}": the path is not a file.`);
+		}
 		const solutionDir = pathModule.dirname(solutionUri.fsPath);
 		const relativeProjectPath = pathModule.relative(solutionDir, projectUri.fsPath).replace(/\\/g, '/');
 		if (solutionUri.path.endsWith('.slnx')) {
@@ -1657,14 +1806,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 
 		const originalContent = await readUtf8(solutionUri);
-		const result = spawnSync('dotnet', ['sln', solutionUri.fsPath, 'add', projectUri.fsPath], {
-			cwd: solutionDir,
-			timeout: 120_000,
-			shell: false,
-		});
-		if (result.error || result.status !== 0) {
-			throw result.error ?? new Error(result.stderr?.toString() || 'Failed to add project to solution');
-		}
+		await vscode.window.withProgress({
+			location: vscode.ProgressLocation.Notification, title: 'Adding project to solution', cancellable: true,
+		}, async (_progress, token) => { await runDotnet(['sln', solutionUri.fsPath, 'add', projectUri.fsPath], solutionDir, token); });
 		const updatedContent = this.removeNewSlnCommentLines(originalContent, await readUtf8(solutionUri));
 		const ensured = ensureSlnFolderPath(updatedContent, getProjectSolutionFolderPath(relativeProjectPath));
 		const updated = ensured.folderGuid
@@ -1682,9 +1826,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 	}
 
 	private async buildTree(): Promise<CsprojTreeNode[]> {
-			const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+		const csprojFiles = await CsprojCache.getInstance().getProjectUris();
 		const projectByPath = new Map(csprojFiles.map(uri => [normalizePath(uri.fsPath), uri]));
-			const solutionFiles = await vscode.workspace.findFiles('**/*.{sln,slnx}', '{**/bin/**,**/obj/**,**/.dotnet/**}');
+		const solutionFiles = await this.discoverSolutions();
 
 		if (solutionFiles.length === 0) {
 			return [];
@@ -1720,7 +1864,7 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		if (vulnerablePackages.children.length > 0) {
 			children.push(vulnerablePackages);
 		}
-		const excludedProjects = await this.createExcludedProjectsNode(solutionUri, solutionDir, entries);
+		const excludedProjects = await this.createExcludedProjectsNode(solutionUri, solutionDir, entries, [...projectByPath.values()]);
 		if (excludedProjects.children.length > 0) {
 			children.push(excludedProjects);
 		}
@@ -1820,11 +1964,11 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		};
 	}
 
-	private async createExcludedProjectsNode(solutionUri: vscode.Uri, solutionDir: string, entries: SlnProjectEntry[]): Promise<ExcludedProjectsNode> {
+	private async createExcludedProjectsNode(solutionUri: vscode.Uri, solutionDir: string, entries: SlnProjectEntry[], projectUris: vscode.Uri[]): Promise<ExcludedProjectsNode> {
 		const includedPaths = new Set(entries
 			.filter(entry => !entry.isSolutionFolder)
 			.map(entry => normalizePath(pathModule.resolve(solutionDir, entry.projectPath))));
-		const excludedProjects = (await vscode.workspace.findFiles('**/*.csproj', '{**/bin/**,**/obj/**,**/.dotnet/**}'))
+		const excludedProjects = projectUris
 			.filter(uri => !includedPaths.has(normalizePath(uri.fsPath)))
 			.map(uri => ({
 				kind: 'excludedProject' as const,
@@ -1959,7 +2103,17 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		const folderUri = csprojUri.with({ path: folderPath });
 		const label = displayName ?? folderPath.split('/').filter(Boolean).pop() ?? csprojUri.fsPath;
 
-		const targetFramework = existsOnDisk ? await this.getTargetFramework(csprojUri) : undefined;
+		const content = existsOnDisk ? await CsprojCache.getInstance().getProjectContent(csprojUri) : '';
+		const targetFramework = content.match(/<TargetFramework>\s*([^<]+?)\s*<\/TargetFramework>/i)?.[1]?.trim()
+			?? content.match(/<TargetFrameworks>\s*([^<]+?)\s*<\/TargetFrameworks>/i)?.[1]?.trim().split(';')[0].trim();
+		const explicitLanguageVersion = content.match(/<LangVersion>\s*([^<]+?)\s*<\/LangVersion>/i)?.[1]?.trim();
+		const metadata = content.replace(/<!--[\s\S]*?-->/g, '');
+		const isAspNet = /Microsoft\.NET\.Sdk\.Web|Microsoft\.AspNetCore/i.test(metadata);
+		const isTest = /<IsTestProject>\s*true\s*<\/IsTestProject>/i.test(metadata) ||
+			/Microsoft\.NET\.Test\.Sdk|xunit|nunit|MSTest\.TestFramework|MSTest\.TestAdapter/i.test(metadata);
+		const isMaui = /<UseMaui\b[^>]*>\s*true\s*<\/UseMaui>/i.test(metadata);
+		const projectTag = metadata.match(/<Project\b(?:[^>"']|"[^"]*"|'[^']*')*>/)?.[0] ?? '';
+		const isBlazor = parseAttributes(projectTag).get('Sdk') === 'Microsoft.NET.Sdk.BlazorWebAssembly';
 
 		return {
 			kind: 'project',
@@ -1970,62 +2124,14 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 			projectPath,
 			existsOnDisk,
 			solutionProjectPaths,
-			isAspNet: existsOnDisk ? await this.isAspNetProject(csprojUri) : false,
-			isTest: existsOnDisk ? await this.isTestProject(csprojUri) : false,
+			isAspNet,
+			isTest,
+			isBlazor,
+			isMaui,
 			virtualPath,
 			targetFramework,
-			languageVersion: existsOnDisk ? await this.getLanguageVersion(csprojUri) : undefined,
+			languageVersion: existsOnDisk ? formatLanguageVersion(explicitLanguageVersion) : undefined,
 		};
-	}
-
-	private async isAspNetProject(csprojUri: vscode.Uri): Promise<boolean> {
-		try {
-			const bytes = await vscode.workspace.fs.readFile(csprojUri);
-			const content = Buffer.from(bytes).toString('utf-8');
-			return /Microsoft\.NET\.Sdk\.Web|Microsoft\.AspNetCore/i.test(content);
-		} catch {
-			return false;
-		}
-	}
-
-	private async isTestProject(csprojUri: vscode.Uri): Promise<boolean> {
-		try {
-			const bytes = await vscode.workspace.fs.readFile(csprojUri);
-			const content = Buffer.from(bytes).toString('utf-8');
-			return /<IsTestProject>\s*true\s*<\/IsTestProject>/i.test(content) ||
-				/Microsoft\.NET\.Test\.Sdk|xunit|nunit|MSTest\.TestFramework|MSTest\.TestAdapter/i.test(content);
-		} catch {
-			return false;
-		}
-	}
-
-	private async getTargetFramework(csprojUri: vscode.Uri): Promise<string | undefined> {
-		try {
-			const bytes = await vscode.workspace.fs.readFile(csprojUri);
-			const content = Buffer.from(bytes).toString('utf-8');
-			const single = content.match(/<TargetFramework>\s*([^<]+?)\s*<\/TargetFramework>/i);
-			if (single) {
-				return single[1].trim();
-			}
-			const multi = content.match(/<TargetFrameworks>\s*([^<]+?)\s*<\/TargetFrameworks>/i);
-			if (multi) {
-				return multi[1].trim().split(';')[0].trim();
-			}
-			return undefined;
-		} catch {
-			return undefined;
-		}
-	}
-
-	private async getLanguageVersion(csprojUri: vscode.Uri): Promise<string | undefined> {
-		try {
-			const bytes = await vscode.workspace.fs.readFile(csprojUri);
-			const content = Buffer.from(bytes).toString('utf-8');
-			const explicitVersion = content.match(/<LangVersion>\s*([^<]+?)\s*<\/LangVersion>/i)?.[1]?.trim();
-			return formatLanguageVersion(explicitVersion);
-		} catch {
-			return undefined;
-		}
 	}
 
 	dispose(): void {
@@ -2037,7 +2143,9 @@ export class CsprojProjectsTreeProvider implements vscode.TreeDataProvider<Cspro
 		}
 		this.watcher.dispose();
 		this.solutionWatcher.dispose();
-		this.workspaceDeleteWatcher.dispose();
+		this.propsWatcher.dispose();
+		this.treeCache.clear();
+		this.treeItems.clear();
 		this.changeEmitter.dispose();
 	}
 }
@@ -2214,9 +2322,13 @@ export class CsprojProjectTreeItem extends vscode.TreeItem {
 
 		const iconName = this.node.isTest
 			? 'dotnetTestsFolder.svg'
-			: this.node.isAspNet
-				? 'dotnetAspNetFolder.svg'
-				: 'dotnetDefaultFolder.svg';
+			: this.node.isMaui
+				? 'dotnetMauiFolder.png'
+				: this.node.isBlazor
+					? 'dotnetBlazorFolder.png'
+					: this.node.isAspNet
+						? 'dotnetAspNetFolder.svg'
+						: 'dotnetDefaultFolder.svg';
 		this.iconPath = vscode.Uri.joinPath(extensionUri, 'icons', iconName);
 	}
 }
@@ -2229,7 +2341,7 @@ function getCollapsibleState(node: CsprojTreeNode): vscode.TreeItemCollapsibleSt
 		return vscode.TreeItemCollapsibleState.Collapsed;
 	}
 	if (node.kind === 'packageReference') {
-		return node.dependencies && node.dependencies.length > 0
+		return node.dependencies === undefined || node.dependencies.length > 0
 			? vscode.TreeItemCollapsibleState.Collapsed
 			: vscode.TreeItemCollapsibleState.None;
 	}
@@ -2446,7 +2558,7 @@ function ensureSlnFolderPath(content: string, folderPath: string | undefined): {
 	return { content: updated, folderGuid: parentGuid };
 }
 
-function removeSlnFolder(content: string, folderGuid: string): string {
+export function removeSlnFolder(content: string, folderGuid: string): string {
 	const guid = folderGuid.toUpperCase();
 	const entries = parseSlnProjects(content);
 	const removedGuids = new Set<string>([guid]);
@@ -2461,38 +2573,18 @@ function removeSlnFolder(content: string, folderGuid: string): string {
 		}
 	}
 
-	const folderProjectRegex = new RegExp(
-		'Project\\("\\{[^}]+\\}"\\)\\s*=\\s*"[^"]+",\\s*"[^"]+",\\s*"\\{([^}]+)\\}"\\r?\\nEndProject\\r?\\n?',
-		'g'
-	);
-	let updated = content.replace(folderProjectRegex, (block, entryGuid: string) =>
+	const projectBlockRegex = /^Project\("\{[^}]+\}"\)\s*=\s*"[^"]+",\s*"[^"]+",\s*"\{([^}]+)\}"[ \t]*\r?\n[\s\S]*?^EndProject[ \t]*(?:\r?\n|$)/gm;
+	const updated = content.replace(projectBlockRegex, (block, entryGuid: string) =>
 		removedGuids.has(entryGuid.toUpperCase()) ? '' : block
 	);
-
-	updated = updated.replace(
-		/GlobalSection\(NestedProjects\)\s*=\s*preSolution([\s\S]*?)EndGlobalSection/g,
-		(_section, body: string) => {
-			const rewrittenLines = body.split(/\r?\n/).filter(line => {
-				const match = line.match(/\{([^}]+)\}\s*=\s*\{([^}]+)\}/);
-				return !match
-					|| (!removedGuids.has(match[1].toUpperCase()) && !removedGuids.has(match[2].toUpperCase()));
-			});
-			const meaningfulLines = rewrittenLines.filter(line => line.trim().length > 0);
-			if (meaningfulLines.length === 0) {
-				return '';
-			}
-			return `GlobalSection(NestedProjects) = preSolution${rewrittenLines.join('\n')}EndGlobalSection`;
-		}
-	);
-
-	return updated;
+	return removeSlnProjectGuidReferences(updated, removedGuids);
 }
 
-function removeSlnProject(content: string, projectPath: string): string {
+export function removeSlnProject(content: string, projectPath: string): string {
 	const normalizedProjectPath = normalizeSolutionFolderPath(projectPath);
-	const projectRegex = /^Project\("\{[^}]+\}"\)\s*=\s*"[^"]+",\s*"([^"]+)",\s*"\{([^}]+)\}"\r?\nEndProject\r?\n?/gm;
+	const projectRegex = /^Project\("\{[^}]+\}"\)\s*=\s*"[^"]+",\s*"([^"]+)",\s*"\{([^}]+)\}"[ \t]*\r?\n[\s\S]*?^EndProject[ \t]*(?:\r?\n|$)/gm;
 	let projectGuid: string | undefined;
-	let updated = content.replace(projectRegex, (block, candidatePath: string, guid: string) => {
+	const updated = content.replace(projectRegex, (block, candidatePath: string, guid: string) => {
 		if (normalizeSolutionFolderPath(candidatePath) !== normalizedProjectPath) {
 			return block;
 		}
@@ -2500,20 +2592,21 @@ function removeSlnProject(content: string, projectPath: string): string {
 		return '';
 	});
 
-	if (projectGuid) {
-		updated = updated.replace(
-			/GlobalSection\(NestedProjects\)\s*=\s*preSolution([\s\S]*?)EndGlobalSection/g,
-			(_section, body: string) => {
-				const lines = body.split(/\r?\n/).filter(line => !line.toUpperCase().includes(`{${projectGuid}}`));
-				const meaningfulLines = lines.filter(line => line.trim().length > 0);
-				return meaningfulLines.length > 0
-					? `GlobalSection(NestedProjects) = preSolution${lines.join('\n')}EndGlobalSection`
-					: '';
-			}
-		);
-	}
+	return projectGuid ? removeSlnProjectGuidReferences(updated, new Set([projectGuid])) : updated;
+}
 
-	return updated;
+function removeSlnProjectGuidReferences(content: string, removedGuids: ReadonlySet<string>): string {
+	const updated = content.replace(
+		/^[ \t]*\{([^}]+)\}(?:\.[^\r\n=]+)?[ \t]*=[ \t]*([^\r\n]*)(?:\r?\n|$)/gm,
+		(line, guid: string, value: string) => {
+			const parentGuid = value.match(/^\{([^}]+)\}/)?.[1];
+			return removedGuids.has(guid.toUpperCase()) || (parentGuid && removedGuids.has(parentGuid.toUpperCase())) ? '' : line;
+		},
+	);
+	return updated.replace(
+		/^[ \t]*GlobalSection\(NestedProjects\)[ \t]*=[ \t]*preSolution[ \t]*\r?\n(?:[ \t]*\r?\n)*[ \t]*EndGlobalSection[ \t]*(?:\r?\n|$)/gm,
+		'',
+	);
 }
 
 function moveSlnProject(content: string, oldProjectPath: string, newProjectPath: string, folderGuid?: string): string {
@@ -3094,20 +3187,7 @@ function parsePackageVersions(content: string): { name: string; version: string 
 }
 
 export function getCentralPackageVersion(content: string, packageId: string): string | undefined {
-	const escapedId = escapeRegExp(packageId);
-	const regex = new RegExp(`<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*)>([\\s\\S]*?)<\\/PackageVersion>|<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\5[^>]*)\\/>`, 'i');
-	const match = content.match(regex);
-	if (!match) {
-		return undefined;
-	}
-
-	const attributes = match[1] ?? match[4] ?? '';
-	const attributeVersion = attributes.match(/\bVersion\s*=\s*(['"])(.*?)\1/i)?.[2]?.trim();
-	if (attributeVersion) {
-		return attributeVersion;
-	}
-
-	return match[3]?.match(/<Version>\s*([^<]+?)\s*<\/Version>/i)?.[1]?.trim();
+	return parsePackageVersions(content).find(entry => entry.name.toLowerCase() === packageId.toLowerCase())?.version;
 }
 
 export function addPackageVersionToProps(content: string, packageId: string, version: string): string {
@@ -3209,33 +3289,8 @@ function hasLocalPackageReferenceVersion(content: string, packageId: string): bo
 	return false;
 }
 
-function updatePackageVersionInProps(content: string, packageId: string, newVersion: string): string {
-	const escapedId = escapeRegExp(packageId);
-	const selfClosingRegex = new RegExp(`<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*)\\/>`, 'i');
-	let match = content.match(selfClosingRegex);
-	if (match) {
-		const originalTag = match[0];
-		const updatedTag = /\bVersion\s*=\s*(['"])[^'"]*\1/i.test(originalTag)
-			? originalTag.replace(/\bVersion\s*=\s*(['"])[^'"]*\1/i, (_versionAttr, quote: string) => `Version=${quote}${escapeXml(newVersion)}${quote}`)
-			: originalTag.replace(/\s*\/>$/, ` Version="${escapeXml(newVersion)}" />`);
-		const index = match.index ?? 0;
-		return content.slice(0, index) + updatedTag + content.slice(index + originalTag.length);
-	}
-
-	const pairedRegex = new RegExp(`<PackageVersion\\b([^>]*\\b(?:Include|Update)=(['"])${escapedId}\\2[^>]*)>([\\s\\S]*?)<\\/PackageVersion>`, 'i');
-	match = content.match(pairedRegex);
-	if (!match) {
-		return content;
-	}
-
-	const originalTag = match[0];
-	const body = match[3];
-	const updatedBody = /<Version>[^<]*<\/Version>/i.test(body)
-		? body.replace(/<Version>[^<]*<\/Version>/i, `<Version>${escapeXml(newVersion)}</Version>`)
-		: `${body}\n    <Version>${escapeXml(newVersion)}</Version>`;
-	const updatedTag = originalTag.replace(body, updatedBody);
-	const index = match.index ?? 0;
-	return content.slice(0, index) + updatedTag + content.slice(index + originalTag.length);
+export function updatePackageVersionInProps(content: string, packageId: string, newVersion: string): string {
+	return updatePackageElementVersion(content, 'PackageVersion', packageId, newVersion);
 }
 
 /**
@@ -3244,29 +3299,26 @@ function updatePackageVersionInProps(content: string, packageId: string, newVers
  * Returns `content` unchanged if the package reference can't be found.
  */
 export function updatePackageReferenceVersionInCsproj(content: string, packageId: string, newVersion: string): string {
-	const escapedId = escapeRegExp(packageId);
-	const pairedRegex = new RegExp(`<PackageReference\\b[^>]*\\b(?:Include|Update)=(["'])${escapedId}\\1[^>]*>([\\s\\S]*?)<\\/PackageReference>`, 'i');
-	let match = content.match(pairedRegex);
-	if (match) {
-		const originalElement = match[0];
+	return updatePackageElementVersion(content, 'PackageReference', packageId, newVersion);
+}
+
+function updatePackageElementVersion(
+	content: string, element: 'PackageReference' | 'PackageVersion', packageId: string, newVersion: string,
+): string {
+	const regex = new RegExp(`<${element}\\b([^>]*?)(?:\\/>|>([\\s\\S]*?)<\\/${element}>)`, 'gi');
+	for (const match of content.matchAll(regex)) {
+		const attributes = parseAttributes(match[1]);
+		const name = attributes.get('Include') ?? attributes.get('Update');
+		if (name?.toLowerCase() !== packageId.toLowerCase()) { continue; }
+		const original = match[0];
+		const openingEnd = original.indexOf('>') + 1;
 		const body = match[2];
-		const updatedElement = /<Version>[^<]*<\/Version>/i.test(body)
-			? originalElement.replace(/<Version>[^<]*<\/Version>/i, `<Version>${escapeXml(newVersion)}</Version>`)
-			: updatePackageReferenceOpeningTag(originalElement, newVersion);
-		const index = match.index ?? 0;
-		return content.slice(0, index) + updatedElement + content.slice(index + originalElement.length);
+		const updated = body !== undefined && /<Version>[^<]*<\/Version>/i.test(body)
+			? original.slice(0, openingEnd) + body.replace(/<Version>[^<]*<\/Version>/i, `<Version>${escapeXml(newVersion)}</Version>`) + `</${element}>`
+			: updatePackageReferenceOpeningTag(original.slice(0, openingEnd), newVersion) + original.slice(openingEnd);
+		return content.slice(0, match.index) + updated + content.slice(match.index + original.length);
 	}
-
-	const tagRegex = new RegExp(`<PackageReference\\b[^>]*\\b(?:Include|Update)=(["'])${escapedId}\\1[^>]*/>`, 'i');
-	match = content.match(tagRegex);
-	if (!match) {
-		return content;
-	}
-
-	const originalTag = match[0];
-	const updatedTag = updatePackageReferenceOpeningTag(originalTag, newVersion);
-	const index = match.index ?? 0;
-	return content.slice(0, index) + updatedTag + content.slice(index + originalTag.length);
+	return content;
 }
 
 function updatePackageReferenceOpeningTag(originalTag: string, newVersion: string): string {
@@ -3363,6 +3415,8 @@ function parseDraggedProjects(raw: string): ProjectNode[] {
 				solutionProjectPaths: new Set<string>(),
 				isAspNet: project.isAspNet,
 				isTest: project.isTest,
+				isBlazor: project.isBlazor,
+				isMaui: project.isMaui,
 				virtualPath: project.virtualPath,
 			}));
 	} catch {
@@ -3383,6 +3437,8 @@ function isDraggedProjectPayload(value: unknown): value is DraggedProjectPayload
 		typeof candidate.projectPath === 'string' &&
 		typeof candidate.isAspNet === 'boolean' &&
 		typeof candidate.isTest === 'boolean' &&
+		typeof candidate.isBlazor === 'boolean' &&
+		typeof candidate.isMaui === 'boolean' &&
 		(candidate.virtualPath === undefined || typeof candidate.virtualPath === 'string');
 }
 
@@ -3424,6 +3480,7 @@ function escapeRegExp(value: string): string {
 }
 
 async function readUtf8(uri: vscode.Uri): Promise<string> {
+	if (uri.path.endsWith('.csproj')) { return CsprojCache.getInstance().getProjectContent(uri); }
 	const bytes = await vscode.workspace.fs.readFile(uri);
 	return Buffer.from(bytes).toString('utf-8');
 }

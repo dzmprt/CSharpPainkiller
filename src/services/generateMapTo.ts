@@ -1,8 +1,11 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { extractFileNamespace } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
 import { coerceTypeName } from '../utils/sharedUtilities.js';
 import { findTypeInWorkspaceWithOptions } from '../utils/typeSearch.js';
+import { getPublicPropertyAccessors, stripComments } from '../utils/contentParser.js';
+
+export { stripComments } from '../utils/contentParser.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -34,39 +37,30 @@ export type MapFromMode = 'static' | 'constructor';
 
 /** Canonical alias map: System type names and BCL aliases → C# keyword. */
 const TYPE_ALIASES: Record<string, string> = {
-	'system.string':  'string',
-	'system.int32':   'int',
-	'system.int64':   'long',
-	'system.int16':   'short',
-	'system.uint32':  'uint',
-	'system.uint64':  'ulong',
-	'system.uint16':  'ushort',
-	'system.single':  'float',
-	'system.double':  'double',
-	'system.decimal': 'decimal',
-	'system.boolean': 'bool',
-	'system.byte':    'byte',
-	'system.sbyte':   'sbyte',
-	'system.char':    'char',
-	'system.object':  'object',
-	'int32':   'int',
-	'int64':   'long',
-	'int16':   'short',
-	'uint32':  'uint',
-	'uint64':  'ulong',
-	'uint16':  'ushort',
-	'single':  'float',
-	'boolean': 'bool',
+	'System.String':  'string', String: 'string',
+	'System.Int32':   'int', Int32: 'int',
+	'System.Int64':   'long', Int64: 'long',
+	'System.Int16':   'short', Int16: 'short',
+	'System.UInt32':  'uint', UInt32: 'uint',
+	'System.UInt64':  'ulong', UInt64: 'ulong',
+	'System.UInt16':  'ushort', UInt16: 'ushort',
+	'System.Single':  'float', Single: 'float',
+	'System.Double':  'double', Double: 'double',
+	'System.Decimal': 'decimal', Decimal: 'decimal',
+	'System.Boolean': 'bool', Boolean: 'bool',
+	'System.Byte':    'byte', Byte: 'byte',
+	'System.SByte':   'sbyte', SByte: 'sbyte',
+	'System.Char':    'char', Char: 'char',
+	'System.Object':  'object', Object: 'object',
 };
 
 /**
- * Normalises a C# type name to a canonical lowercase form.
- * Strips whitespace, resolves BCL aliases, lowercases.
+ * Strips whitespace and resolves BCL aliases without changing identifier casing.
  * Does NOT strip trailing `?` — nullable is kept as-is so callers can detect it.
  */
 function normaliseType(t: string): string {
-	const clean = t.replace(/\s+/g, '').toLowerCase();
-	return TYPE_ALIASES[clean] ?? clean;
+	const clean = t.replace(/\s+/g, '');
+	return Object.hasOwn(TYPE_ALIASES, clean) ? TYPE_ALIASES[clean] : clean;
 }
 
 /** Returns true if the normalised type name ends with `?`. */
@@ -132,7 +126,7 @@ function buildScalarConversion(
 // Collection detection helpers
 // ---------------------------------------------------------------------------
 
-const LIST_LIKE_RE  = /^(?:list|ienumerable|ilist|icollection|ireadonlylist|ireadonlycollection)<(.+)>$/;
+const LIST_LIKE_RE  = /^(?:List|IEnumerable|IList|ICollection|IReadOnlyList|IReadOnlyCollection)<(.+)>$/;
 const ARRAY_RE      = /^(.+)\[\]$/;
 
 interface CollectionInfo {
@@ -160,7 +154,7 @@ function detectCollection(norm: string, orig: string): CollectionInfo | null {
 		// Recover original element type from orig<...>
 		const origMatch = orig.replace(/\s+/g, '').match(/^[^<]+<(.+)>$/);
 		const elemOrig  = origMatch ? origMatch[1] : elemNorm;
-		const kind: CollectionInfo['kind'] = norm.startsWith('list<') ? 'list' : 'enumerable';
+		const kind: CollectionInfo['kind'] = norm.startsWith('List<') ? 'list' : 'enumerable';
 		return { elemNorm, elemOrig, kind };
 	}
 
@@ -177,8 +171,7 @@ function detectCollection(norm: string, orig: string): CollectionInfo | null {
  *
  * Handles:
  *  - Same type                          → direct
- *  - T  → T?   or  T? → T              → direct / .Value
- *  - T? → U  (unwraps nullable first)  → (expr).Value converted to U
+ *  - Nullable targets preserve null; non-nullable targets reject null.
  *  - numeric ↔ numeric                 → explicit cast
  *  - numeric/bool/char → string         → .ToString()
  *  - string → numeric/bool              → Type.Parse(...)
@@ -205,20 +198,13 @@ function buildConversion(expr: string, srcType: string, tgtType: string): string
 		return expr;
 	}
 
-	// T? → T  (e.g. int? → int)
-	if (srcIsNullable && !tgtIsNullable && srcBase === tgtBase) {
-		return `${expr}.Value`;
-	}
-
-	// T? → U  or  T? → U?  — unwrap source nullable, then convert
 	if (srcIsNullable) {
-		// Recover original base type for tgtOrig (strip ? from original string)
-		const srcBaseOrig = srcType.replace(/\s+/g, '').endsWith('?')
-			? srcType.replace(/\s+/g, '').slice(0, -1)
-			: srcType;
-		const innerExpr = `${expr}.Value`;
-		const innerConv = buildConversion(innerExpr, srcBaseOrig, tgtType);
-		return innerConv;
+		const srcBaseOrig = srcType.replace(/\s+/g, '').slice(0, -1);
+		const tgtBaseOrig = tgtIsNullable ? tgtType.replace(/\s+/g, '').slice(0, -1) : tgtType;
+		const nonNull = `(${expr} ?? throw new global::System.InvalidOperationException("Cannot map a null value to a non-nullable target."))`;
+		const conversion = buildConversion(nonNull, srcBaseOrig, tgtBaseOrig);
+		if (conversion === null) { return null; }
+		return tgtIsNullable ? `${expr} is null ? (${tgtType})null : ${conversion}` : conversion;
 	}
 
 	// T → U?  — convert T → U, result is implicitly assignable to U?
@@ -264,82 +250,6 @@ function buildConversion(expr: string, srcType: string, tgtType: string): string
 // Parsing helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Removes comments and string literals from C# source while keeping all
- * character offsets intact (every removed character is replaced with a space,
- * newlines are preserved). This ensures that char-offset → line/col conversions
- * via vscode.TextDocument.positionAt() remain valid.
- */
-export function stripComments(content: string): string {
-	let result = '';
-	let i = 0;
-	const len = content.length;
-
-	while (i < len) {
-		// Block comment /* ... */
-		if (content[i] === '/' && i + 1 < len && content[i + 1] === '*') {
-			const start = i;
-			i += 2;
-			while (i < len && !(content[i - 1] === '*' && content[i] === '/')) {
-				i++;
-			}
-			i++; // skip closing '/'
-			for (let j = start; j < i; j++) {
-				result += content[j] === '\n' ? '\n' : ' ';
-			}
-			continue;
-		}
-
-		// Single-line comment // ...
-		if (content[i] === '/' && i + 1 < len && content[i + 1] === '/') {
-			const start = i;
-			while (i < len && content[i] !== '\n') { i++; }
-			for (let j = start; j < i; j++) { result += ' '; }
-			continue;
-		}
-
-		// Verbatim string @"..." (must come before regular string check)
-		if (content[i] === '@' && i + 1 < len && content[i + 1] === '"') {
-			const start = i;
-			i += 2;
-			while (i < len) {
-				if (content[i] === '"' && i + 1 < len && content[i + 1] === '"') {
-					i += 2; // escaped "" inside verbatim
-				} else if (content[i] === '"') {
-					i++;
-					break;
-				} else {
-					i++;
-				}
-			}
-			for (let j = start; j < i; j++) {
-				result += content[j] === '\n' ? '\n' : ' ';
-			}
-			continue;
-		}
-
-		// Regular string literal "..."
-		if (content[i] === '"') {
-			const start = i;
-			i++; // skip opening quote
-			while (i < len && content[i] !== '"') {
-				if (content[i] === '\\') { i++; } // escape sequence — skip next char too
-				i++;
-			}
-			i++; // skip closing quote
-			for (let j = start; j < i; j++) {
-				result += content[j] === '\n' ? '\n' : ' ';
-			}
-			continue;
-		}
-
-		result += content[i];
-		i++;
-	}
-
-	return result;
-}
-
 function findMatchingBrace(content: string, openPos: number): number {
 	let depth = 0;
 	for (let i = openPos; i < content.length; i++) {
@@ -372,35 +282,45 @@ function extractTypeBody(content: string, typeName: string): string | undefined 
 	return undefined;
 }
 
-function extractFields(typeBody: string, rawContent: string, typeName: string): FieldInfo[] {
-	const results: FieldInfo[] = [];
+function extractFields(typeBody: string, rawContent: string, typeName: string): ParsedFields {
+	const results: ParsedFields = [];
 
 	const propRegex =
-		/\bpublic\s+(?:required\s+)?(?:readonly\s+)?(?:static\s+)?(?:override\s+)?(?:virtual\s+)?(?:new\s+)?([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{[^}]*\}(?:\s*=\s*[^;{}]*)?|(?:\s*=\s*[^;{}]*)?;)/g;
+		/\bpublic\s+((?:(?:required|readonly|static|override|virtual|new|sealed)\s+)*)([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?:\{[^}]*\}(?:\s*=\s*[^;{}]*)?|=>[^;]*;|(?:\s*=\s*[^;{}]*)?;)/g;
 
 	let m: RegExpExecArray | null;
 	while ((m = propRegex.exec(typeBody)) !== null) {
-		const rawType = m[1].trim();
-		const name    = m[2].trim();
+		if (/\bstatic\b/.test(m[1])) { continue; }
+		const rawType = m[2].trim();
+		const name    = m[3].trim();
 
 		if (/^(class|struct|record|enum|interface|delegate|event|void|operator)$/.test(rawType)) { continue; }
 		if (/^(if|else|return|new|this|base|var|null|true|false)$/.test(name)) { continue; }
 
-		const accessors = m[0].match(/\{([^}]*)\}/)?.[1] ?? '';
-		const getter = accessors.match(/(?:^|\s)(?:(public|private|protected|internal)\s+)?get\s*[;{]/);
-		const setter = accessors.match(/(?:^|\s)(?:(public|private|protected|internal)\s+)?(?:set|init)\s*[;{]/);
+		let canRead = true;
+		let canWrite = false;
+		const brace = m[0].indexOf('{');
+		if (brace >= 0) {
+			const start = m.index + brace;
+			const end = findMatchingBrace(typeBody, start);
+			if (end < 0) { continue; }
+			const accessors = getPublicPropertyAccessors(typeBody.slice(start + 1, end));
+			canRead = accessors.hasGet;
+			canWrite = accessors.hasSet || accessors.hasInit;
+			propRegex.lastIndex = end + 1;
+		}
 		results.push({
 			name,
 			typeName: rawType,
-			canRead: !getter || !getter[1] || getter[1] === 'public',
-			canWrite: !!setter && (!setter[1] || setter[1] === 'public'),
+			canRead,
+			canWrite,
 		});
 	}
 
 	// Primary constructor parameters for records
 	const stripped     = stripComments(rawContent);
 	const escaped      = escapeRe(typeName);
-	const recordCtorRe = new RegExp(`\\brecord\\b(?:\\s+(?:struct|class))?\\s+${escaped}\\s*\\(([^)]*)\\)`, 'm');
+	const recordCtorRe = new RegExp(`\\brecord\\b(?:\\s+(?:struct|class))?\\s+${escaped}(?:\\s*<[^>]*>)?\\s*\\(([^)]*)\\)`, 'm');
 	const recordMatch  = recordCtorRe.exec(stripped);
 	if (recordMatch) {
 		const paramRegex = /([\w<>\[\]?,.\s]+?)\s+([A-Za-z_][A-Za-z0-9_]*)(?:\s*=\s*[^,)]+)?(?:,|$)/g;
@@ -443,7 +363,7 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 		constructors.push({ parameters });
 	}
 
-	(results as ParsedFields).constructors = constructors;
+	results.constructors = constructors;
 
 	return results;
 }
@@ -451,6 +371,13 @@ function extractFields(typeBody: string, rawContent: string, typeName: string): 
 // ---------------------------------------------------------------------------
 // Code generation
 // ---------------------------------------------------------------------------
+
+export function buildMappingProperties(fields: FieldInfo[], eol: string): string {
+	return fields
+		.filter(field => field.canRead !== false)
+		.map(field => `    public ${field.typeName} ${field.name} { get; init; }`)
+		.join(eol);
+}
 
 function buildAssignmentLines(
 	sourceFields: FieldInfo[],
@@ -503,35 +430,15 @@ function buildConstructorExpression(
 	sourcePrefix = 'source.',
 	argumentIndent = indent
 ): string[] | undefined {
-	const constructors = (targetFields as ParsedFields).constructors ?? [];
-	if (targetFields.length === 0 || targetFields.some(field => field.canWrite !== false)) { return undefined; }
-
-	const sourceMap = new Map(sourceFields.filter(field => field.canRead !== false).map(field => [field.name.toLowerCase(), field]));
-	let best: ConstructorInfo | undefined;
-	let bestMatches = 0;
-	for (const constructor of constructors) {
-		const matches = constructor.parameters.filter(parameter => sourceMap.has(parameter.name.toLowerCase())).length;
-		if (matches > bestMatches) {
-			best = constructor;
-			bestMatches = matches;
-		}
-	}
-	if (!best) { return undefined; }
-
-	const targetMap = new Map(targetFields.map(field => [field.name.toLowerCase(), field]));
-	const args = best.parameters.map(parameter => {
-		const sourceField = sourceMap.get(parameter.name.toLowerCase());
-		const targetField = targetMap.get(parameter.name.toLowerCase());
-		if (sourceField && targetField) {
-			return buildConversion(`${sourcePrefix}${sourceField.name}`, sourceField.typeName, parameter.typeName)
-				?? defaultConstructorArgument(parameter.typeName);
-		}
-		return defaultConstructorArgument(parameter.typeName);
-	});
+	const args = buildConstructorArguments(sourceFields, targetFields, sourcePrefix);
+	if (!args) { return undefined; }
+	const assignments = buildAssignmentLines(sourceFields, targetFields, sourcePrefix, indent);
 	return [
 		`${indent}return new ${targetTypeName}(`,
 		...args.map((arg, index) => `${argumentIndent}${arg}${index === args.length - 1 ? '' : ','}`),
-		`${indent});`,
+		...(assignments.length > 0
+			? [`${indent})`, `${indent}{`, ...assignments, `${indent}};`]
+			: [`${indent});`]),
 	];
 }
 
@@ -541,11 +448,14 @@ function buildConstructorArguments(
 	sourcePrefix: string
 ): string[] | undefined {
 	const constructors = (targetFields as ParsedFields).constructors ?? [];
-	if (targetFields.length === 0 || targetFields.some(field => field.canWrite !== false)) { return undefined; }
+	if (constructors.length === 0 ||
+		(targetFields.some(field => field.canWrite !== false) && constructors.some(ctor => ctor.parameters.length === 0))) {
+		return undefined;
+	}
 
 	const sourceMap = new Map(sourceFields.filter(field => field.canRead !== false).map(field => [field.name.toLowerCase(), field]));
 	let best: ConstructorInfo | undefined;
-	let bestMatches = 0;
+	let bestMatches = -1;
 	for (const constructor of constructors) {
 		const matches = constructor.parameters.filter(parameter => sourceMap.has(parameter.name.toLowerCase())).length;
 		if (matches > bestMatches) {
@@ -555,11 +465,9 @@ function buildConstructorArguments(
 	}
 	if (!best) { return undefined; }
 
-	const targetMap = new Map(targetFields.map(field => [field.name.toLowerCase(), field]));
 	return best.parameters.map(parameter => {
 		const sourceField = sourceMap.get(parameter.name.toLowerCase());
-		const targetField = targetMap.get(parameter.name.toLowerCase());
-		if (sourceField && targetField) {
+		if (sourceField) {
 			return buildConversion(`${sourcePrefix}${sourceField.name}`, sourceField.typeName, parameter.typeName)
 				?? defaultConstructorArgument(parameter.typeName);
 		}
@@ -611,6 +519,8 @@ export function buildMapFromMethod(
 	const methodName = `MapFrom${targetTypeName}`;
 	const constructor = buildConstructorExpression(sourceTypeName, targetFields, sourceFields, i2);
 	if (mode === 'constructor') {
+		const assignments = buildAssignmentLines(targetFields, sourceFields, 'source.', i1)
+			.map(line => line.endsWith(',') ? line.slice(0, -1) + ';' : line + ';');
 		const constructorArgs = buildConstructorArguments(targetFields, sourceFields, 'source.');
 		if (constructorArgs) {
 			return [
@@ -618,11 +528,10 @@ export function buildMapFromMethod(
 				...constructorArgs.map((arg, index) => `${i2}${arg}${index === constructorArgs.length - 1 ? '' : ','}`),
 				`${i1})`,
 				`${i1}{`,
+				...assignments,
 				`${i1}}`,
 			].join(eol);
 		}
-		const assignments = buildAssignmentLines(targetFields, sourceFields, 'source.', i1)
-			.map(line => line.endsWith(',') ? line.slice(0, -1) + ';' : line + ';');
 		return [
 			`${i1}public ${sourceTypeName}(${targetTypeName} source)`,
 			`${i1}{`,
@@ -680,6 +589,7 @@ interface MappingContext {
 	targetTypeName: string;
 	targetFields: FieldInfo[];
 	targetNamespace: string;
+	targetDocument: vscode.TextDocument;
 	eol: string;
 	document: vscode.TextDocument;
 	insertionPosition: vscode.Position;
@@ -693,7 +603,7 @@ async function resolveMappingContext(
 	const eol = content.includes('\r\n') ? '\r\n' : '\n';
 
 	// 1. Source type
-	const sourceTypeName = coerceTypeName(explicitSourceTypeName) ?? detectPrimaryTypeName(content);
+	const sourceTypeName = coerceTypeName(explicitSourceTypeName) ?? (await csharpLanguageService.getPrimaryType(document))?.name;
 	if (!sourceTypeName) {
 		vscode.window.showErrorMessage('CSharp Painkiller: Cannot find a class, struct, or record in the current file.');
 		return undefined;
@@ -722,22 +632,12 @@ async function resolveMappingContext(
 	}
 
 	// 4. Parse fields
-	const sourceFields = parseTypeFields(content, sourceTypeName);
-
-	let targetContent: string;
-	try {
-		const buf = await vscode.workspace.fs.readFile(foundType.fileUri);
-		targetContent = Buffer.from(buf).toString('utf-8');
-	} catch {
-		vscode.window.showErrorMessage(
-			`CSharp Painkiller: Cannot read file for type "${targetTypeName}".`
-		);
-		return undefined;
-	}
-	const targetFields = parseTypeFields(targetContent, targetTypeName);
+	const sourceFields = await parseDocumentTypeFields(document, sourceTypeName);
+	const targetDocument = await vscode.workspace.openTextDocument(foundType.fileUri);
+	const targetFields = await parseDocumentTypeFields(targetDocument, targetTypeName);
 
 	// 5. Insertion point: beginning of the line containing the type's closing brace
-	const insertionPosition = findInsertionPosition(document, sourceTypeName);
+	const insertionPosition = await findInsertionPosition(document, sourceTypeName);
 	if (!insertionPosition) {
 		vscode.window.showErrorMessage(
 			`CSharp Painkiller: Cannot determine insertion point in "${path.basename(document.uri.path)}".`
@@ -751,6 +651,7 @@ async function resolveMappingContext(
 		targetTypeName,
 		targetFields,
 		targetNamespace: foundType.namespace,
+		targetDocument,
 		eol,
 		document,
 		insertionPosition,
@@ -825,8 +726,31 @@ export async function generateMapFromForDocument(
 		return;
 	}
 
-	const methodText = buildMapFromMethod(srcName, targetTypeName, sourceFields, targetFields, eol, selectedMode);
-	await applyMethodInsert(document, insertionPosition, methodText, targetNamespace, eol);
+	let mappingFields = sourceFields;
+	let properties = '';
+	let additionalUsings: string[] = [];
+	if (sourceFields.length === 0) {
+		const destinationType = (await csharpLanguageService.getTypes(document)).find(type => type.name === srcName);
+		if (!destinationType) { throw new Error(`Cannot resolve mapping destination type "${srcName}".`); }
+		if (destinationType.symbol.children.length === 0) {
+			const readableFields = targetFields.filter(field => field.canRead !== false);
+			if (readableFields.length === 0) {
+				vscode.window.showWarningMessage(
+					`CSharp Painkiller: No mappable public properties found on ${targetTypeName}.`
+				);
+				return;
+			}
+			mappingFields = readableFields.map(field => ({ ...field, canWrite: true }));
+			properties = buildMappingProperties(mappingFields, eol) + eol + eol;
+			const inputType = (await csharpLanguageService.getTypes(ctx.targetDocument)).find(type => type.name === targetTypeName);
+			if (!inputType) { throw new Error(`Cannot resolve mapping input type "${targetTypeName}".`); }
+			const context = await csharpLanguageService.getTypeFileContext(ctx.targetDocument, inputType);
+			additionalUsings = [...context.usings, ...context.namespaces.flatMap(namespace => namespace.usings)];
+		}
+	}
+
+	const methodText = buildMapFromMethod(srcName, targetTypeName, mappingFields, targetFields, eol, selectedMode);
+	await applyMethodInsert(document, insertionPosition, properties + methodText, targetNamespace, eol, additionalUsings);
 
 	vscode.window.showInformationMessage(
 		`CSharp Painkiller: Generated MapFrom${targetTypeName} in ${srcName}.`
@@ -849,10 +773,11 @@ async function applyMethodInsert(
 	insertionPosition: vscode.Position,
 	methodText: string,
 	targetNamespace: string,
-	eol: string
+	eol: string,
+	additionalUsings: string[] = []
 ): Promise<void> {
 	const content = document.getText();
-	const fileNs  = extractFileNamespace(content) ?? '';
+	const fileNs = (await csharpLanguageService.getTypes(document))[0]?.namespace ?? '';
 	const edit    = new vscode.WorkspaceEdit();
 	const insertionOffset = document.offsetAt(insertionPosition);
 	const isBodylessDeclaration = document.getText().charAt(insertionOffset) === ';';
@@ -862,6 +787,32 @@ async function applyMethodInsert(
 		const alreadyHasUsing = new RegExp(`^using\\s+${escapeRe(targetNamespace)}\\s*;`, 'm').test(content);
 		if (!alreadyHasUsing) {
 			edit.insert(document.uri, findUsingInsertPosition(document), `using ${targetNamespace};${eol}`);
+		}
+	}
+
+	if (additionalUsings.length > 0) {
+		const type = (await csharpLanguageService.getTypes(document)).find(type => type.symbol.range.contains(insertionPosition));
+		if (!type) { throw new Error('Cannot resolve the type receiving the generated mapping properties.'); }
+		const context = await csharpLanguageService.getTypeFileContext(document, type);
+		const normalize = (using: string): string => using.replace(/\s+/g, '');
+		const existing = new Set([
+			...context.usings,
+			...context.namespaces.flatMap(namespace => namespace.usings),
+			...(targetNamespace ? [`using ${targetNamespace};`] : []),
+		].map(normalize));
+		const missing: string[] = [];
+		for (const using of additionalUsings) {
+			const normalized = normalize(using);
+			if (existing.has(normalized)) { continue; }
+			const alias = normalized.match(/^using(@?[\p{L}_][\p{L}\p{N}_]*)=/u)?.[1];
+			if (alias && [...existing].some(directive => directive.startsWith(`using${alias}=`))) {
+				throw new Error(`Cannot generate mapping properties: using alias "${alias}" has a different definition in the destination.`);
+			}
+			existing.add(normalized);
+			missing.push(using);
+		}
+		if (missing.length > 0) {
+			edit.insert(document.uri, findUsingInsertPosition(document), missing.join(eol) + eol);
 		}
 	}
 
@@ -882,7 +833,9 @@ async function applyMethodInsert(
 		edit.insert(document.uri, insertionPosition, separator + methodText + eol);
 	}
 
-	await vscode.workspace.applyEdit(edit);
+	if (!await vscode.workspace.applyEdit(edit)) {
+		throw new Error('VS Code could not insert the generated mapping method.');
+	}
 
 	// Scroll to the inserted method
 	const editor = vscode.window.visibleTextEditors.find(
@@ -915,45 +868,45 @@ export function parseTypeFields(content: string, typeName: string): ParsedFields
 	return extractFields(body ?? '', content, typeName);
 }
 
+export async function parseDocumentTypeFields(document: vscode.TextDocument, typeName: string): Promise<ParsedFields> {
+	const matches = (await csharpLanguageService.getTypes(document)).filter(type => type.name === typeName);
+	if (matches.length !== 1) {
+		throw new Error(`Cannot uniquely resolve type "${typeName}" in the C# document.`);
+	}
+	const type = matches[0];
+	const fields = extractFields('', csharpLanguageService.getHeader(document, type), typeName);
+	for (const symbol of type.symbol.children) {
+		const source = stripComments(document.getText(symbol.range));
+		const name = document.getText(symbol.selectionRange);
+		if (symbol.kind === vscode.SymbolKind.Property || symbol.kind === vscode.SymbolKind.Field) {
+			const parsed = extractFields(source, '', typeName).find(field => field.name === name);
+			if (parsed && !fields.some(field => field.name === parsed.name)) { fields.push(parsed); }
+		} else if (symbol.kind === vscode.SymbolKind.Constructor || (symbol.kind === vscode.SymbolKind.Method && name === typeName)) {
+			fields.constructors?.push(...(extractFields('', source, typeName).constructors ?? []));
+		}
+	}
+	return fields;
+}
+
 /**
  * Returns the position of column 0 on the line that holds the closing `}` of
  * the named type. Inserting at this position places new code entirely before
  * the `}` without splitting any existing source line.
  */
-function findInsertionPosition(
+async function findInsertionPosition(
 	document: vscode.TextDocument,
 	typeName: string
-): vscode.Position | undefined {
-	const content  = document.getText();
-	const stripped = stripComments(content);
-	const escaped  = escapeRe(typeName);
-
-	const typeRegex = new RegExp(
-		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record(?:\\s+(?:struct|class))?)\\s+${escaped}(?:\\s*<[^>]*>)?\\s*(?::[^{]*)?\\{`,
-		'g'
-	);
-
-	let match: RegExpExecArray | null;
-	while ((match = typeRegex.exec(stripped)) !== null) {
-		const openBrace  = match.index + match[0].length - 1;
-		const closeBrace = findMatchingBrace(stripped, openBrace);
-		if (closeBrace === -1) { continue; }
-
-		// Column 0 of the line containing `}` — insert goes before it
-		const closingLine = document.positionAt(closeBrace).line;
-		return new vscode.Position(closingLine, 0);
+): Promise<vscode.Position | undefined> {
+	const type = (await csharpLanguageService.getTypes(document)).find(type => type.name === typeName);
+	if (!type) { return undefined; }
+	const end = document.offsetAt(type.symbol.range.end) - 1;
+	const last = document.getText(new vscode.Range(document.positionAt(end), type.symbol.range.end));
+	if (last !== '}' && last !== ';') { return undefined; }
+	const position = document.positionAt(end);
+	if (last === ';' || document.lineAt(position.line).text.slice(0, position.character).trim()) {
+		return position;
 	}
-
-	const bodylessTypeRegex = new RegExp(
-		`(?:public|internal|private|protected)?\\s*(?:static|sealed|abstract|partial|readonly)*\\s*(?:class|struct|record(?:\\s+(?:struct|class))?)\\s+${escaped}(?:\\s*<[^>]*>)?(?:\\s*\\([^)]*\\))?\\s*(?::[^;]*)?;`,
-		'g'
-	);
-	const bodylessMatch = bodylessTypeRegex.exec(stripped);
-	if (bodylessMatch) {
-		return document.positionAt(bodylessMatch.index + bodylessMatch[0].length - 1);
-	}
-
-	return undefined;
+	return new vscode.Position(position.line, 0);
 }
 
 /**
@@ -981,36 +934,9 @@ function findUsingInsertPosition(document: vscode.TextDocument): vscode.Position
  * Returns the type name if the cursor is positioned on a class/struct/record
  * declaration name, otherwise undefined.
  */
-export function getTypeNameAtPosition(
+export async function getTypeNameAtPosition(
 	document: vscode.TextDocument,
 	position: vscode.Position
-): string | undefined {
-	const content  = document.getText();
-	const stripped = stripComments(content);
-
-	const patterns = [
-		/\brecord\s+struct\s+([A-Za-z_][A-Za-z0-9_]*)/g,
-		/\b(?:class|struct|record|enum|interface)\s+([A-Za-z_][A-Za-z0-9_]*)/g,
-	];
-
-	for (const re of patterns) {
-		let match: RegExpExecArray | null;
-		while ((match = re.exec(stripped)) !== null) {
-			const nameStart = match.index + match[0].indexOf(match[1]);
-			const nameEnd   = nameStart + match[1].length;
-
-			const startPos = document.positionAt(nameStart);
-			const endPos   = document.positionAt(nameEnd);
-
-			if (
-				position.line >= startPos.line && position.line <= endPos.line &&
-				(position.line !== startPos.line || position.character >= startPos.character) &&
-				(position.line !== endPos.line   || position.character <= endPos.character)
-			) {
-				return match[1];
-			}
-		}
-	}
-
-	return undefined;
+): Promise<string | undefined> {
+	return (await csharpLanguageService.getTypeAtPosition(document, position))?.name;
 }

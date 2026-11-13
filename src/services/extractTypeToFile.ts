@@ -1,10 +1,9 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import { getFileBaseNameFromUri } from '../utils/fileUtils.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
 import {
 	buildExtractedFileContent,
-	canExtractTypeFromFile,
-	findTypeDeclarationSpan,
 	removeTypeFromContent,
 } from './extractTypeToFileCore.js';
 
@@ -19,18 +18,22 @@ export {
 export async function extractTypeToFile(document: vscode.TextDocument, typeName: string): Promise<void> {
 	const content = document.getText();
 
-	if (!canExtractTypeFromFile(content, typeName, getFileBaseNameFromUri(document.uri))) {
+	const types = (await csharpLanguageService.getTypes(document)).filter(type => !type.nested);
+	const selected = types.filter(type => type.name === typeName);
+	const type = selected.length === 1 ? selected[0] : undefined;
+	if (!type || types.length <= 1 || type.partial || typeName === getFileBaseNameFromUri(document.uri)) {
 		vscode.window.showErrorMessage(
 			`CSharp Painkiller: Cannot extract "${typeName}" — the file must contain multiple types, the file name must not match the type name, and the selected type must not be partial.`
 		);
 		return;
 	}
 
-	const span = findTypeDeclarationSpan(content, typeName);
-	if (!span) {
-		vscode.window.showErrorMessage(`CSharp Painkiller: Could not locate type "${typeName}" in the file.`);
-		return;
+	let start = document.offsetAt(type.symbol.range.start);
+	let line = type.symbol.range.start.line;
+	while (line > 0 && document.lineAt(line - 1).text.trim().startsWith('///')) {
+		start = document.offsetAt(document.lineAt(--line).range.start);
 	}
+	const span = { start, end: document.offsetAt(type.symbol.range.end), text: content.slice(start, document.offsetAt(type.symbol.range.end)) };
 
 	const dir = path.posix.dirname(document.uri.path);
 	const newFilePath = `${dir}/${typeName}.cs`;
@@ -44,7 +47,8 @@ export async function extractTypeToFile(document: vscode.TextDocument, typeName:
 		// File does not exist — proceed.
 	}
 
-	const newFileContent = buildExtractedFileContent(content, span.text);
+	const fileContext = await csharpLanguageService.getTypeFileContext(document, type);
+	const newFileContent = buildExtractedFileContent(content, span.text, type.namespace, fileContext);
 	const updatedContent = removeTypeFromContent(content, span);
 
 	const edit = new vscode.WorkspaceEdit();

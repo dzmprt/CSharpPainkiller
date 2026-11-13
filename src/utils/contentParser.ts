@@ -21,6 +21,73 @@ function stripBom(content: string): string {
 	return content.charCodeAt(0) === 0xFEFF ? content.slice(1) : content;
 }
 
+/** Masks comments and string literals while preserving source offsets. */
+export function stripComments(content: string): string {
+	let result = '';
+	let i = 0;
+	const len = content.length;
+
+	while (i < len) {
+		if (content[i] === '/' && i + 1 < len && content[i + 1] === '*') {
+			const start = i;
+			i += 2;
+			while (i < len && !(content[i - 1] === '*' && content[i] === '/')) {
+				i++;
+			}
+			i++;
+			for (let j = start; j < i; j++) {
+				result += content[j] === '\n' ? '\n' : ' ';
+			}
+			continue;
+		}
+
+		if (content[i] === '/' && i + 1 < len && content[i + 1] === '/') {
+			const start = i;
+			while (i < len && content[i] !== '\n') { i++; }
+			for (let j = start; j < i; j++) { result += ' '; }
+			continue;
+		}
+
+		if (content[i] === '@' && i + 1 < len && content[i + 1] === '"') {
+			const start = i;
+			i += 2;
+			while (i < len) {
+				if (content[i] === '"' && i + 1 < len && content[i + 1] === '"') {
+					i += 2;
+				} else if (content[i] === '"') {
+					i++;
+					break;
+				} else {
+					i++;
+				}
+			}
+			for (let j = start; j < i; j++) {
+				result += content[j] === '\n' ? '\n' : ' ';
+			}
+			continue;
+		}
+
+		if (content[i] === '"') {
+			const start = i;
+			i++;
+			while (i < len && content[i] !== '"') {
+				if (content[i] === '\\') { i++; }
+				i++;
+			}
+			i++;
+			for (let j = start; j < i; j++) {
+				result += content[j] === '\n' ? '\n' : ' ';
+			}
+			continue;
+		}
+
+		result += content[i];
+		i++;
+	}
+
+	return result;
+}
+
 /**
  * Extracts the namespace with its leading whitespace from file content.
  * Used internally for namespace replacement in adjustFileNamespace.
@@ -33,7 +100,7 @@ export function extractFileNamespaceWithIndent(content: string): { namespace: st
 /**
  * Extracts the namespace from file content.
  * INTERNAL USE ONLY - for working with file content strings.
- * For LSP-based namespace extraction from files, use CSharpParser service.
+ * For source documents, use csharpLanguageService.getTypes().
  */
 export function extractFileNamespace(content: string): string | undefined {
 	const match = stripBom(content).match(NAMESPACE_REGEX);
@@ -43,7 +110,7 @@ export function extractFileNamespace(content: string): string | undefined {
 /**
  * Extracts using directives from file content.
  * INTERNAL USE ONLY - for working with file content strings.
- * For LSP-based using extraction from files, use CSharpParser service.
+ * Using formatting remains content-based; source structure comes from csharpLanguageService.
  */
 export function extractUsingDirectives(content: string): string[] {
 	const usingRegex = /^using\s+([\w.]+)\s*;/gm;
@@ -123,7 +190,7 @@ function extractBlockNamespaceBodies(content: string): { ns: string; body: strin
 /**
  * Extracts type definitions from file content along with the namespace.
  * Used internally for analyzing partial types and file structure.
- * For LSP-based namespace/type extraction, use CSharpParser service.
+ * For source documents, use csharpLanguageService.getTypes().
  */
 export function extractTypesFromContent(content: string): TypeExtractionResult {
 	const types: TypeDefinition[] = [];
@@ -380,6 +447,40 @@ export function extractGenericInterfaceArgument(content: string, interfaceName: 
 	}
 
 	return content.slice(start, i - 1).trim();
+}
+
+export interface GenericDeclaration {
+	typeParameters?: string;
+	constraints?: string;
+}
+
+export function parseGenericDeclaration(header: string, name: string): GenericDeclaration {
+	const masked = stripComments(header);
+	const parameters = extractGenericInterfaceArgument(masked, name);
+	return {
+		typeParameters: parameters ? `<${parameters.replace(/\s+/g, ' ').trim()}>` : undefined,
+		constraints: masked.match(/\bwhere\b[\s\S]*$/)?.[0].replace(/\s+/g, ' ').trim() || undefined,
+	};
+}
+
+export function getPublicPropertyAccessors(content: string): { hasGet: boolean; hasSet: boolean; hasInit: boolean } {
+	const masked = stripComments(content);
+	const pattern = /\b(?:(private\s+protected|protected\s+internal|private|protected|internal|public)\s+)?(get|set|init)\s*(;|\{|=>)/g;
+	const accessors = new Set<string>();
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(masked)) !== null) {
+		if (!match[1] || match[1] === 'public') { accessors.add(match[2]); }
+		if (match[3] === '{') {
+			const end = findMatchingBrace(masked, pattern.lastIndex - 1);
+			if (end < 0) { break; }
+			pattern.lastIndex = end + 1;
+		} else if (match[3] === '=>') {
+			const end = masked.indexOf(';', pattern.lastIndex);
+			if (end < 0) { break; }
+			pattern.lastIndex = end + 1;
+		}
+	}
+	return { hasGet: accessors.has('get'), hasSet: accessors.has('set'), hasInit: accessors.has('init') };
 }
 
 // ============================================================================

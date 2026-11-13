@@ -3,6 +3,7 @@ import {
 	extractFileNamespace,
 } from '../utils/contentParser.js';
 import { type CType } from '../types.js';
+import { buildTypeFileContent, type TypeFileContext } from '../utils/usingBlock.js';
 
 export interface TypeDeclarationSpan {
 	start: number;
@@ -227,8 +228,8 @@ function extractUsingLines(content: string): string[] {
 	const lines = content.split('\n');
 	const usings: string[] = [];
 	for (const line of lines) {
-		if (/^using\s+[\w.]+\s*;/.test(line)) {
-			usings.push(line.trimEnd());
+		if (/^\s*using\s+(?!var\b)[^;]+;/.test(line)) {
+			usings.push(line.trim());
 		} else if (line.trim() !== '' && !line.trim().startsWith('//')) {
 			break;
 		}
@@ -286,25 +287,21 @@ function normalizeExtractedTypeText(text: string): string {
 	return dedentOneLevel(lines.join('\n').trimEnd());
 }
 
-export function buildExtractedFileContent(sourceContent: string, typeDeclaration: string): string {
+export function buildExtractedFileContent(
+	sourceContent: string,
+	typeDeclaration: string,
+	namespaceName?: string,
+	context?: TypeFileContext
+): string {
 	const eol = sourceContent.includes('\r\n') ? '\r\n' : '\n';
 	const usings = extractUsingLines(sourceContent);
-	const namespace = extractFileNamespace(sourceContent);
+	const namespace = namespaceName ?? extractFileNamespace(sourceContent);
 	const typeText = normalizeExtractedTypeText(typeDeclaration);
 
-	const parts: string[] = [];
-	if (usings.length > 0) {
-		parts.push(...usings);
-		parts.push('');
-	}
-	if (namespace) {
-		parts.push(`namespace ${namespace};`);
-		parts.push('');
-	}
-	parts.push(typeText);
-	parts.push('');
-
-	return parts.join(eol);
+	return buildTypeFileContent(typeText, context ?? {
+		usings,
+		namespaces: namespace ? [{ name: namespace, usings: [] }] : [],
+	}, eol);
 }
 
 export function removeTypeFromContent(content: string, span: TypeDeclarationSpan): string {

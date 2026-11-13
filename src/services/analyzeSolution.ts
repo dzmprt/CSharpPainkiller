@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { ErrorHandler } from '../utils/errorHandler.js';
 import {
 	runDiagnosticsForWorkspace,
 	type AnalyzerSelection,
@@ -21,11 +22,6 @@ const ANALYZER_ITEMS: AnalyzerQuickPickItem[] = [
 		key: 'wrongFilename',
 		label: '$(file) Filename mismatch',
 		description: "File name doesn't match the type it declares",
-	},
-	{
-		key: 'unsortedUsings',
-		label: '$(list-ordered) Unsorted usings',
-		description: 'using directives are not sorted alphabetically',
 	},
 	{
 		key: 'mixedLanguageIdentifiers',
@@ -68,7 +64,6 @@ async function pickAnalyzersToRun(): Promise<AnalyzerSelection | undefined> {
 			resolve({
 				wrongNamespace: selectedKeys.has('wrongNamespace'),
 				wrongFilename: selectedKeys.has('wrongFilename'),
-				unsortedUsings: selectedKeys.has('unsortedUsings'),
 				mixedLanguageIdentifiers: selectedKeys.has('mixedLanguageIdentifiers'),
 				duplicateTypeName: selectedKeys.has('duplicateTypeName'),
 			});
@@ -109,7 +104,6 @@ export async function analyzeSolutionCommand(
 	if (
 		!selection.wrongNamespace &&
 		!selection.wrongFilename &&
-		!selection.unsortedUsings &&
 		!selection.mixedLanguageIdentifiers &&
 		!selection.duplicateTypeName
 	) {
@@ -117,7 +111,7 @@ export async function analyzeSolutionCommand(
 		return;
 	}
 
-	await vscode.window.withProgress(
+	await Promise.resolve(vscode.window.withProgress(
 		{
 			location: vscode.ProgressLocation.Notification,
 			title: 'CSharp Painkiller: Analyzing solution',
@@ -147,5 +141,9 @@ export async function analyzeSolutionCommand(
 				`CSharp Painkiller: Analyzed ${result.processed} file(s), found ${result.diagnosticCount} issue(s).`
 			);
 		}
-	);
+	)).catch((error: unknown) => {
+		if (error instanceof vscode.CancellationError) { return; }
+		ErrorHandler.logError('Analyzing solution', error);
+		vscode.window.showErrorMessage(`CSharp Painkiller: Solution analysis failed: ${error instanceof Error ? error.message : String(error)}`);
+	});
 }

@@ -1,12 +1,11 @@
 import * as vscode from 'vscode';
-import { DIAGNOSTIC_SOURCE, DIAGNOSTIC_CODE_NAMESPACE, DIAGNOSTIC_CODE_UNSORTED_USINGS } from './diagnosticsProvider.js';
+import { DIAGNOSTIC_SOURCE, DIAGNOSTIC_CODE_NAMESPACE } from './diagnosticsProvider.js';
 
 /**
  * Provides quick fix actions for CSharp Painkiller diagnostics.
  *
  * Currently supports:
  * - Fixing wrong namespace via the existing `csharppainkiller.adjustNamespace` command.
- * - Fixing unsorted using directives via the existing `csharppainkiller.sortUsings` command.
  */
 export class CSharpDiagnosticsCodeActionProvider implements vscode.CodeActionProvider {
 	public static readonly providedCodeActionKinds = [vscode.CodeActionKind.QuickFix];
@@ -31,12 +30,6 @@ export class CSharpDiagnosticsCodeActionProvider implements vscode.CodeActionPro
 				}
 			}
 
-			if (diagnostic.code === DIAGNOSTIC_CODE_UNSORTED_USINGS) {
-				const action = this.createSortUsingsAction(document, diagnostic);
-				if (action) {
-					actions.push(action);
-				}
-			}
 		}
 
 		return actions;
@@ -63,24 +56,4 @@ export class CSharpDiagnosticsCodeActionProvider implements vscode.CodeActionPro
 		return action;
 	}
 
-	private createSortUsingsAction(
-		document: vscode.TextDocument,
-		diagnostic: vscode.Diagnostic
-	): vscode.CodeAction | undefined {
-		const action = new vscode.CodeAction(
-			'Sort using directives',
-			vscode.CodeActionKind.QuickFix
-		);
-		action.diagnostics = [diagnostic];
-		action.isPreferred = true;
-
-		// Reuse the existing sortUsings command passing the file URI
-		action.command = {
-			title: 'Sort usings',
-			command: 'csharppainkiller.sortUsings',
-			arguments: [document.uri],
-		};
-
-		return action;
-	}
 }

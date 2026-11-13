@@ -31,7 +31,7 @@ export function isPathExcluded(filePath: string): boolean {
 export async function collectCsFiles(folderUri: vscode.Uri): Promise<vscode.Uri[]> {
 	const pattern = '**/*.cs';
 	const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
-	const files = await vscode.workspace.findFiles(pattern, exclusionPattern);
+	const files = await vscode.workspace.findFiles(new vscode.RelativePattern(folderUri, pattern), exclusionPattern);
 
 	// Filter to only include files within the target folder and exclude bin/obj
 	const normalizedFolderPath = '/' + folderUri.path.replace(/^\/+/, '');
@@ -80,31 +80,30 @@ export function findProjectRootForPath(
 		return undefined;
 	}
 
-	// Sort by depth (deepest first) to find the closest .csproj
-	const sorted = [...csprojs].sort((a, b) => b.dirPath.split('/').length - a.dirPath.split('/').length);
-
-	for (const csproj of sorted) {
+	let root: string | undefined;
+	for (const csproj of csprojs) {
 		const normalized = '/' + csproj.dirPath.replace(/^\/+/, '');
-		if (filePath === normalized || filePath.startsWith(normalized + '/')) {
-			return csproj.dirPath;
+		if ((filePath === normalized || filePath.startsWith(normalized + '/')) &&
+			(root === undefined || csproj.dirPath.length > root.length)) {
+			root = csproj.dirPath;
 		}
 	}
-
-	return undefined;
+	return root;
 }
 
 /**
  * Preloads all .csproj paths for a given workspace folder.
  * This is called once per folder operation to avoid repeated searches.
  */
-export async function preloadCsprojs(_folderUri: vscode.Uri): Promise<ProjectContext> {
-	const exclusionPattern = '{**/bin/**,**/obj/**,**/.dotnet/**}';
-	const csprojFiles = await vscode.workspace.findFiles('**/*.csproj', exclusionPattern);
-
-	const csprojs: CsprojInfo[] = csprojFiles.map(uri => ({
-		dirPath: uri.path.replace(/\/[^/]*$/, ''),
+export async function preloadCsprojs(folderUri: vscode.Uri): Promise<ProjectContext> {
+	const cache = CsprojCache.getInstance();
+	const csprojs = await Promise.all((await cache.getCsprojs()).map(async project => {
+		const relevant = folderUri.path === project.dirPath || folderUri.path.startsWith(`${project.dirPath}/`) ||
+			project.dirPath.startsWith(`${folderUri.path}/`);
+		return relevant && project.projectUri
+			? { ...project, rootNamespace: await cache.getRootNamespace(project.projectUri) }
+			: project;
 	}));
-
 	return { csprojs };
 }
 
@@ -123,12 +122,13 @@ export async function findProjectDirectory(folderUri: vscode.Uri): Promise<strin
 		return undefined;
 	}
 
-	const csprojs = await CsprojCache.getInstance().getCsprojs();
+	const cache = CsprojCache.getInstance();
+	const csprojs = await cache.getCsprojs();
 	if (csprojs.length === 0) {
 		return undefined;
 	}
 
-	return findProjectRootForPath(folderUri.path, csprojs);
+	return cache.findProjectRootForPath(folderUri.path);
 }
 
 // ============================================================================

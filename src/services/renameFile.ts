@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { getPublicTypeName, hasPartialTypes } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
 import { collectCsFiles, getFileNameFromUri } from '../utils/fileUtils.js';
 import { ErrorHandler } from '../utils/errorHandler.js';
 import { OperationError } from '../utils/operationError.js';
@@ -12,19 +12,20 @@ export async function renameFileByType(
 	openFile: boolean = false
 ): Promise<{ success: boolean; message: string }> {
 	try {
-		const existingContent = await vscode.workspace.fs.readFile(fileUri);
-		const content = Buffer.from(existingContent).toString('utf-8');
+		const document = await vscode.workspace.openTextDocument(fileUri);
+		const types = (await csharpLanguageService.getTypes(document)).filter(type => !type.nested);
 
 		const currentFileName = getFileNameFromUri(fileUri);
 
-		if (hasPartialTypes(content)) {
+		if (types.some(type => type.partial)) {
 			return {
 				success: true,
 				message: `File ${currentFileName} contains partial types and was skipped.`,
 			};
 		}
 
-		const typeInfo = getPublicTypeName(content);
+		const publicTypes = types.filter(type => type.public);
+		const typeInfo = publicTypes.length > 1 ? 'ambiguous' : publicTypes[0] ?? null;
 
 		if (typeInfo === null) {
 			const err = new OperationError('NO_TYPE_FOUND', {
@@ -87,11 +88,11 @@ export async function renameFileByType(
 			// Target file doesn't exist, proceed with rename
 		}
 
-		// Write content to new location
-		await vscode.workspace.fs.writeFile(newFileUri, existingContent);
-
-		// Delete the old file
-		await vscode.workspace.fs.delete(fileUri);
+		const edit = new vscode.WorkspaceEdit();
+		edit.renameFile(fileUri, newFileUri, { overwrite: false });
+		if (!await vscode.workspace.applyEdit(edit)) {
+			throw new Error('VS Code could not apply the file rename.');
+		}
 
 		// Open the new file only if requested (single file mode)
 		if (openFile) {

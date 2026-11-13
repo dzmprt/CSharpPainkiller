@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { deriveNamespaceFromFolder } from '../namespace/compute.js';
 import { findTypeInWorkspaceWithOptions, findHandlerForMediator } from '../utils/typeSearch.js';
-import { detectMediatorFile } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
 import { getParentFolder } from '../utils/fileUtils.js';
 import {
 	normalizeControllerName,
@@ -198,16 +198,8 @@ export async function goToHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
 		uri = editor.document.uri;
 	}
 
-	let content: string;
-	try {
-		const buf = await vscode.workspace.fs.readFile(uri);
-		content = Buffer.from(buf).toString('utf-8');
-	} catch {
-		vscode.window.showErrorMessage('Could not read the file.');
-		return;
-	}
-
-	const info = detectMediatorFile(content);
+	const document = await vscode.workspace.openTextDocument(uri);
+	const info = await csharpLanguageService.getMediatorInfo(document);
 	if (!info) {
 		vscode.window.showErrorMessage(
 			'This file does not contain a recognisable IRequest or INotification class.'
@@ -218,7 +210,7 @@ export async function goToHandlerForFile(fileUri?: vscode.Uri): Promise<void> {
 	let found: Awaited<ReturnType<typeof findHandlerForMediator>>;
 	await vscode.window.withProgress(
 		{ location: vscode.ProgressLocation.Notification, title: `Searching for handler of '${info.className}'…` },
-		async () => { found = await findHandlerForMediator(info.className, info.kind); }
+		async () => { found = await findHandlerForMediator(info.className, info.kind, { contextUri: uri }); }
 	);
 
 	if (!found!) {
@@ -252,16 +244,8 @@ export async function generateHandlerForFile(fileUri?: vscode.Uri): Promise<void
 		return;
 	}
 
-	let content: string;
-	try {
-		const buf = await vscode.workspace.fs.readFile(uri);
-		content = Buffer.from(buf).toString('utf-8');
-	} catch {
-		vscode.window.showErrorMessage('Could not read the file.');
-		return;
-	}
-
-	const info = detectMediatorFile(content);
+	const document = await vscode.workspace.openTextDocument(uri);
+	const info = await csharpLanguageService.getMediatorInfo(document);
 	if (!info) {
 		vscode.window.showErrorMessage(
 			'This file does not contain a recognisable IRequest or INotification class.'
@@ -283,7 +267,7 @@ export async function generateHandlerForFile(fileUri?: vscode.Uri): Promise<void
 
 	const requestFoundType: import('../utils/typeSearch.js').FoundType = {
 		name: info.className,
-		namespace,
+		namespace: (await csharpLanguageService.getTypes(document)).find(type => type.name === info.className)?.namespace ?? '',
 		fileUri: uri,
 	};
 
@@ -444,11 +428,12 @@ export async function createMediatRHandler(folderUri?: vscode.Uri): Promise<void
 				return;
 			}
 
-			let returnType: string | null = null;
-			try {
-				const buf = await vscode.workspace.fs.readFile(found.fileUri);
-				returnType = extractCqrsIRequestReturnType(Buffer.from(buf).toString('utf-8')) ?? null;
-			} catch { /* ignore */ }
+			const document = await vscode.workspace.openTextDocument(found.fileUri);
+			const info = await csharpLanguageService.getMediatorInfo(document, requestInput);
+			if (!info || info.kind !== 'request') {
+				throw new Error(`"${requestInput}" is not a C# mediator request.`);
+			}
+			const returnType = info.returnType;
 
 			const rt = returnType ?? 'Unit';
 			let returnedType: import('../utils/typeSearch.js').FoundType | undefined;
@@ -528,11 +513,12 @@ export async function createMitMediatorHandler(folderUri?: vscode.Uri): Promise<
 				return;
 			}
 
-			let returnType: string | null = null;
-			try {
-				const buf = await vscode.workspace.fs.readFile(found.fileUri);
-				returnType = extractCqrsIRequestReturnType(Buffer.from(buf).toString('utf-8')) ?? null;
-			} catch { /* ignore */ }
+			const document = await vscode.workspace.openTextDocument(found.fileUri);
+			const info = await csharpLanguageService.getMediatorInfo(document, requestInput);
+			if (!info || info.kind !== 'request') {
+				throw new Error(`"${requestInput}" is not a C# mediator request.`);
+			}
+			const returnType = info.returnType;
 
 			let returnedType: import('../utils/typeSearch.js').FoundType | undefined;
 			if (returnType) {

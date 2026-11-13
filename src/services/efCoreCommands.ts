@@ -2,7 +2,8 @@ import * as vscode from 'vscode';
 import { deriveNamespaceFromFolder } from '../namespace/compute.js';
 import { findTypeInWorkspaceWithOptions } from '../utils/typeSearch.js';
 import { getParentFolder } from '../utils/fileUtils.js';
-import { extractTypesFromContent } from '../utils/contentParser.js';
+import { csharpLanguageService } from './csharpLanguageService.js';
+import { CsprojCache } from '../utils/csprojCache.js';
 import {
 	parsePublicProperties,
 	generateEfCoreEntityTypeConfiguration,
@@ -57,18 +58,19 @@ async function writeAndOpen(
 	return true;
 }
 
-async function readProperties(fileUri: vscode.Uri): Promise<ReturnType<typeof parsePublicProperties>> {
-	try {
-		const buf = await vscode.workspace.fs.readFile(fileUri);
-		return parsePublicProperties(Buffer.from(buf).toString('utf-8'));
-	} catch {
-		return [];
-	}
+async function readProperties(fileUri: vscode.Uri, typeName: string): Promise<ParsedProperty[]> {
+	const document = await vscode.workspace.openTextDocument(fileUri);
+	const type = (await csharpLanguageService.getTypes(document)).find(type => type.name === typeName && !type.nested);
+	if (!type) { throw new Error(`Cannot resolve C# entity "${typeName}".`); }
+	return type.symbol.children.filter(symbol => symbol.kind === vscode.SymbolKind.Property)
+		.flatMap(symbol => parsePublicProperties(document.getText(symbol.range))
+			.filter(property => property.name === document.getText(symbol.selectionRange)).slice(0, 1));
 }
 
 async function readRelatedProperties(
 	properties: ParsedProperty[],
-	currentEntityName: string
+	currentEntityName: string,
+	contextUri: vscode.Uri
 ): Promise<RelatedPropertiesByType> {
 	const relatedTypes = new Set<string>();
 	for (const property of properties) {
@@ -79,33 +81,11 @@ async function readRelatedProperties(
 	}
 
 	const entries = await Promise.all([...relatedTypes].map(async relatedType => {
-		const candidates = await vscode.workspace.findFiles('**/*.cs', '{**/bin/**,**/obj/**,**/.dotnet/**}');
-		let fallback: ParsedProperty[] | undefined;
-		for (const fileUri of candidates) {
-			const fileProperties = await readProperties(fileUri);
-			if (!fileProperties.some(property => getNavigationTargetType(property) === currentEntityName)) {
-				continue;
-			}
-
-			let fileContent: string;
-			try {
-				const buf = await vscode.workspace.fs.readFile(fileUri);
-				fileContent = Buffer.from(buf).toString('utf-8');
-			} catch {
-				continue;
-			}
-			const declaresRelatedType = extractTypesFromContent(fileContent).types.some(type => type.name === relatedType);
-			if (!declaresRelatedType) {
-				continue;
-			}
-
-			fallback ??= fileProperties;
-			const inverseCount = fileProperties.filter(property => getNavigationTargetType(property) === currentEntityName).length;
-			if (inverseCount === 1) {
-				return [relatedType, fileProperties] as const;
-			}
-		}
-		return fallback ? [relatedType, fallback] as const : undefined;
+		const found = await findTypeInWorkspaceWithOptions(relatedType, { contextUri });
+		if (!found) { return undefined; }
+		const fileProperties = await readProperties(found.fileUri, relatedType);
+		return fileProperties.some(property => getNavigationTargetType(property) === currentEntityName)
+			? [relatedType, fileProperties] as const : undefined;
 	}));
 	return Object.fromEntries(entries.filter((entry): entry is readonly [string, ParsedProperty[]] => entry !== undefined));
 }
@@ -145,8 +125,8 @@ export async function createEfCoreConfigurationFromFolder(folderUri?: vscode.Uri
 				return;
 			}
 
-			const properties = await readProperties(found.fileUri);
-			const relatedProperties = await readRelatedProperties(properties, entityName);
+			const properties = await readProperties(found.fileUri, entityName);
+			const relatedProperties = await readRelatedProperties(properties, entityName, found.fileUri);
 			const namespace = await deriveNamespaceFromFolder(folder);
 			const content = generateEfCoreEntityTypeConfiguration(found, properties, namespace, relatedProperties);
 			await writeAndOpen(folder, `${entityName}Configuration.cs`, content);
@@ -179,28 +159,18 @@ export async function createEfCoreConfigurationFromFile(fileUri?: vscode.Uri): P
 		return;
 	}
 
-	let fileContent: string;
-	try {
-		const buf = await vscode.workspace.fs.readFile(uri);
-		fileContent = Buffer.from(buf).toString('utf-8');
-	} catch {
-		vscode.window.showErrorMessage('Could not read the file.');
-		return;
-	}
-
-	// Extract the primary public class name from the file
-	const extraction = extractTypesFromContent(fileContent);
-	const publicClass = extraction.types.find(t => t.type === 'class');
+	const document = await vscode.workspace.openTextDocument(uri);
+	const publicClass = (await csharpLanguageService.getTypes(document)).find(type => !type.nested && type.type === 'class');
 	if (!publicClass) {
 		vscode.window.showErrorMessage('No class found in this file.');
 		return;
 	}
 
 	const entityName = publicClass.name;
-	const entityNamespace = publicClass.namespace ?? extraction.oldNamespace ?? '';
+	const entityNamespace = publicClass.namespace;
 
-	const properties = parsePublicProperties(fileContent);
-	const relatedProperties = await readRelatedProperties(properties, entityName);
+	const properties = await readProperties(uri, entityName);
+	const relatedProperties = await readRelatedProperties(properties, entityName, uri);
 	const folder = getParentFolder(uri);
 	const namespace = await deriveNamespaceFromFolder(folder);
 
@@ -213,12 +183,10 @@ export async function createEfCoreConfigurationFromFile(fileUri?: vscode.Uri): P
 // EF Core CLI commands
 // ============================================================================
 
-const EXCLUSION = '{**/bin/**,**/obj/**,**/.dotnet/**}';
-
 /**
  * Finds all .csproj files in the workspace. */
 async function findAllCsprojs(): Promise<vscode.Uri[]> {
-	return vscode.workspace.findFiles('**/*.csproj', EXCLUSION);
+	return CsprojCache.getInstance().getProjectUris();
 }
 
 /**
@@ -317,8 +285,7 @@ async function isEfCoreProject(projectFolder: vscode.Uri): Promise<boolean> {
 
 	for (const csprojUri of csprojs) {
 		try {
-			const buf = await vscode.workspace.fs.readFile(csprojUri);
-			const content = Buffer.from(buf).toString('utf-8');
+			const content = await CsprojCache.getInstance().getProjectContent(csprojUri);
 
 			// Check for common EF Core package references
 			if (
